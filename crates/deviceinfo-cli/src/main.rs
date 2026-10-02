@@ -39,8 +39,15 @@ enum Command {
     /// 硬件与能力：这台机器是什么（不变的部分）
     Hardware {
         /// 探测的根目录
-        #[arg(long, value_name = "PATH", default_value = "/")]
+        #[arg(long, value_name = "PATH", default_value = "/", conflicts_with = "ssh")]
         root: PathBuf,
+        /// 隔着 ssh 探测另一台机器（不写夹具）。
+        ///
+        /// 做法和采集一样：先把探测要读的文件镜像成本地临时树，然后照常探测。
+        /// 注意 `state` **没有**这个开关——磁盘余量查的是本机挂载的文件系统，
+        /// 隔着 ssh 问"那块盘还剩多少"问的是错的对象。
+        #[arg(long, value_name = "HOST")]
+        ssh: Option<String>,
         /// 伪造架构（默认用编译期架构）
         #[arg(long, value_name = "ARCH")]
         arch: Option<String>,
@@ -89,12 +96,29 @@ fn main() {
     let cli = Cli::parse();
     match cli.command.unwrap_or(Command::Hardware {
         root: PathBuf::from("/"),
+        ssh: None,
         arch: None,
         strict: false,
     }) {
-        Command::Hardware { root, arch, strict } => {
+        Command::Hardware {
+            root,
+            ssh,
+            arch,
+            strict,
+        } => {
             let arch = arch.unwrap_or_else(|| std::env::consts::ARCH.to_string());
-            let report = probe_with(&root, &arch);
+            let source = match &ssh {
+                Some(host) => Source::remote(host),
+                None => Source::local(&root),
+            };
+            let (local_root, _staging) = match resolve_local_root(&source) {
+                Ok(pair) => pair,
+                Err(error) => {
+                    eprintln!("探测失败: {error}");
+                    std::process::exit(2);
+                }
+            };
+            let report = probe_with(&local_root, &arch);
             if cli.json {
                 print_json(&report);
             } else {
@@ -203,6 +227,21 @@ fn capture(source: &Source, arch: &str, out: &Path) -> io::Result<()> {
 
 /// 采集前必须存在的文件。理由见 [`capture`] 里的守卫。
 const ESSENTIAL_FILES: [&str; 2] = ["proc/cpuinfo", "proc/meminfo"];
+
+/// 得到一个**本地**的探测根。
+///
+/// 本地来源直接用自己；远端来源先镜像成一棵本地临时树。暂存树随返回值一起交出去，
+/// 调用方 drop 它时就自动删掉——**必须持有它**，否则临时目录会在探测之前就被清了。
+fn resolve_local_root(source: &Source) -> io::Result<(PathBuf, Option<TempTree>)> {
+    match source {
+        Source::Local(root) => Ok((root.clone(), None)),
+        Source::Remote(_) => {
+            let staging = TempTree::new()?;
+            mirror(source, &staging.path)?;
+            Ok((staging.path.clone(), Some(staging)))
+        }
+    }
+}
 
 /// 把远端的东西落到本地临时树。
 ///

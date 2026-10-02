@@ -42,6 +42,7 @@ cargo run -p deviceinfo-cli                       # 硬件与能力（默认子�
 cargo run -p deviceinfo-cli -- state --watch /var/cache
 cargo run -p deviceinfo-cli -- state --counters    # 额外读累积计数器（见下）
 cargo run -p deviceinfo-cli -- --json hardware     # 跨机器 diff 用
+cargo run -p deviceinfo-cli -- hardware --ssh o6n          # 隔着 ssh 探测另一台机器
 cargo run -p deviceinfo-cli -- hardware --root ./fixtures/lunar-lake-ultra7-258v
 cargo run -p deviceinfo-cli -- capture --ssh o6n --arch aarch64 --out fixtures/新机器
 cargo test
@@ -131,6 +132,16 @@ git add fixtures/<名字>
 它们**存在**这件事才是被测的对象），所以重新采集只会在探测逻辑**真的**
 变了的时候产生 diff。**快照变了不一定是 bug**：先看 diff，决定是"有意改了行为"
 （重新 capture 并提交）还是"引入了回归"（修代码）。
+
+**远端夹具没法在本地独立验证，本地夹具可以。** 差别在于 `expected.json` 是从哪儿算的：
+
+| 来源 | expected.json 从哪算 | 夹具测试能发现什么 |
+|---|---|---|
+| `--root`（本地） | **真实机器** | 连"采集漏了一个文件"都能发现（那会让夹具的报告偏离真值） |
+| `--ssh`（远端） | 镜像出来的暂存树 | 只能发现"探测逻辑变了"——采集本身的缺陷是**自洽的**，测试会一起接受 |
+
+所以远端采集的可靠性只能靠采集自己把住：读失败报 `@@X` 并**硬失败**、缺 `proc/cpuinfo`
+直接拒绝写、长度与内容用同一次读取（见下）。
 
 采集清单（`capture_plan`）是探测逻辑的镜像，两边要一起改。软链要单独重建——
 驱动名是从 `device/driver` 软链的末段读的，夹具里放空文件的话 `read_link` 会失败，

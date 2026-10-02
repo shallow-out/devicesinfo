@@ -221,6 +221,9 @@ impl RemoteSource {
         let mut child = Command::new("ssh")
             // BatchMode：宁可直接失败，也不要卡在密码提示上（agent 场景下那会永久挂住）
             .args(["-o", "BatchMode=yes"])
+            // 主机不可达时别挂在那里：默认 TCP 超时可能两分钟以上，
+            // 而采集是交互式跑的，挂着比失败更糟
+            .args(["-o", "ConnectTimeout=10"])
             .args(["-o", "ControlMaster=auto"])
             .args(["-o", &format!("ControlPath={control_path}")])
             .args(["-o", "ControlPersist=30"])
