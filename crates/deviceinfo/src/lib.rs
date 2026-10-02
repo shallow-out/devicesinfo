@@ -66,6 +66,7 @@ pub use report::{
 pub use runtime::LIBRARY_DIRS;
 pub use state::{AcceleratorState, DiskUsage, MemoryState, RuntimeState, SampleOptions};
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 /// 探测真实系统。`root` 传 `/`。
@@ -85,8 +86,18 @@ pub fn probe_with(root: &Path, arch: &str) -> HardwareReport {
     // 库索引建一次，所有加速器共用——每台机器通常有好几个加速器，
     // 各自重新遍历一遍 /usr/lib 是没必要的浪费
     let libraries = runtime::LibraryIndex::build(root);
-    let mut accelerators = accelerator::probe_npus(root, &libraries, &mut warnings);
-    accelerators.extend(accelerator::probe_gpus(root, &libraries, &mut warnings));
+    // 已报过的加速器占了哪些 PCI 槽位——扫 PCI 总线时要用它去重
+    // （Intel 的 NPU 本身就是一个 class 0x1200 的 PCI 设备）
+    let mut known_pci_slots = BTreeSet::new();
+    let mut accelerators =
+        accelerator::probe_npus(root, &libraries, &mut known_pci_slots, &mut warnings);
+    accelerators.extend(accelerator::probe_gpus(
+        root,
+        &libraries,
+        &mut known_pci_slots,
+        &mut warnings,
+    ));
+    accelerator::warn_unmodelled_pci_accelerators(root, &known_pci_slots, &mut warnings);
     HardwareReport {
         cpu,
         memory,

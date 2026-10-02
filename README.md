@@ -227,12 +227,18 @@ git add fixtures/<名字>
   `o6n` 那台**整个 `/sys/firmware/devicetree` 都不存在**，它的 DRM 设备又是平台设备
   （没有 PCI 标识），所以名字只能退回 `GPU (card0)`。（整机型号走了 DMI 兜底，
   但**单个设备**的 DMI 信息拿不到。）
-- **既不用 `/dev/accel` 也不出 DRM 卡的加速器目前看不见。** 内核给出的通用入口只有
-  `sys/class/accel`（→ `/dev/accel/accelN`）和 DRM，而有些加速卡两个都不用：
-  Hailo-8 → `/dev/hailo0`、Coral → `/dev/apex_0`、FPGA → `/dev/xdma*`。它们有 PCI
-  标识，class 通常是 `0x1200`（处理加速器）或 `0x0b40`（协处理器）——**扫
-  `/sys/bus/pci/devices/*/class` 是个通用且不靠白名单的补法**（本机那颗 Intel NPU
-  正是 class `0x1200`，所以还要按设备去重）。目前没做。
+- **`warnings`** 会点名"本模块不认识的加速器"：内核给出的通用加速器入口只有
+  `sys/class/accel`（→ `/dev/accel/accelN`）和 DRM，而有些卡两个都不用
+  （Hailo-8 → `/dev/hailo0`、Coral → `/dev/apex_0`、FPGA → `/dev/xdma*`）。
+  这类设备按 PCI `class`（内核自己的分类：`0x12xx` 处理加速器 / `0x0b40` 协处理器）
+  扫出来并**点名警告**，而不是静默消失。
+  刻意**只警告、不进 `accelerators`**：我们只知道它是加速器，不知道它属于哪一类、
+  能不能拿来跑模型——宁可说"我认不出它"，也不要给它编一个类别。
+  实测校准：`0x11xx`（Signal processing controller）**不算**——本机那两个是
+  Intel DTT 功耗控制和 Crash Log Telemetry，`lspci` 也把它们和 "Processing
+  accelerators [1200]" 分开标。
+  **这套逻辑没有真机验证过**：手上没有任何一块这类卡，只有单元测试 + 本机那颗
+  已被 `/dev/accel` 覆盖的 Intel NPU（用它验证去重是对的）。
 - **设备树/DMI 的型号兜底没有真机验证**：`machine_model` 的 DMI 分支目前没有一台
   "既没设备树、cpuinfo 又不报型号"的机器可以验证（`o6n` 的 cpuinfo 里有
   `model name`，所以走的是第一条路）。单元测试覆盖了，真机没验。

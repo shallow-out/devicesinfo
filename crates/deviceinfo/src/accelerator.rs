@@ -251,6 +251,78 @@ pub(crate) fn classify_drm_device(
     }
 }
 
+/// PCI 槽位名（`0000:00:0b.0`）。
+///
+/// 用来回答"这个 PCI 设备是不是**已经**被当作加速器报过了"。从 `uevent` 里读
+/// `PCI_SLOT_NAME`，而不是解 `device` 软链：软链在夹具里存不下来（capture 把 `device`
+/// 建成真目录），而 `uevent` 是个普通文本文件，两条路都读得到。
+fn pci_slot_name(device_dir: &Path) -> Option<String> {
+    let text = read_trimmed(&device_dir.join("uevent"))?;
+    text.lines()
+        .find_map(|line| line.strip_prefix("PCI_SLOT_NAME="))
+        .map(str::trim)
+        .filter(|slot| !slot.is_empty())
+        .map(str::to_string)
+}
+
+/// PCI `class` 里属于"加速器"的两类。
+///
+/// `class` 文件形如 `0x120000`（class / subclass / prog-if 各一字节）：
+///
+/// - `0x12....` = **Processing accelerators**（处理加速器，本机的 Intel NPU 就是它）
+/// - `0x0b40..` = **Co-processor**（协处理器）
+///
+/// 关键：**这是内核自己的分类**，不是白名单——内核已经把"这块卡是干什么的"写在
+/// sysfs 里了，照读就行。
+fn is_accelerator_class(class: &str) -> bool {
+    // 先统一小写再剥 `0x`：内核写的是 `0x120000`，但没必要依赖这个大小写
+    let normalized = class.trim().to_ascii_lowercase();
+    let normalized = normalized.strip_prefix("0x").unwrap_or(&normalized);
+    normalized.starts_with("12") || normalized.starts_with("0b40")
+}
+
+/// 扫 PCI 总线，把**本模块不建模**的加速器点名出来。
+///
+/// 为什么需要：内核给出的通用加速器入口只有 `sys/class/accel`
+/// （→ `/dev/accel/accelN`）和 DRM，而有些卡两个都不用——Hailo-8 是 `/dev/hailo0`、
+/// Coral 是 `/dev/apex_0`、FPGA 卡是 `/dev/xdma*`。那些卡会**静默消失**，
+/// 而"我没看见"和"没有"是两件事，前者必须说出来。
+///
+/// 只发警告、**不进 `accelerators`**：我们只知道它是加速器，不知道它属于哪一类、
+/// 能不能拿来跑模型。宁可说"我认不出它"，也不要给它编一个类别。
+pub(crate) fn warn_unmodelled_pci_accelerators(
+    root: &Path,
+    known_slots: &BTreeSet<String>,
+    warnings: &mut Vec<String>,
+) {
+    let Ok(entries) = fs::read_dir(root.join("sys/bus/pci/devices")) else {
+        return;
+    };
+    let mut unmodelled: Vec<(String, String, String)> = Vec::new();
+    for entry in entries.flatten() {
+        let slot = entry.file_name().to_string_lossy().into_owned();
+        // 已经被当作加速器报过的（本机的 Intel NPU 就是）不再重复点名
+        if known_slots.contains(&slot) {
+            continue;
+        }
+        let Some(class) = read_trimmed(&entry.path().join("class")) else {
+            continue;
+        };
+        if !is_accelerator_class(&class) {
+            continue;
+        }
+        let driver = driver_of(&entry.path()).unwrap_or_else(|| "无驱动".into());
+        unmodelled.push((slot, class, driver));
+    }
+    unmodelled.sort();
+    for (slot, class, driver) in unmodelled {
+        warnings.push(format!(
+            "PCI {slot} 是加速器（class {class}，驱动 {driver}），但本模块不认识这类设备，\
+             它不在 accelerators 里——要用它得先给这类设备加上探测"
+        ));
+    }
+}
+
 /// 一台 DRM 设备**自己**的 render 节点名（`renderD128` 这类）。
 ///
 /// `<device_dir>/drm/` 列的就是该设备自己的 `cardN` / `renderD*` / `controlD*` 条目，
@@ -275,6 +347,7 @@ pub(crate) fn render_nodes_of(device_dir: &Path) -> Vec<String> {
 pub(crate) fn probe_npus(
     root: &Path,
     libraries: &LibraryIndex,
+    known_pci_slots: &mut BTreeSet<String>,
     warnings: &mut Vec<String>,
 ) -> Vec<Accelerator> {
     let dir = root.join("dev/accel");
@@ -285,6 +358,10 @@ pub(crate) fn probe_npus(
         let vendor = read_trimmed(&device_dir.join("vendor")).map(|v| vendor_name(&v));
         let driver = driver_of(&device_dir);
         let pci_id = read_pci_id(&device_dir);
+        // 记下 PCI 槽位：扫 PCI 总线时要用它去重（Intel 的 NPU 就是 PCI 设备）
+        if let Some(slot) = pci_slot_name(&device_dir) {
+            known_pci_slots.insert(slot);
+        }
         let runtime = runtime::probe(AcceleratorKind::Npu, vendor.as_deref(), libraries);
         // 先算成局部变量：struct 字面量里字段是按书写顺序求值的，
         // 把"借 vendor"和"move vendor"放在同一个字面量里会打架。
@@ -329,6 +406,7 @@ pub(crate) fn probe_npus(
 pub(crate) fn probe_gpus(
     root: &Path,
     libraries: &LibraryIndex,
+    known_pci_slots: &mut BTreeSet<String>,
     warnings: &mut Vec<String>,
 ) -> Vec<Accelerator> {
     let drm = root.join("sys/class/drm");
@@ -344,6 +422,9 @@ pub(crate) fn probe_gpus(
         let pci_id = read_pci_id(&device_dir);
         let compatible = read_compatible(&device_dir);
         let raw_id = read_trimmed(&device_dir.join("device")).unwrap_or_else(|| "未知".into());
+        if let Some(slot) = pci_slot_name(&device_dir) {
+            known_pci_slots.insert(slot);
+        }
 
         // render 节点的**归属**由 `<device>/drm/` 的目录项给出。
         // 三态：看到了(Some) / 看不到那个目录(None)——理由见 classify_drm_device。
@@ -562,7 +643,7 @@ mod tests {
         fs::write(root.join("dev/accel/accel0"), "").unwrap();
 
         let mut warnings = Vec::new();
-        let npus = probe_npus(&root, &empty_libraries(&root), &mut warnings);
+        let npus = probe_npus(&root, &empty_libraries(&root), &mut std::collections::BTreeSet::new(), &mut warnings);
         assert_eq!(npus.len(), 1);
         // 设备确实在……
         assert_eq!(npus[0].vendor.as_deref(), Some("Intel"));
@@ -586,7 +667,7 @@ mod tests {
         fs::write(device.join("device"), "0x2204\n").unwrap();
 
         let mut warnings = Vec::new();
-        let gpus = probe_gpus(&root, &empty_libraries(&root), &mut warnings);
+        let gpus = probe_gpus(&root, &empty_libraries(&root), &mut std::collections::BTreeSet::new(), &mut warnings);
         assert_eq!(gpus.len(), 1);
         assert_eq!(gpus[0].vendor.as_deref(), Some("NVIDIA"));
         match &gpus[0].memory {
@@ -611,7 +692,7 @@ mod tests {
         fs::write(device.join("mem_info_vram_total"), "17163091968\n").unwrap();
 
         let mut warnings = Vec::new();
-        let gpus = probe_gpus(&root, &empty_libraries(&root), &mut warnings);
+        let gpus = probe_gpus(&root, &empty_libraries(&root), &mut std::collections::BTreeSet::new(), &mut warnings);
         assert_eq!(
             gpus[0].memory,
             AcceleratorMemory::Dedicated {
@@ -630,7 +711,7 @@ mod tests {
         fs::write(root.join("sys/class/drm/card0/device/vendor"), "0x1002\n").unwrap();
 
         let mut warnings = Vec::new();
-        let gpus = probe_gpus(&root, &empty_libraries(&root), &mut warnings);
+        let gpus = probe_gpus(&root, &empty_libraries(&root), &mut std::collections::BTreeSet::new(), &mut warnings);
         assert_eq!(gpus.len(), 1);
         assert_eq!(gpus[0].vendor.as_deref(), Some("AMD"));
         assert!(
@@ -726,7 +807,7 @@ mod tests {
         fs::write(root.join("dev/dri/renderD128"), "").unwrap();
 
         let mut warnings = Vec::new();
-        let found = probe_gpus(&root, &empty_libraries(&root), &mut warnings);
+        let found = probe_gpus(&root, &empty_libraries(&root), &mut std::collections::BTreeSet::new(), &mut warnings);
         assert_eq!(found[0].memory, AcceleratorMemory::SharedWithSystem);
         assert!(
             found[0].notes.iter().any(|note| note.contains("推断")),
@@ -738,11 +819,11 @@ mod tests {
         let soc = fake_root("soc-gpu");
         fs::create_dir_all(soc.join("sys/class/drm/card0/device/drm/renderD128")).unwrap();
         assert_eq!(
-            probe_gpus(&soc, &empty_libraries(&soc), &mut Vec::new())[0].memory,
+            probe_gpus(&soc, &empty_libraries(&soc), &mut std::collections::BTreeSet::new(), &mut Vec::new())[0].memory,
             AcceleratorMemory::SharedWithSystem
         );
         assert!(
-            !probe_gpus(&soc, &empty_libraries(&soc), &mut Vec::new())[0]
+            !probe_gpus(&soc, &empty_libraries(&soc), &mut std::collections::BTreeSet::new(), &mut Vec::new())[0]
                 .notes
                 .iter()
                 .any(|note| note.contains("推断")),
@@ -751,6 +832,99 @@ mod tests {
 
         fs::remove_dir_all(&root).ok();
         fs::remove_dir_all(&soc).ok();
+    }
+
+    /// 内核自己的 PCI `class` 就是"这块卡是干什么的"。不在 `/dev/accel`、也不出 DRM
+    /// 的加速器（Hailo-8、Coral、FPGA 卡）**必须点名警告**，不能静默消失。
+    #[test]
+    fn unmodelled_pci_accelerators_are_named_not_silently_dropped() {
+        let root = fake_root("pci-accel");
+        let pci = root.join("sys/bus/pci/devices");
+        // 处理加速器（本机 Intel NPU 就是这类）
+        fs::create_dir_all(pci.join("0000:01:00.0")).unwrap();
+        fs::write(pci.join("0000:01:00.0/class"), "0x120000\n").unwrap();
+        fs::write(
+            pci.join("0000:01:00.0/uevent"),
+            "DRIVER=hailo_pci\nPCI_SLOT_NAME=0000:01:00.0\n",
+        )
+        .unwrap();
+        fs::create_dir_all(pci.join("0000:01:00.0/driver")).unwrap();
+        // 协处理器
+        fs::create_dir_all(pci.join("0000:03:00.0")).unwrap();
+        fs::write(pci.join("0000:03:00.0/class"), "0x0b4000\n").unwrap();
+        // 显卡 / 网卡：不是"未建模的加速器"，不该被点名
+        fs::create_dir_all(pci.join("0000:02:00.0")).unwrap();
+        fs::write(pci.join("0000:02:00.0/class"), "0x030000\n").unwrap();
+        fs::create_dir_all(pci.join("0000:04:00.0")).unwrap();
+        fs::write(pci.join("0000:04:00.0/class"), "0x020000\n").unwrap();
+
+        let mut warnings = Vec::new();
+        warn_unmodelled_pci_accelerators(&root, &BTreeSet::new(), &mut warnings);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].contains("0000:01:00.0"), "{warnings:?}");
+        assert!(warnings[1].contains("0000:03:00.0"), "{warnings:?}");
+        // 要说清后果，而不只是"发现一个设备"
+        assert!(warnings[0].contains("不在 accelerators 里"), "{warnings:?}");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// 已经被当作加速器报过的 PCI 设备**不能重复点名**——Intel 的 NPU 正是
+    /// class `0x1200` 的 PCI 设备，而且已经通过 `/dev/accel` 报过了。
+    #[test]
+    fn an_already_reported_pci_accelerator_is_not_named_twice() {
+        let root = fake_root("pci-dedupe");
+        // 已发现的 NPU
+        let npu = root.join("sys/class/accel/accel0/device");
+        fs::create_dir_all(&npu).unwrap();
+        fs::write(npu.join("vendor"), "0x8086\n").unwrap();
+        fs::write(npu.join("device"), "0x643e\n").unwrap();
+        fs::write(
+            npu.join("uevent"),
+            "DRIVER=intel_vpu\nPCI_SLOT_NAME=0000:00:0b.0\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("dev/accel")).unwrap();
+        fs::write(root.join("dev/accel/accel0"), "").unwrap();
+        // 同一个设备的 PCI 视图
+        let pci = root.join("sys/bus/pci/devices/0000:00:0b.0");
+        fs::create_dir_all(&pci).unwrap();
+        fs::write(pci.join("class"), "0x120000\n").unwrap();
+        fs::write(
+            pci.join("uevent"),
+            "DRIVER=intel_vpu\nPCI_SLOT_NAME=0000:00:0b.0\n",
+        )
+        .unwrap();
+
+        let mut known = BTreeSet::new();
+        let mut warnings = Vec::new();
+        let npus = probe_npus(
+            &root,
+            &empty_libraries(&root),
+            &mut known,
+            &mut warnings,
+        );
+        assert_eq!(npus.len(), 1);
+        warn_unmodelled_pci_accelerators(&root, &known, &mut warnings);
+        assert!(
+            warnings.is_empty(),
+            "同一个设备不该被点名两次: {warnings:?}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn pci_class_matching_is_by_class_and_subclass() {
+        assert!(is_accelerator_class("0x120000"));
+        assert!(is_accelerator_class("0x1200"));
+        assert!(is_accelerator_class("0x0b4000"));
+        assert!(is_accelerator_class("0X120000"));
+        // 显卡、网卡、存储控制器都不是
+        assert!(!is_accelerator_class("0x030000"));
+        assert!(!is_accelerator_class("0x020000"));
+        assert!(!is_accelerator_class("0x010802"));
+        assert!(!is_accelerator_class(""));
     }
 
     /// Rockchip 的 RKNPU 走 **DRM** 而不是 `/dev/accel` 暴露。
@@ -768,7 +942,7 @@ mod tests {
         fs::write(root.join("dev/dri/renderD128"), "").unwrap();
 
         let mut warnings = Vec::new();
-        let found = probe_gpus(&root, &empty_libraries(&root), &mut warnings);
+        let found = probe_gpus(&root, &empty_libraries(&root), &mut std::collections::BTreeSet::new(), &mut warnings);
         assert_eq!(found.len(), 1);
         assert_eq!(
             found[0].kind,
@@ -794,7 +968,7 @@ mod tests {
         fs::write(root.join("dev/dri/renderD128"), "").unwrap();
 
         let mut warnings = Vec::new();
-        let found = probe_gpus(&root, &empty_libraries(&root), &mut warnings);
+        let found = probe_gpus(&root, &empty_libraries(&root), &mut std::collections::BTreeSet::new(), &mut warnings);
         let card0 = found.iter().find(|a| a.name == "GPU (card0)").unwrap();
         let card1 = found.iter().find(|a| a.name == "display (card1)").unwrap();
         assert_eq!(card0.kind, AcceleratorKind::Gpu);
@@ -855,7 +1029,7 @@ mod tests {
         fs::create_dir_all(root.join("sys/class/drm/card0/device")).unwrap();
 
         let mut warnings = Vec::new();
-        let found = probe_gpus(&root, &empty_libraries(&root), &mut warnings);
+        let found = probe_gpus(&root, &empty_libraries(&root), &mut std::collections::BTreeSet::new(), &mut warnings);
         assert_eq!(found[0].kind, AcceleratorKind::Gpu);
         assert!(
             found[0].notes.iter().any(|note| note.contains("看不到")),
@@ -874,7 +1048,7 @@ mod tests {
         fs::write(root.join("dev/dri/renderD128"), "").unwrap();
 
         let mut warnings = Vec::new();
-        let found = probe_gpus(&root, &empty_libraries(&root), &mut warnings);
+        let found = probe_gpus(&root, &empty_libraries(&root), &mut std::collections::BTreeSet::new(), &mut warnings);
         assert!(found.is_empty());
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("renderD128"), "{warnings:?}");
@@ -890,7 +1064,7 @@ mod tests {
             fs::create_dir_all(root.join("sys/class/drm").join(name)).unwrap();
         }
         let mut warnings = Vec::new();
-        assert!(probe_gpus(&root, &empty_libraries(&root), &mut warnings).is_empty());
+        assert!(probe_gpus(&root, &empty_libraries(&root), &mut std::collections::BTreeSet::new(), &mut warnings).is_empty());
         fs::remove_dir_all(&root).ok();
     }
 

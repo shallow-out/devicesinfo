@@ -460,11 +460,30 @@ fn capture_plan(source: &Source) -> CapturePlan {
         files.push(format!("{DRI_DIR}/{node}"));
     }
 
+    // PCI 总线：找"本模块不建模的加速器"。照抄内核自己的分类（`class` 0x12xx / 0x0b40），
+    // 这样 Hailo-8 / Coral / FPGA 卡这类既不走 /dev/accel 也不出 DRM 的设备不会静默消失。
+    const PCI_DIR: &str = "sys/bus/pci/devices";
+    lists.ensure(&[PCI_DIR.to_string()]);
+    let mut pci_driver_links = Vec::new();
+    for device in lists.entries(PCI_DIR) {
+        let base = format!("{PCI_DIR}/{}", device.name);
+        files.push(format!("{base}/class"));
+        // uevent 里有 `PCI_SLOT_NAME`，去重要用它（软链在夹具里存不下来）
+        files.push(format!("{base}/uevent"));
+        pci_driver_links.push(format!("{base}/driver"));
+    }
+
+    // 已发现加速器的 uevent：里面有 `PCI_SLOT_NAME`，扫 PCI 总线时用它去重
+    for device in &device_dirs {
+        files.push(format!("{device}/uevent"));
+    }
+
     // 阶段四：所有驱动软链一次读完
-    let link_paths: Vec<String> = device_dirs
+    let mut link_paths: Vec<String> = device_dirs
         .iter()
         .map(|device| format!("{device}/driver"))
         .collect();
+    link_paths.extend(pci_driver_links);
     let links = source.link_many(&link_paths);
     for (path, target) in links {
         let Some(name) = target

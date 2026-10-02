@@ -1,0 +1,6 @@
+DRIVER=RKNPU
+OF_NAME=npu
+OF_FULLNAME=/npu@fdab0000
+OF_COMPATIBLE_0=rockchip,rk3588-rknpu
+OF_COMPATIBLE_N=1
+MODALIAS=of:NnpuT(null)Crockchip,rk3588-rknpu

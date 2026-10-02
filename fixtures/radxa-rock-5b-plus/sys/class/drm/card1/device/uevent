@@ -1,0 +1,6 @@
+DRIVER=rockchip-drm
+OF_NAME=display-subsystem
+OF_FULLNAME=/display-subsystem
+OF_COMPATIBLE_0=rockchip,display-subsystem
+OF_COMPATIBLE_N=1
+MODALIAS=of:Ndisplay-subsystemT(null)Crockchip,display-subsystem

@@ -1,0 +1,2 @@
+DRIVER=linlondp
+MODALIAS=acpi:CIXH5010:
