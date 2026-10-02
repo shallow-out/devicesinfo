@@ -1,0 +1,74 @@
+//! 设备信息与能力探测：CPU / 内存 / 加速器。
+//!
+//! 目的只有一个：**在分配任务之前，准确回答这台设备能做什么**。
+//! 上层（模型分发、任务调度、面板）靠这份报告决定"这个模型该不该装、该在哪跑"，
+//! 所以**报错比不报更糟**——一个乐观的数字会让人装上一个跑不动的模型，
+//! 一个悲观的数字会让本机永远拿不到该干的活。
+//!
+//! # 三条原则
+//!
+//! 1. **优先 sysfs，`/proc/cpuinfo` 只当兜底。** cpuinfo 是给人看的文本，字段随架构变化
+//!    （ARM64 没有 `physical id`/`core id`）；`sys/devices/system/cpu/*/topology/` 是内核
+//!    主动提供的稳定接口，x86 和 ARM 都有。
+//! 2. **不猜。** 算不出来就留 `None`，并把原因写进 [`HardwareReport::warnings`]。
+//!    "不知道"必须显式可见，而不是伪装成一个具体的数字。
+//! 3. **不列白名单。** 指令集特征按族匹配——漏项是静默的，报告看起来正常，只是少了一行。
+//!
+//! # 模块划分
+//!
+//! | 模块 | 职责 |
+//! |---|---|
+//! | [`report`] | 对外的数据结构，不含任何 IO |
+//! | [`cpu`] | 架构、核数、性能分层、指令集 |
+//! | [`memory`] | 总量与可用量 |
+//! | [`accelerator`] | GPU / NPU 的存在性与驱动绑定 |
+//! | [`render`] | 给人看的文本渲染（CLI 与 GUI 共用一份） |
+//! | `sysfs` / `features` | 内部工具：按 root 前缀读文件、指令集特征族匹配 |
+//!
+//! # 可注入的 root
+//!
+//! 所有探测都接受一个 `root` 前缀而不是写死 `/`，因此可以用**假文件树**做单元测试，
+//! 也可以用来探测容器内的可见设备，或者事后对着真实机器的采样夹具做回归。
+//! 真实调用传 [`Path::new("/")`]。
+//!
+//! ```
+//! let report = deviceinfo::probe(std::path::Path::new("/"));
+//! println!("{}", deviceinfo::render::human(&report));
+//! ```
+
+mod accelerator;
+mod cpu;
+mod features;
+mod memory;
+mod report;
+mod sysfs;
+
+pub mod render;
+
+pub use report::{Accelerator, AcceleratorKind, CoreTier, CpuInfo, HardwareReport, MemoryInfo};
+
+use std::path::Path;
+
+/// 探测真实系统。`root` 传 `/`。
+pub fn probe(root: &Path) -> HardwareReport {
+    probe_with(root, std::env::consts::ARCH)
+}
+
+/// 与 [`probe`] 相同，但架构可注入。
+///
+/// 架构用**编译期常量**而不是读文件：本模块总是探测自己所在的机器，二进制架构就是主机架构，
+/// 而 `/proc/cpuinfo` 里根本没有 arch 字段（x86 只给 `vendor_id`，arm64 什么都不给）。
+/// 参数化只是为了测试夹具能伪造一台 aarch64 机器。
+pub fn probe_with(root: &Path, arch: &str) -> HardwareReport {
+    let mut warnings = Vec::new();
+    let cpu = cpu::probe(root, arch, &mut warnings);
+    let memory = memory::probe(root, &mut warnings);
+    let mut accelerators = accelerator::probe_npus(root, &mut warnings);
+    accelerators.extend(accelerator::probe_gpus(root, &mut warnings));
+    HardwareReport {
+        cpu,
+        memory,
+        accelerators,
+        warnings,
+    }
+}

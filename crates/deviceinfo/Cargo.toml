@@ -1,0 +1,12 @@
+[package]
+name = "deviceinfo"
+description = "硬件与设备能力探测：CPU / 内存 / 加速器"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
