@@ -171,6 +171,12 @@ git add fixtures/<名字>
   它们仍在 `accelerators` 里，因为"有几个 DRM 设备、分别是什么"是值得知道的事实，
   只是不参与"能不能跑模型"的判断。`runtime` 对它们是 `NotApplicable`——
   那是"知道不用找"，和 `Unknown`（"不知道该找什么"）分开。
+- **显存语义里只有两件事是证据**：驱动暴露了 `mem_info_vram_total`（→ 独立显存），
+  或者设备**没有 PCI 标识**（→ SoC 上集成的单元，必然共享系统内存）。
+  剩下那种情况（PCI 设备 + 驱动没暴露显存总量）**从 sysfs 判不出来**：集显和独显在这
+  长得一样。实测本机 iGPU 是 `0000:00:02.0`、只有一个 256 MB 的 BAR，而**非 ReBAR 的
+  独显 BAR 也是 256 MB**，连 BAR 大小都不能用。所以那里给的 `SharedWithSystem` 是
+  **按厂商常见形态的推断**，会附一条 `notes` 说明——ARM 服务器插一张 AMD 卡就会判错。
 - **`has_gpu() == false` 的意思是"内核没暴露可计算的 GPU"，不是"硬件上没有 GPU"。**
   实测那台 RK3588S 的 Mali 在这台内核上根本没绑定（连 `panfrost`/`panthor` 都没编进去），
   只有一个 `rockchip-drm` 显示控制器，于是报告说没有 GPU。这是对的——这份报告回答的是
@@ -178,8 +184,11 @@ git add fixtures/<名字>
 - **"没看到 render 节点"有两种原因，不能混。** `Some(0)` 是确实看到了那个目录、
   里面没有（→ 显示设备）；`None` 是我们**没能看到目录**（老内核？）——那就什么都不改，
   继续当 GPU 并注明。把后者也当显示设备，会在老内核上把真 GPU 静默降级。
-- **`compatible` 是非 PCI 平台上设备的权威标识。** ARM／嵌入式上既没有 PCI id，
-  也没有 `cardN` 以外的名字——少了它，加速器只能叫 `GPU (card0, id 未知)`，信息量为零。
+- **身份来源按****设备****选，不按架构选。** 有这个设备的 PCI 标识就用它（`pci.ids` 给人名、
+  独立显存也看这个节点）；没有才退到设备树 `compatible`。判据是"**这个设备**有没有 PCI
+  标识"，不是"这台机器是什么架构"——**ARM 服务器一样有 PCIe，一样能插独显/加速卡**
+  （本机那颗 Intel NPU 就是 PCI 设备，class `0x120000`）。少了 `compatible`，
+  没有 PCI 标识的加速器就只能叫 `GPU (card0, id 未知)`，信息量为零。
 - **arm64 的机器型号只能从设备树读**（`/sys/firmware/devicetree/base/model`）：
   `/proc/cpuinfo` 在 arm64 上**不报型号**，一行都没有。设备树属性是 NUL 结尾、
   可能是 NUL 分隔的多个值，`trim()` 去不掉。
@@ -214,11 +223,16 @@ git add fixtures/<名字>
 - **`CpuInfo.model` 一个字段担了两种含义**：x86 上是**处理器**型号（cpuinfo 的
   `model name`），ARM 上通常是**整机**型号（设备树 `model` 或 DMI `product_name`）——
   因为平台只给得出后者。拆成 `cpu_model` + `machine_model` 更干净，但会动到字段。
-- **加速器的身份来源在三种平台上各不相同**：PCI id（x86）、设备树 `compatible`
-  （多数 ARM）、DMI（ACPI 启动的 ARM）。`o6n` 那台**整个 `/sys/firmware/devicetree`
-  都不存在**，所以它的加速器没有 `compatible`，名字只能退回 `GPU (card0)`。
-  加了 DMI 兜底之后**整机**型号能拿到，但**单个设备**的 DMI 信息是拿不到的——
-  那台机器上设备身份就到此为止。
+- **加速器的身份来源有三种，按设备挑**：PCI 标识、设备树 `compatible`、以及什么都没有。
+  `o6n` 那台**整个 `/sys/firmware/devicetree` 都不存在**，它的 DRM 设备又是平台设备
+  （没有 PCI 标识），所以名字只能退回 `GPU (card0)`。（整机型号走了 DMI 兜底，
+  但**单个设备**的 DMI 信息拿不到。）
+- **既不用 `/dev/accel` 也不出 DRM 卡的加速器目前看不见。** 内核给出的通用入口只有
+  `sys/class/accel`（→ `/dev/accel/accelN`）和 DRM，而有些加速卡两个都不用：
+  Hailo-8 → `/dev/hailo0`、Coral → `/dev/apex_0`、FPGA → `/dev/xdma*`。它们有 PCI
+  标识，class 通常是 `0x1200`（处理加速器）或 `0x0b40`（协处理器）——**扫
+  `/sys/bus/pci/devices/*/class` 是个通用且不靠白名单的补法**（本机那颗 Intel NPU
+  正是 class `0x1200`，所以还要按设备去重）。目前没做。
 - **设备树/DMI 的型号兜底没有真机验证**：`machine_model` 的 DMI 分支目前没有一台
   "既没设备树、cpuinfo 又不报型号"的机器可以验证（`o6n` 的 cpuinfo 里有
   `model name`，所以走的是第一条路）。单元测试覆盖了，真机没验。

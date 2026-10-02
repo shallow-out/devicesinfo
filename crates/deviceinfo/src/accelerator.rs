@@ -123,27 +123,53 @@ fn gpu_max_freq_mhz(device_dir: &Path) -> Option<u64> {
     .find_map(|path| read_u64(&device_dir.join(path)))
 }
 
-/// GPU 可用的内存语义。
-fn gpu_memory(device_dir: &Path, vendor: Option<&str>) -> AcceleratorMemory {
-    // amdgpu 一直暴露 mem_info_vram_total；Intel 的 xe 在独显上也暴露。
-    // 有它就说明有独立显存，这是唯一能确定"独立"的证据。
+/// GPU 可用的内存语义，以及一条"这是推断"的说明（如果有）。
+///
+/// 只有一件事是**证据**：驱动暴露了 `mem_info_vram_total` → 独立显存。
+/// 另一件也算证据：**没有 PCI 标识**的图形单元是 SoC 上集成的，必然共享系统内存。
+///
+/// 剩下那种情况（PCI 设备、驱动又没暴露显存总量）**从 sysfs 判不出来**：
+/// 集显和独显在这里长得一样。实测本机 iGPU 是 `0000:00:02.0`、只有一个 256 MB 的
+/// BAR，而**非 ReBAR 的独显 BAR 也是 256 MB**，所以连 BAR 大小都不能用。
+/// 以前这里按"Intel/AMD 在 Linux 上绝大多数是集显"直接判成共享——那不是证据，
+/// 只是概率，而 ARM 服务器插一张 AMD 卡就会判错。现在照旧给共享，
+/// 但**必须附一条说明**，让上层知道这是推断。
+fn gpu_memory(
+    device_dir: &Path,
+    vendor: Option<&str>,
+    pci_id: Option<&PciId>,
+) -> (AcceleratorMemory, Option<String>) {
     if let Some(bytes) = read_u64(&device_dir.join("mem_info_vram_total")) {
         if bytes > 0 {
-            return AcceleratorMemory::Dedicated { bytes };
+            return (AcceleratorMemory::Dedicated { bytes }, None);
         }
     }
+    // 没有 PCI 标识 → 是 SoC 上集成的单元，共享系统内存。这是证据，不是推断。
+    if pci_id.is_none() {
+        return (AcceleratorMemory::SharedWithSystem, None);
+    }
     match vendor {
-        // 走到这里说明驱动没暴露显存总量。Intel / AMD 在 Linux 上绝大多数是集显，
-        // 集显没有独立显存、和 CPU 共享系统内存——这是**确定的语义**，不是"不知道"。
-        Some("Intel") | Some("AMD") => AcceleratorMemory::SharedWithSystem,
-        // NVIDIA 专有驱动不通过 sysfs 暴露显存（要 NVML）。这里不猜：
+        Some(name @ ("Intel" | "AMD")) => (
+            AcceleratorMemory::SharedWithSystem,
+            Some(format!(
+                "驱动未暴露显存上限；按 {name} 在 Linux 上的常见形态推断为共享系统内存——\
+                 这是推断，不是本机证据（独显此处会判错）"
+            )),
+        ),
+        // NVIDIA 专有驱动不通过 sysfs 暴露显存（要 NVML）。这里不猜数值：
         // 编一个数会让人装上装不下的模型。
-        Some(other) => AcceleratorMemory::Unknown {
-            reason: format!("{other} 驱动未通过 sysfs 暴露显存上限"),
-        },
-        None => AcceleratorMemory::Unknown {
-            reason: "厂商未识别，无法判断显存是独立还是共享".into(),
-        },
+        Some(other) => (
+            AcceleratorMemory::Unknown {
+                reason: format!("{other} 驱动未通过 sysfs 暴露显存上限"),
+            },
+            None,
+        ),
+        None => (
+            AcceleratorMemory::Unknown {
+                reason: "PCI 设备且厂商未识别，无法判断显存是独立还是共享".into(),
+            },
+            None,
+        ),
     }
 }
 
@@ -168,7 +194,11 @@ fn sorted_entries(dir: &Path, keep: impl Fn(&str) -> bool) -> Vec<(String, PathB
     found
 }
 
-/// 设备树 `compatible`：非 PCI 平台上设备的权威标识。
+/// 设备树 `compatible`：**没有 PCI 标识的设备**（SoC 上集成的单元）的权威标识。
+///
+/// 注意判据是"**这个设备**有没有 PCI 标识"，不是"这台机器是什么架构"：
+/// ARM 服务器一样有 PCIe，一样能插独显 / 加速卡（本机那颗 Intel NPU 就是
+/// PCI 设备，class `0x120000`）。身份来源是按设备选的。
 ///
 /// `pub(crate)`：理由同 [`driver_of`]。
 pub(crate) fn read_compatible(device_dir: &Path) -> Option<String> {
@@ -325,7 +355,7 @@ pub(crate) fn probe_gpus(
         let kind = classify_drm_device(driver.as_deref(), compatible.as_deref(), render_nodes);
         let runtime = runtime::probe(kind, vendor.as_deref(), libraries);
         let name = name_from_pci(root, &vendor, &pci_id, || match (&compatible, &vendor) {
-            // 非 PCI 平台：设备树 compatible 是唯一有信息量的标识
+            // 没有 PCI 标识的设备：设备树 compatible 是唯一有信息量的标识
             (Some(compatible), _) => format!("{compatible} ({node})"),
             (None, Some(vendor)) => format!(
                 "{vendor} {} ({node}, id {raw_id})",
@@ -336,14 +366,17 @@ pub(crate) fn probe_gpus(
 
         let device_path = nodes.first().map(|name| root.join("dev/dri").join(name));
         // 字面量里字段是按书写顺序求值的：先把借 vendor 的算完再 move 它
-        let memory = match kind {
+        let (memory, memory_note) = match kind {
             // 显示控制器拿系统内存做 framebuffer，没有"独立显存"这回事
-            AcceleratorKind::Display => AcceleratorMemory::SharedWithSystem,
-            _ => gpu_memory(&device_dir, vendor.as_deref()),
+            AcceleratorKind::Display => (AcceleratorMemory::SharedWithSystem, None),
+            _ => gpu_memory(&device_dir, vendor.as_deref(), pci_id.as_ref()),
         };
         let max_freq_mhz = gpu_max_freq_mhz(&device_dir);
 
         let mut notes = Vec::new();
+        if let Some(note) = memory_note {
+            notes.push(note);
+        }
         if driver.is_none() {
             notes.push("未绑定内核驱动，硬件加速不可用".into());
         }
@@ -424,7 +457,8 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(
             dir.join("pci.ids"),
-            "8086  Intel Corporation\n\t64a0  Arc Graphics 130V/140V GPU\n\t643e  Core Ultra NPU\n",
+            "8086  Intel Corporation\n\t64a0  Arc Graphics 130V/140V GPU\n\t643e  Core Ultra NPU\n\
+             1002  Advanced Micro Devices, Inc. [AMD/ATI]\n\t744c  Navi 31 [Radeon RX 7900 XT/XTX]\n",
         )
         .unwrap();
     }
@@ -629,6 +663,94 @@ mod tests {
         // 连驱动名都没有
         assert_eq!(driver_version_of(&root, None), None);
         fs::remove_dir_all(&root).ok();
+    }
+
+    /// **ARM 服务器一样有 PCIe，一样能插独显 / 加速卡。**
+    ///
+    /// 性能相关的身份来源是**按设备**选的，不是按架构选的：这个设备有 PCI 标识就用
+    /// PCI 标识（`pci.ids` 给人名 + 独立显存），没有才退到设备树 `compatible`。
+    /// 这条测的就是那个组合：aarch64 + PCI 独显 + 独立显存 + 没有 `of_node`。
+    /// （本机那颗 Intel NPU 也是 PCI 设备，class `0x120000`。）
+    #[test]
+    fn a_discrete_gpu_on_arm_uses_its_pci_identity() {
+        let root = fake_root("arm-pcie");
+        write_pci_ids(&root);
+        let device = root.join("sys/class/drm/card0/device");
+        fs::create_dir_all(device.join("drm/renderD128")).unwrap();
+        fs::write(device.join("vendor"), "0x1002\n").unwrap();
+        fs::write(device.join("device"), "0x744c\n").unwrap();
+        fs::write(device.join("mem_info_vram_total"), "17163091968\n").unwrap();
+        fs::create_dir_all(root.join("dev/dri")).unwrap();
+        fs::write(root.join("dev/dri/renderD128"), "").unwrap();
+
+        let report = crate::probe_with(&root, "aarch64");
+        assert_eq!(report.accelerators.len(), 1);
+        let gpu = &report.accelerators[0];
+        assert_eq!(gpu.kind, AcceleratorKind::Gpu);
+        assert_eq!(gpu.pci_id.as_ref().unwrap().compact(), "1002:744c");
+        assert_eq!(gpu.vendor.as_deref(), Some("AMD"));
+        assert!(
+            gpu.compatible.is_none(),
+            "PCI 卡一般没有 of_node，不该凭空编一个"
+        );
+        assert_eq!(gpu.name, "AMD Navi 31 [Radeon RX 7900 XT/XTX]");
+        // 驱动暴露了显存上限 → 独立显存，而且不该附带"这是推断"的说明
+        assert_eq!(
+            gpu.memory,
+            AcceleratorMemory::Dedicated {
+                bytes: 17_163_091_968
+            }
+        );
+        // 有证据的语义不需要附"这是推断"
+        assert!(
+            !gpu.notes.iter().any(|note| note.contains("推断")),
+            "{:#?}",
+            gpu.notes
+        );
+        // 架构是 aarch64 也照样算有 GPU
+        assert!(report.has_gpu());
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// PCI 设备、驱动又没暴露显存 → sysfs 判不出来。这时给共享只能算推断，
+    /// **必须附说明**：ARM 服务器插一张 AMD 卡就会判错。
+    #[test]
+    fn an_unexposed_vram_limit_is_labelled_as_an_inference() {
+        let root = fake_root("inferred-memory");
+        let device = root.join("sys/class/drm/card0/device");
+        fs::create_dir_all(device.join("drm/renderD128")).unwrap();
+        fs::write(device.join("vendor"), "0x1002\n").unwrap();
+        fs::write(device.join("device"), "0x744c\n").unwrap();
+        fs::create_dir_all(root.join("dev/dri")).unwrap();
+        fs::write(root.join("dev/dri/renderD128"), "").unwrap();
+
+        let mut warnings = Vec::new();
+        let found = probe_gpus(&root, &empty_libraries(&root), &mut warnings);
+        assert_eq!(found[0].memory, AcceleratorMemory::SharedWithSystem);
+        assert!(
+            found[0].notes.iter().any(|note| note.contains("推断")),
+            "给推断就必须说出来: {:#?}",
+            found[0].notes
+        );
+
+        // 没有 PCI 标识（SoC 上集成的单元）→ 共享是**证据**，不需要说明
+        let soc = fake_root("soc-gpu");
+        fs::create_dir_all(soc.join("sys/class/drm/card0/device/drm/renderD128")).unwrap();
+        assert_eq!(
+            probe_gpus(&soc, &empty_libraries(&soc), &mut Vec::new())[0].memory,
+            AcceleratorMemory::SharedWithSystem
+        );
+        assert!(
+            !probe_gpus(&soc, &empty_libraries(&soc), &mut Vec::new())[0]
+                .notes
+                .iter()
+                .any(|note| note.contains("推断")),
+            "SoC 上集成的单元共享系统内存是证据，不该标成推断"
+        );
+
+        fs::remove_dir_all(&root).ok();
+        fs::remove_dir_all(&soc).ok();
     }
 
     /// Rockchip 的 RKNPU 走 **DRM** 而不是 `/dev/accel` 暴露。

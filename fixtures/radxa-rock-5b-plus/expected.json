@@ -56,8 +56,7 @@
       "driver": "RKNPU",
       "compatible": "rockchip,rk3588-rknpu",
       "memory": {
-        "kind": "unknown",
-        "reason": "厂商未识别，无法判断显存是独立还是共享"
+        "kind": "shared-with-system"
       },
       "runtime": {
         "state": "unknown",

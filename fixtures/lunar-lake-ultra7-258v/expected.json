@@ -230,7 +230,9 @@
           "libze_intel_gpu.so"
         ]
       },
-      "notes": []
+      "notes": [
+        "驱动未暴露显存上限；按 Intel 在 Linux 上的常见形态推断为共享系统内存——这是推断，不是本机证据（独显此处会判错）"
+      ]
     }
   ],
   "warnings": []
