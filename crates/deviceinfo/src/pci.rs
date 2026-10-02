@@ -3,11 +3,17 @@
 //! **解析 `pci.ids` 数据文件，而不是调用 `lspci`**：后者要求机器上装了 pciutils，
 //! 而本模块只是给一个 id 配个人名，不该为此引入外部进程依赖和它的权限面。
 
+use crate::report::PciId;
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
 
 /// 候选位置，按常见程度排序：Arch 系在 `hwdata`，Debian 系在 `misc`。
-const DATABASE_PATHS: [&str; 4] = [
+///
+/// 公开是因为采集夹具的一方需要知道去哪儿取原始文件——两边的清单必须一致，
+/// 不能各写一份。
+pub const PCI_DATABASE_PATHS: [&str; 4] = [
     "usr/share/hwdata/pci.ids",
     "usr/share/misc/pci.ids",
     "usr/local/share/hwdata/pci.ids",
@@ -18,7 +24,7 @@ const DATABASE_PATHS: [&str; 4] = [
 pub(crate) fn lookup(root: &Path, vendor: &str, device: &str) -> Option<String> {
     let vendor_id = normalize_id(vendor)?;
     let device_id = normalize_id(device)?;
-    for path in DATABASE_PATHS {
+    for path in PCI_DATABASE_PATHS {
         let Ok(text) = fs::read_to_string(root.join(path)) else {
             continue;
         };
@@ -42,6 +48,74 @@ fn normalize_id(id: &str) -> Option<String> {
         return None;
     }
     Some(trimmed.to_ascii_lowercase())
+}
+
+/// 抽出一份最小但格式完好的 `pci.ids` 子集，只含给定 id 的条目。
+///
+/// 给夹具采集用。**不整份复制**有两个理由：完整文件 1.6 MB，而且它的内容会随系统
+/// hwdata 更新而变化——夹具会因为与被测逻辑无关的原因失败。
+/// 也**不保留整个厂商段**：Intel 那一段本身就有 1 万行 / 455 KB，而夹具只需要那几个
+/// id 的名字。
+pub fn extract_entries(text: &str, ids: &[PciId]) -> String {
+    let wanted: Vec<(String, String)> = ids
+        .iter()
+        .filter_map(|id| Some((normalize_id(&id.vendor)?, normalize_id(&id.device)?)))
+        .collect();
+
+    let mut current_vendor: Option<String> = None;
+    // 厂商 id → (厂商名, 命中的设备条目)
+    let mut found: BTreeMap<String, (String, Vec<(String, String)>)> = BTreeMap::new();
+
+    for line in text.lines() {
+        if line.starts_with("C ") {
+            break;
+        }
+        if let Some(rest) = line.strip_prefix('\t') {
+            // 两层缩进是子系统
+            if rest.starts_with('\t') {
+                continue;
+            }
+            let Some(vendor) = current_vendor.as_deref() else {
+                continue;
+            };
+            let Some((device, name)) = split_entry(rest) else {
+                continue;
+            };
+            if wanted.contains(&(vendor.to_string(), device.clone())) {
+                if let Some(slot) = found.get_mut(vendor) {
+                    slot.1.push((device, name));
+                }
+            }
+            continue;
+        }
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        match split_entry(line) {
+            Some((vendor, name)) => {
+                if wanted
+                    .iter()
+                    .any(|(wanted_vendor, _)| *wanted_vendor == vendor)
+                {
+                    found.insert(vendor.clone(), (name, Vec::new()));
+                }
+                current_vendor = Some(vendor);
+            }
+            None => current_vendor = None,
+        }
+    }
+
+    let mut out = String::new();
+    for (vendor, (name, devices)) in found {
+        if devices.is_empty() {
+            continue;
+        }
+        let _ = writeln!(out, "{vendor}  {name}");
+        for (device, device_name) in devices {
+            let _ = writeln!(out, "\t{device}  {device_name}");
+        }
+    }
+    out
 }
 
 /// 在 `pci.ids` 文本里查。文件格式是缩进分层的（下面用空格示意，**真实文件用 tab**）：
@@ -169,5 +243,44 @@ C 00  Unclassified device
         fs::create_dir_all(&root).unwrap();
         assert_eq!(lookup(&root, "0x8086", "0x64a0"), None);
         fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn extracted_subset_keeps_only_the_wanted_entries() {
+        let wanted = vec![PciId {
+            vendor: "0x8086".into(),
+            device: "0x643e".into(),
+        }];
+        let subset = extract_entries(DATABASE, &wanted);
+
+        assert!(subset.contains("8086  Intel Corporation"), "{subset}");
+        assert!(subset.contains("\t643e  Core Ultra 200V Series Processors NPU"), "{subset}");
+        // 同一个厂商段里没被点名的设备不该进去
+        assert!(!subset.contains("64a0"), "{subset}");
+        // 其它厂商段整个不该出现
+        assert!(!subset.contains("10de"), "{subset}");
+
+        // 关键：抽出来的子集必须还能查回同一个名字（格式没抽坏）
+        assert_eq!(
+            lookup_in(&subset, "8086", "643e").as_deref(),
+            Some("Core Ultra 200V Series Processors NPU")
+        );
+    }
+
+    #[test]
+    fn extracting_an_unknown_id_yields_an_empty_subset() {
+        let unknown = vec![PciId {
+            vendor: "0xdead".into(),
+            device: "0xbeef".into(),
+        }];
+        assert!(extract_entries(DATABASE, &unknown).is_empty());
+        // 厂商在但设备不在：也不该凭空造一条
+        let missing_device = vec![PciId {
+            vendor: "0x8086".into(),
+            device: "0xffff".into(),
+        }];
+        let subset = extract_entries(DATABASE, &missing_device);
+        assert!(!subset.contains("ffff"), "{subset}");
+        assert_eq!(lookup_in(&subset, "8086", "ffff"), None);
     }
 }

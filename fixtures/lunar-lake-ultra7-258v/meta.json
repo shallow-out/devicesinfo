@@ -1,0 +1,4 @@
+{
+  "arch": "x86_64",
+  "note": "由 `deviceinfo capture` 生成。expected.json 是采集当时的探测结果快照——探测行为变化时它会失败，人工看 diff 决定是改了行为还是修了 bug。"
+}

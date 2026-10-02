@@ -27,6 +27,15 @@
 //! | `runtime` | 用户态加速栈是否齐备（设备在 ≠ 能用） |
 //! | `sysfs` / `features` | 内部工具：按 root 前缀读文件、指令集特征族匹配 |
 //!
+//! # 硬件 vs 运行时状态
+//!
+//! 两个入口，别混：
+//!
+//! - [`probe`] → [`HardwareReport`]：**这台机器是什么**。装上就不变，可以缓存、可以跨设备比较。
+//! - [`sample_state`] → [`RuntimeState`]：**此刻怎样**。每一秒都在变，不能缓存、不能比较。
+//!
+//! 混在一起会让硬件报告失去它最大的用处：拿两台机器的报告直接 `diff`。
+//!
 //! # 可注入的 root
 //!
 //! 所有探测都接受一个 `root` 前缀而不是写死 `/`，因此可以用**假文件树**做单元测试，
@@ -42,19 +51,21 @@ mod accelerator;
 mod cpu;
 mod features;
 mod memory;
-mod pci;
 mod report;
 mod runtime;
+mod state;
 mod sysfs;
 
+pub mod pci;
 pub mod render;
 
 pub use report::{
     Accelerator, AcceleratorKind, AcceleratorMemory, CoreTier, CpuInfo, HardwareReport, MemoryInfo,
     PciId, RuntimeStatus,
 };
+pub use state::{DiskUsage, MemoryState, RuntimeState};
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// 探测真实系统。`root` 传 `/`。
 pub fn probe(root: &Path) -> HardwareReport {
@@ -81,4 +92,19 @@ pub fn probe_with(root: &Path, arch: &str) -> HardwareReport {
         accelerators,
         warnings,
     }
+}
+
+/// 采样一次运行时状态。`watch` 是要查磁盘余量的路径（通常是模型缓存目录）。
+///
+/// 与 [`probe`] 分开的理由见 [`state`] 的模块文档：这里的每个数字下一秒就不一样。
+pub fn sample_state(watch: &[PathBuf]) -> RuntimeState {
+    state::sample(Path::new("/"), watch)
+}
+
+/// 与 [`sample_state`] 相同，但 `/proc` 部分可注入（测试用）。
+///
+/// `watch` 里的路径**不经过 `root`**：`statvfs` 查的是真实挂载的文件系统，
+/// 对着假文件树问"这块盘还剩多少"没有意义。
+pub fn sample_state_with(root: &Path, watch: &[PathBuf]) -> RuntimeState {
+    state::sample(root, watch)
 }

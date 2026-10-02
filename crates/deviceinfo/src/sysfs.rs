@@ -25,3 +25,15 @@ pub(crate) fn field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
         .find_map(|line| line.split_once(':').filter(|(k, _)| k.trim() == key))
         .map(|(_, value)| value.trim())
 }
+
+/// 读 `<值> kB` 形式的字段并转成字节。
+///
+/// `/proc/meminfo` 的所有值都以 kB 为单位。数值解析失败返回 `None`，不填 0 冒充。
+pub(crate) fn kib_field(text: &str, key: &str) -> Option<u64> {
+    field(text, key)?
+        .split_whitespace()
+        .next()?
+        .parse::<u64>()
+        .ok()
+        .map(|kib| kib * 1024)
+}

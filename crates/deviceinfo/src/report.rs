@@ -203,13 +203,15 @@ impl CoreTier {
     }
 }
 
+/// 内存的**硬件事实**：只有总量。
+///
+/// 可用内存和 swap 在 [`crate::state::MemoryState`]——那些是瞬时值。
+/// 总量也用 `Option`：读不到就是 `None`，**不是 0**。报 0 会让上层算出
+/// "一字节都装不下"，进而拒绝掉本来能跑的模型。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryInfo {
-    pub total_bytes: u64,
-    /// `/proc/meminfo` 的 `MemAvailable`。**这是瞬时值**，不是硬件事实——
-    /// 缓存/比较它的时候要记住这一点。
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub available_bytes: Option<u64>,
+    pub total_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -228,13 +230,6 @@ pub struct HardwareReport {
 }
 
 impl HardwareReport {
-    /// 可用于加载模型的内存（保守取可用内存，取不到就退回总量）。
-    pub fn usable_memory_bytes(&self) -> u64 {
-        self.memory
-            .available_bytes
-            .unwrap_or(self.memory.total_bytes)
-    }
-
     /// 是否存在 NPU 设备。
     ///
     /// **只回答"设备在不在"**。设备节点存在但用户态栈不全时它同样返回 `true`——

@@ -2,11 +2,15 @@
 //!
 //! 放在库里而不是各个 CLI 里：一份报告只有一种正确的读法，多份渲染实现迟早会分叉——
 //! 上游加了字段，某一端的输出漏掉，而且没人会发现。
+//!
+//! 硬件报告和运行时状态**分开渲染**：这两份数据的生命周期不同，一起打印会让人以为
+//! "可用内存"和"CPU 型号"是同一类东西。
 
 use crate::report::{AcceleratorKind, AcceleratorMemory, HardwareReport, RuntimeStatus};
+use crate::state::RuntimeState;
 use std::fmt::Write;
 
-/// 把报告渲染成多行文本（带末尾换行）。
+/// 把硬件报告渲染成多行文本（带末尾换行）。
 pub fn human(report: &HardwareReport) -> String {
     let mut out = String::new();
 
@@ -44,11 +48,14 @@ pub fn human(report: &HardwareReport) -> String {
         let _ = writeln!(out, "         指令集: {}", report.cpu.simd.join(", "));
     }
 
-    let mut mem = format!("内存     {}", human_bytes(report.memory.total_bytes));
-    if let Some(available) = report.memory.available_bytes {
-        let _ = write!(mem, "  （当前可用 {}）", human_bytes(available));
+    match report.memory.total_bytes {
+        Some(bytes) => {
+            let _ = writeln!(out, "内存     {}", human_bytes(bytes));
+        }
+        None => {
+            let _ = writeln!(out, "内存     未知");
+        }
     }
-    let _ = writeln!(out, "{mem}");
 
     if report.accelerators.is_empty() {
         let _ = writeln!(out, "加速器   未检测到 GPU / NPU，只能跑 CPU 推理");
@@ -108,6 +115,69 @@ pub fn human(report: &HardwareReport) -> String {
     out
 }
 
+/// 把运行时状态渲染成多行文本（带末尾换行）。
+pub fn human_state(state: &RuntimeState) -> String {
+    let mut out = String::new();
+
+    let mut line = match state.memory.total_bytes {
+        Some(total) => format!("内存     {} 总量", human_bytes(total)),
+        None => "内存     总量未知".to_string(),
+    };
+    match state.memory.available_bytes {
+        Some(available) => {
+            let _ = write!(line, "   可用 {}", human_bytes(available));
+        }
+        None => line.push_str("   可用未知"),
+    }
+    let _ = writeln!(out, "{line}");
+
+    match (state.memory.swap_total_bytes, state.memory.swap_free_bytes) {
+        (Some(0), _) => {
+            let _ = writeln!(out, "交换     无");
+        }
+        (Some(total), free) => {
+            let free = free.map_or_else(|| "未知".into(), human_bytes);
+            let marker = if state.memory.swap_exhausted() {
+                "   ! 已基本用满"
+            } else {
+                ""
+            };
+            let _ = writeln!(out, "交换     {} 总量   空闲 {free}{marker}", human_bytes(total));
+        }
+        _ => {
+            let _ = writeln!(out, "交换     未知");
+        }
+    }
+
+    if state.memory.swap_exhausted() {
+        // 这个提醒是状态报告存在的主要理由之一：swap 满时"可用内存"会系统性高估，
+        // 而这在原始数字上看不出来
+        let _ = writeln!(
+            out,
+            "         ! swap 用满时，系统的\"可用内存\"会高估还能装下多少，判断时要留余量"
+        );
+    }
+
+    for disk in &state.disks {
+        let _ = writeln!(
+            out,
+            "磁盘     {}   可写 {} / {}",
+            disk.path.display(),
+            human_bytes(disk.available_bytes),
+            human_bytes(disk.total_bytes)
+        );
+    }
+    if state.disks.is_empty() {
+        let _ = writeln!(out, "磁盘     （未指定要查的路径）");
+    }
+
+    for warning in &state.warnings {
+        let _ = writeln!(out, "警告     {warning}");
+    }
+
+    out
+}
+
 fn kind_label(kind: AcceleratorKind) -> &'static str {
     match kind {
         AcceleratorKind::Cpu => "CPU",
@@ -156,6 +226,7 @@ pub fn format_cpu_ids(cpus: &[usize]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{CoreTier, CpuInfo, MemoryInfo, PciId};
 
     #[test]
     fn cpu_ids_are_compressed_into_ranges() {
@@ -178,23 +249,22 @@ mod tests {
     }
 
     #[test]
-    fn unknown_memory_and_runtime_states_are_visible_in_the_output() {
+    fn unknown_accelerator_states_are_visible_in_the_output() {
         let report = HardwareReport {
-            cpu: crate::CpuInfo {
+            cpu: CpuInfo {
                 arch: "x86_64".into(),
                 model: Some("Intel(R) Core(TM) Ultra 7 258V".into()),
                 logical_cores: 8,
                 physical_cores: Some(8),
-                core_tiers: vec![crate::CoreTier {
+                core_tiers: vec![CoreTier {
                     cpus: (0..8).collect(),
                     max_freq_mhz: Some(4800),
                     capacity: Some(1024),
                 }],
                 simd: vec!["avx_vnni".into()],
             },
-            memory: crate::MemoryInfo {
-                total_bytes: 33_129_861_120,
-                available_bytes: Some(9_000_000_000),
+            memory: MemoryInfo {
+                total_bytes: Some(33_129_861_120),
             },
             accelerators: vec![
                 crate::Accelerator {
@@ -204,7 +274,7 @@ mod tests {
                     driver: Some("nvidia".into()),
                     driver_version: None,
                     vendor: Some("NVIDIA".into()),
-                    pci_id: Some(crate::PciId {
+                    pci_id: Some(PciId {
                         vendor: "0x10de".into(),
                         device: "0x2204".into(),
                     }),
@@ -242,7 +312,10 @@ mod tests {
         assert!(text.contains("[x86_64]"), "{text}");
         assert!(text.contains("等效算力 8.0 核"), "{text}");
         // 显存"未知"要带原因，不能只说未知
-        assert!(text.contains("内存 未知（NVIDIA 驱动未通过 sysfs 暴露显存上限）"), "{text}");
+        assert!(
+            text.contains("内存 未知（NVIDIA 驱动未通过 sysfs 暴露显存上限）"),
+            "{text}"
+        );
         // 运行时缺件要列出可以照抄去装的东西
         assert!(
             text.contains("运行时 缺件 · OpenVINO NPU：缺 libopenvino_intel_npu_compiler_loader.so"),
@@ -251,5 +324,39 @@ mod tests {
         assert!(text.contains("(10de:2204)"), "{text}");
         assert!(text.contains("共享系统内存"), "{text}");
         assert!(text.contains("频率上限 1900 MHz"), "{text}");
+        // 硬件报告里不该再出现"可用内存"——那是运行时状态
+        assert!(!text.contains("可用"), "硬件报告不该报瞬时值: {text}");
+    }
+
+    #[test]
+    fn exhausted_swap_is_called_out() {
+        let state = RuntimeState {
+            memory: crate::MemoryState {
+                total_bytes: Some(33_129_861_120),
+                available_bytes: Some(9_945_219_072),
+                swap_total_bytes: Some(4_294_963_200),
+                swap_free_bytes: Some(1_552_384),
+            },
+            disks: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let text = human_state(&state);
+        assert!(text.contains("已基本用满"), "{text}");
+        assert!(text.contains("会高估"), "必须给出为什么重要: {text}");
+        assert!(text.contains("未指定要查的路径"), "{text}");
+
+        // 没有 swap 的机器不该出现任何"用满"的提示
+        let no_swap = RuntimeState {
+            memory: crate::MemoryState {
+                swap_total_bytes: Some(0),
+                swap_free_bytes: Some(0),
+                ..state.memory
+            },
+            disks: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let text = human_state(&no_swap);
+        assert!(text.contains("交换     无"), "{text}");
+        assert!(!text.contains("用满"), "{text}");
     }
 }

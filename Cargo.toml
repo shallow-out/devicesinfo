@@ -16,6 +16,9 @@ repository = "https://github.com/shallow-out/devicesinfo"
 deviceinfo = { path = "crates/deviceinfo" }
 
 clap = { version = "4", features = ["derive"] }
+# 只为了 statvfs：标准库至今没有 std::fs::statvfs，而拿 `df` 子进程去解析输出
+# 比这个薄封装差（多一个外部依赖 + 要处理各发行版的 df 方言）。
+libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
