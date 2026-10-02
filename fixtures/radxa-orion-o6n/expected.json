@@ -123,7 +123,7 @@
     },
     {
       "kind": "display",
-      "name": "display (card1)",
+      "name": "card1",
       "driver": "linlondp",
       "memory": {
         "kind": "shared-with-system"
@@ -136,7 +136,7 @@
     },
     {
       "kind": "display",
-      "name": "display (card2)",
+      "name": "card2",
       "driver": "linlondp",
       "memory": {
         "kind": "shared-with-system"
@@ -149,7 +149,7 @@
     },
     {
       "kind": "display",
-      "name": "display (card3)",
+      "name": "card3",
       "driver": "linlondp",
       "memory": {
         "kind": "shared-with-system"

@@ -442,7 +442,13 @@ pub(crate) fn probe_gpus(
                 "{vendor} {} ({node}, id {raw_id})",
                 kind_label_for_name(kind)
             ),
-            (None, None) => format!("{} ({node})", kind_label_for_name(kind)),
+            // 既没 PCI 标识也没设备树 compatible：名字只能靠节点名。
+            // 显示设备连 render 节点都没有，就只留节点名——类别已经在 `kind` 里了，
+            // 否则会渲染成“显示 display (card1)”这种重复且中英混杂的东西。
+            (None, None) => match kind {
+                AcceleratorKind::Display => node.clone(),
+                _ => format!("{} ({node})", kind_label_for_name(kind)),
+            },
         });
 
         let device_path = nodes.first().map(|name| root.join("dev/dri").join(name));
@@ -512,11 +518,10 @@ pub(crate) fn probe_gpus(
     found
 }
 
-/// 给名字用的类别标签（NPU / GPU）。
+/// 给名字用的类别标签（NPU / GPU）。显示设备走另一条路（见调用处）。
 fn kind_label_for_name(kind: AcceleratorKind) -> &'static str {
     match kind {
         AcceleratorKind::Npu => "NPU",
-        AcceleratorKind::Display => "display",
         _ => "GPU",
     }
 }
@@ -970,7 +975,8 @@ mod tests {
         let mut warnings = Vec::new();
         let found = probe_gpus(&root, &empty_libraries(&root), &mut std::collections::BTreeSet::new(), &mut warnings);
         let card0 = found.iter().find(|a| a.name == "GPU (card0)").unwrap();
-        let card1 = found.iter().find(|a| a.name == "display (card1)").unwrap();
+        // 显示设备既没 PCI 标识也没 `compatible`，名字就是节点名——类别在 kind 里
+        let card1 = found.iter().find(|a| a.name == "card1").unwrap();
         assert_eq!(card0.kind, AcceleratorKind::Gpu);
         assert_eq!(
             card0.device_path.as_deref(),
