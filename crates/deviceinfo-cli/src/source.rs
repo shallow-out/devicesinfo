@@ -92,14 +92,8 @@ impl Source {
                 .map(|dir| (dir.clone(), list_local(root, dir)))
                 .collect(),
             Self::Remote(remote) => {
-                let script = "\
-while IFS= read -r d; do
-  printf '@@L %s\\n' \"$d\"
-  ls -1p -- \"$d\" 2>/dev/null
-  printf '@@E\\n'
-done";
                 remote
-                    .run_with_stdin(script, &stdin_lines(dirs))
+                    .run_with_stdin(REMOTE_LIST_SCRIPT, &stdin_lines(dirs))
                     .map(|out| parse_listing(&out))
                     .unwrap_or_default()
             }
@@ -119,14 +113,8 @@ done";
                 })
                 .collect(),
             Self::Remote(remote) => {
-                let script = "\
-while IFS= read -r p; do
-  printf '@@K %s\\n' \"$p\"
-  t=$(readlink -- \"$p\" 2>/dev/null)
-  if [ -n \"$t\" ]; then printf '@@T %s\\n' \"$t\"; else printf '@@N\\n'; fi
-done";
                 remote
-                    .run_with_stdin(script, &stdin_lines(paths))
+                    .run_with_stdin(REMOTE_LINK_SCRIPT, &stdin_lines(paths))
                     .map(|out| parse_links(&out))
                     .unwrap_or_default()
             }
@@ -190,19 +178,7 @@ done";
         let Self::Remote(remote) = self else {
             return;
         };
-        let script = "\
-while IFS= read -r p; do
-  if [ -f \"$p\" ]; then
-    n=$(wc -c < \"$p\" 2>/dev/null) || n=0
-    printf '@@F %s %s\\n' \"$n\" \"$p\"
-    cat -- \"$p\"
-  elif [ -e \"$p\" ]; then
-    printf '@@D %s\\n' \"$p\"
-  else
-    printf '@@M %s\\n' \"$p\"
-  fi
-done";
-        let Ok(out) = remote.run_with_stdin(script, &stdin_lines(paths)) else {
+        let Ok(out) = remote.run_with_stdin(REMOTE_FETCH_SCRIPT, &stdin_lines(paths)) else {
             return;
         };
         parse_batch(
@@ -265,6 +241,41 @@ impl RemoteSource {
         Ok(output.stdout)
     }
 }
+
+/// 远端列目录的脚本。
+///
+/// 抽成常量不只是为了整洁：`remote_scripts_all_run_under_busybox` 会拿本机的 busybox
+/// 真跑一遍——目标机常常是 OpenWrt / 嵌入式，那边只有 busybox，而这类不兼容
+/// 只有到目标机上才会发现，那时候你人未必在机器旁边。
+const REMOTE_LIST_SCRIPT: &str = "\
+while IFS= read -r d; do
+  printf '@@L %s\\n' \"$d\"
+  ls -1p -- \"$d\" 2>/dev/null
+  printf '@@E\\n'
+done";
+
+/// 远端读软链的脚本。`readlink` 失败（不是软链、不存在）时输出 `@@N`。
+const REMOTE_LINK_SCRIPT: &str = "\
+while IFS= read -r p; do
+  printf '@@K %s\\n' \"$p\"
+  t=$(readlink -- \"$p\" 2>/dev/null)
+  if [ -n \"$t\" ]; then printf '@@T %s\\n' \"$t\"; else printf '@@N\\n'; fi
+done";
+
+/// 远端取内容的脚本。**按字节数报长度**，本地据此截断——内容里什么都可能有，
+/// 唯一可靠的定界是长度。
+const REMOTE_FETCH_SCRIPT: &str = "\
+while IFS= read -r p; do
+  if [ -f \"$p\" ]; then
+    n=$(wc -c < \"$p\" 2>/dev/null) || n=0
+    printf '@@F %s %s\\n' \"$n\" \"$p\"
+    cat -- \"$p\"
+  elif [ -e \"$p\" ]; then
+    printf '@@D %s\\n' \"$p\"
+  else
+    printf '@@M %s\\n' \"$p\"
+  fi
+done";
 
 /// 拼成喂给远端 `while read` 的输入。
 ///
@@ -528,6 +539,126 @@ mod tests {
         assert_eq!(stdin_lines(&["a".into(), "b".into()]), b"a\nb\n");
         assert_eq!(stdin_lines(&["only".into()]), b"only\n");
         assert_eq!(stdin_lines(&[]), b"\n");
+    }
+
+    /// 找一个**真的** busybox（不是那种只转发几条命令的 wrapper 脚本）。
+    fn find_busybox() -> Option<PathBuf> {
+        let usable = |path: &Path| {
+            Command::new(path)
+                .arg("--help")
+                .output()
+                .map(|out| String::from_utf8_lossy(&out.stdout).contains("BusyBox v"))
+                .unwrap_or(false)
+        };
+        for candidate in [
+            "/usr/lib/initcpio/busybox",
+            "/usr/bin/busybox",
+            "/bin/busybox",
+        ] {
+            let path = PathBuf::from(candidate);
+            if usable(&path) {
+                return Some(path);
+            }
+        }
+        let in_path = PathBuf::from("busybox");
+        usable(&in_path).then_some(in_path)
+    }
+
+    /// **远端脚本必须能在 busybox 上跑。**
+    ///
+    /// 目标机常常是 OpenWrt / 嵌入式，那边只有 busybox：`ls -1p`、`readlink --`、
+    /// `wc -c` 都有，但 `find -printf`、`readlink -f` 这类 GNU 扩展没有。
+    /// 以前这只是"我读了一遍觉得应该行"——现在拿本机的 busybox 真跑一遍。
+    /// 没有 busybox 的环境直接跳过（不让别人因为缺个工具就红）。
+    #[test]
+    fn remote_scripts_all_run_under_busybox() {
+        let Some(busybox) = find_busybox() else {
+            eprintln!("跳过：本机没有可用的 busybox");
+            return;
+        };
+
+        let root = std::env::temp_dir().join(format!("deviceinfo-bb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("d");
+        std::fs::create_dir_all(dir.join("inner")).unwrap();
+        std::fs::write(dir.join("one.txt"), b"hello\n").unwrap();
+        std::fs::write(dir.join("two.txt"), b"world\n").unwrap();
+        std::os::unix::fs::symlink("inner", dir.join("link")).unwrap();
+
+        // busybox 按 argv[0] 选 applet，所以造一个指向它的软链农场当 PATH
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for applet in ["ls", "readlink", "cat", "wc", "printf", "test", "["] {
+            std::os::unix::fs::symlink(&busybox, bin.join(applet)).unwrap();
+        }
+
+        let run = |script: &str, input: &str| -> Vec<u8> {
+            let mut child = Command::new(&busybox)
+                .args(["sh", "-c", script])
+                .env("PATH", &bin)
+                // 让脚本在一个空环境里跑，免得继承本机的东西
+                .env_remove("IFS")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("busybox 应当能启动");
+            let mut stdin = child.stdin.take().expect("piped");
+            stdin.write_all(input.as_bytes()).unwrap();
+            drop(stdin);
+            let out = child.wait_with_output().unwrap();
+            assert!(
+                out.status.success(),
+                "busybox 跑挂了: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out.stdout
+        };
+
+        // 列目录：`ls -1p` 必须给目录加尾 `/`（这是判 is_dir 的唯一依据）
+        let dir_text = dir.display().to_string();
+        let listing = parse_listing(&run(REMOTE_LIST_SCRIPT, &format!("{dir_text}\n")));
+        let mut names: Vec<(String, bool)> = listing[&dir_text]
+            .iter()
+            .map(|entry| (entry.name.clone(), entry.is_dir))
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                ("inner".to_string(), true),
+                ("link".to_string(), false),
+                ("one.txt".to_string(), false),
+                ("two.txt".to_string(), false),
+            ]
+        );
+
+        // 读软链：软链给目标，普通文件给 `@@N`
+        let link = dir.join("link").display().to_string();
+        let plain = dir.join("one.txt").display().to_string();
+        let missing = dir.join("nope").display().to_string();
+        let links = parse_links(&run(
+            REMOTE_LINK_SCRIPT,
+            &format!("{link}\n{plain}\n{missing}\n"),
+        ));
+        assert_eq!(links[&link].as_deref(), Some("inner"));
+        assert_eq!(links[&plain], None);
+        assert_eq!(links[&missing], None);
+
+        // 取内容：普通文件带内容，设备节点式的不存在路径报 M
+        let one = dir.join("one.txt").display().to_string();
+        let mut contents = BTreeMap::new();
+        let mut kinds = BTreeMap::new();
+        parse_batch(
+            &run(REMOTE_FETCH_SCRIPT, &format!("{one}\n{missing}\n")),
+            &mut contents,
+            &mut kinds,
+        );
+        assert_eq!(contents[&one], b"hello\n");
+        assert_eq!(kinds[&one], EntryKind::File);
+        assert_eq!(kinds[&missing], EntryKind::Missing);
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

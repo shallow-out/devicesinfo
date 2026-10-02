@@ -181,8 +181,28 @@ fn capture(source: &Source, arch: &str, out: &Path) -> io::Result<()> {
             staging.path.clone()
         }
     };
+
+    // 采集源不对时**必须报错**，不能写出一份空壳夹具。
+    //
+    // 这条守卫来自一个真实的失败模式：`ssh` 不可用（没装、认证失败、主机名敲错）时，
+    // 列目录全返回空，于是采集**不报错**、写出一份几乎空的夹具、还说"已采集"。
+    // `--root` 指错地方同理。而夹具是要进回归测试的——**一份空壳夹具比没有夹具更坏**，
+    // 它会让后来的所有探测变更都"通过"。
+    for required in ESSENTIAL_FILES {
+        if !root.join(required).is_file() {
+            return Err(io::Error::other(format!(
+                "{} 里没有 {required}：采集源不对，或者远端没取到东西。\
+                 拒绝写出一份空壳夹具。",
+                source.describe()
+            )));
+        }
+    }
+
     capture_from_root(&root, arch, out)
 }
+
+/// 采集前必须存在的文件。理由见 [`capture`] 里的守卫。
+const ESSENTIAL_FILES: [&str; 2] = ["proc/cpuinfo", "proc/meminfo"];
 
 /// 把远端的东西落到本地临时树。
 ///
@@ -649,4 +669,27 @@ fn write_file(path: &Path, contents: &[u8]) -> io::Result<()> {
         fs::create_dir_all(parent)?;
     }
     fs::write(path, contents)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 采集源不对时**必须报错**。以前它会"成功"写出一份空壳夹具——而空壳夹具比没有
+    /// 夹具更坏：它会让后来的所有探测变更都"通过"。
+    #[test]
+    fn capture_refuses_an_empty_source() {
+        let out = std::env::temp_dir().join(format!("deviceinfo-empty-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&out);
+
+        let source = Source::local(Path::new("/definitely/not/here"));
+        let error = capture(&source, "x86_64", &out).unwrap_err();
+        assert!(error.to_string().contains("proc/cpuinfo"), "{error}");
+        assert!(
+            !out.exists(),
+            "失败时不该留下半个夹具目录——那比没有更坏"
+        );
+
+        let _ = fs::remove_dir_all(&out);
+    }
 }
