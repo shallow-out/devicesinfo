@@ -22,6 +22,7 @@
 //! ——这就是本模块存在的理由。
 
 use crate::sysfs::read_trimmed;
+use crate::tags::{self, parse as tags_parse, TagLine};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -458,12 +459,17 @@ fn probe_inference_tools(root: &Path) -> Vec<InstalledTool> {
 /// 不一致会让路由静默失配——而"任务永远找不到这台机器"这种故障极难查。
 /// 其他字符一律拒绝并出声，理由同上：静默忽略一个拼错的标签，比报错难查得多。
 fn probe_declared_tags(root: &Path, warnings: &mut Vec<String>) -> Vec<DeclaredTag> {
-    let mut configs: Vec<String> = TAG_CONFIGS.iter().map(|path| path.to_string()).collect();
-    if let Ok(entries) = fs::read_dir(root.join(TAG_CONFIG_DIR)) {
+    // 机器路径是 `/etc/...`；拼探测根之前要剥掉开头的 `/`（`join` 会把绝对路径当成整段替换）
+    let mut configs: Vec<String> = tags::config_paths()
+        .iter()
+        .map(|path| path.trim_start_matches('/').to_string())
+        .collect();
+    let shard_dir = tags::TAG_CONFIG_DIR.trim_start_matches('/');
+    if let Ok(entries) = fs::read_dir(root.join(shard_dir)) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
             if name.ends_with(".conf") {
-                configs.push(format!("{TAG_CONFIG_DIR}/{name}"));
+                configs.push(format!("{shard_dir}/{name}"));
             }
         }
     }
@@ -483,42 +489,28 @@ fn probe_declared_tags(root: &Path, warnings: &mut Vec<String>) -> Vec<DeclaredT
 }
 
 /// 解析标签文件。`source` 会记进每条标签里，方便回头找到那一行。
+///
+/// 行格式本身在 [`crate::tags`] 里——**写标签的是另一个程序**，格式只能有一份。
 fn parse_tags(
     text: &str,
     source: &Path,
     tags: &mut Vec<DeclaredTag>,
     warnings: &mut Vec<String>,
 ) {
-    for (number, line) in text.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        for token in line.split_whitespace() {
-            match normalize_tag(token) {
-                Some(tag) => tags.push(DeclaredTag {
-                    tag,
-                    source: source.to_path_buf(),
-                }),
-                None => warnings.push(format!(
-                    "{} 第 {} 行的 {:?} 不是合法标签（只接受字母、数字、`.`、`_`、`-`），已跳过",
-                    source.display(),
-                    number + 1,
-                    token
-                )),
-            }
+    for entry in tags_parse(text) {
+        match entry {
+            TagLine::Tag { tag, .. } => tags.push(DeclaredTag {
+                tag,
+                source: source.to_path_buf(),
+            }),
+            TagLine::Invalid { line, token } => warnings.push(format!(
+                "{} 第 {} 行的 {:?} 不是合法标签（只接受字母、数字、`.`、`_`、`-`），已跳过",
+                source.display(),
+                line,
+                token
+            )),
         }
     }
-}
-
-/// 标签规范化：转小写、`_` 换成 `-`。非法字符返回 `None`（由调用方出声）。
-fn normalize_tag(token: &str) -> Option<String> {
-    if token.is_empty()
-        || !token.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-    {
-        return None;
-    }
-    Some(token.to_ascii_lowercase().replace('_', "-"))
 }
 
 /// 收集配置好的容器镜像源。

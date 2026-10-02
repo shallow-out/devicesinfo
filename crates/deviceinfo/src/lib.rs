@@ -57,6 +57,7 @@ mod report;
 mod runtime;
 mod state;
 mod sysfs;
+pub mod tags;
 
 pub mod pci;
 pub mod render;
