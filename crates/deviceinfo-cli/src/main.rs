@@ -138,11 +138,11 @@ fn main() {
             arch,
             strict,
         } => {
-            let arch = arch.unwrap_or_else(|| std::env::consts::ARCH.to_string());
             let source = match &ssh {
                 Some(host) => Source::remote(host),
                 None => Source::local(&root),
             };
+            let (arch, arch_warnings) = resolve_arch(&source, &root, arch);
             let (local_root, _staging) = match resolve_local_root(&source) {
                 Ok(pair) => pair,
                 Err(error) => {
@@ -151,6 +151,8 @@ fn main() {
                 }
             };
             let report = probe_with(&local_root, &arch);
+            let mut report = report;
+            report.warnings.splice(0..0, arch_warnings);
             if cli.json {
                 print_json(&report);
             } else {
@@ -251,12 +253,12 @@ fn main() {
             ssh,
             arch,
         } => {
-            let arch = arch.unwrap_or_else(|| std::env::consts::ARCH.to_string());
             let source = match &ssh {
                 Some(host) => Source::remote(host),
                 None => Source::local(&root),
             };
-            match capture(&source, &arch, &out) {
+            let (arch, arch_warnings) = resolve_arch(&source, &root, arch);
+            match capture(&source, &arch, &arch_warnings, &out) {
                 Ok(()) => println!("已从 {} 采集到 {}", source.describe(), out.display()),
                 Err(error) => {
                     eprintln!("采集失败: {error}");
@@ -289,7 +291,7 @@ fn print_json<T: serde::Serialize>(value: &T) {
 ///
 /// 这样 `tests/fixtures.rs` 就能"拿真机形状跑一遍，结果必须一样"——
 /// 手写的假 flags 列表抓不到真实内核里的意外（`smep` 就是这么混进指令集列表的）。
-fn capture(source: &Source, arch: &str, out: &Path) -> io::Result<()> {
+fn capture(source: &Source, arch: &str, extra_warnings: &[String], out: &Path) -> io::Result<()> {
     // 远端先镜像成本地临时树，之后一切都按本地处理——这样本地采集的路径一字未变，
     // 远端采集只是多了一步落地。
     let staging = TempTree::new()?;
@@ -323,7 +325,7 @@ fn capture(source: &Source, arch: &str, out: &Path) -> io::Result<()> {
         }
     }
 
-    capture_from_root(&root, arch, out)
+    capture_from_root(&root, arch, extra_warnings, out)
 }
 
 /// "顺手带上内容"的大小门槛。
@@ -487,9 +489,12 @@ impl Drop for TempTree {
 }
 
 /// 从一棵**本地**文件树写夹具。
-fn capture_from_root(root: &Path, arch: &str, out: &Path) -> io::Result<()> {
+fn capture_from_root(root: &Path, arch: &str, extra_warnings: &[String], out: &Path) -> io::Result<()> {
     let source = Source::local(root);
-    let report = probe_with(root, arch);
+    let mut report = probe_with(root, arch);
+    // 架构是猜来的（或调用方指定的）时，报告里要跟着一句解释——否则夹具里那个
+    // 架构值看起来就像探测出来的事实。
+    report.warnings.splice(0..0, extra_warnings.iter().cloned());
     let plan = capture_plan(&source)?;
 
     // 0) **只需要"存在"**的输入：夹具里放空占位。可执行文件动辄几十 MB，
@@ -985,12 +990,7 @@ impl Runner {
             Some(host) => {
                 let mut words: Vec<String> = vec![source::quoted(program)];
                 words.extend(args.iter().map(|arg| source::quoted(arg)));
-                let mut command = ProcessCommand::new("ssh");
-                command
-                    .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--"])
-                    .arg(host)
-                    .arg(words.join(" "));
-                run_with_timeout(command, self.timeout + Duration::from_secs(5))
+                ssh_exec(host, &words.join(" "), self.timeout + Duration::from_secs(5))
             }
         }
     }
@@ -1044,6 +1044,68 @@ fn run_with_timeout(mut command: ProcessCommand, timeout: Duration) -> io::Resul
         )));
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// 目标架构。**从文件里读不出来**（`/proc` 和 `/sys` 里都没有这个字段），所以只能
+/// 要么调用方给，要么问目标机——而架构是"能不能跑"最硬的过滤条件，猜错的代价是部署错东西。
+fn resolve_arch(source: &Source, root: &Path, explicit: Option<String>) -> (String, Vec<String>) {
+    match source {
+        // 隔着一台机器却拿本机架构当默认值，会**静默产出一个看似合理的错答案**
+        // （真的发生了：aarch64 的机器被记成 x86_64），而报告里没有任何东西提示它。
+        Source::Remote(_) => {
+            let host = source.host().to_string();
+            let reported = ssh_exec(&host, "uname -m", Duration::from_secs(15))
+                .map(|output| output.trim().to_string())
+                .ok()
+                .filter(|arch| !arch.is_empty());
+            match (explicit, reported) {
+                // 显式的 `--arch` 是有意的（比如 32 位用户态跑在 64 位内核上），
+                // 所以**不静默覆盖**，但要把不一致说出来。
+                (Some(explicit), Some(reported)) if explicit != reported => (
+                    explicit.clone(),
+                    vec![format!(
+                        "指定的架构 {explicit} 与目标机 `uname -m` 报的 {reported} 不一致，报告里用的是指定的那个"
+                    )],
+                ),
+                (Some(explicit), _) => (explicit, Vec::new()),
+                (None, Some(reported)) => (reported, Vec::new()),
+                (None, None) => {
+                    let fallback = std::env::consts::ARCH.to_string();
+                    (
+                        fallback.clone(),
+                        vec![format!(
+                            "问不出目标机的架构（`uname -m` 没能执行），退回了本机的 {fallback}——这个值很可能是错的，用 --arch 指定"
+                        )],
+                    )
+                }
+            }
+        }
+        // 本机探测时，编译进来的架构是对的：二进制就跑在这台上。
+        Source::Local(_) => {
+            let mut warnings = Vec::new();
+            let guessed = explicit.is_none();
+            let arch = explicit.unwrap_or_else(|| std::env::consts::ARCH.to_string());
+            // 只有**默认值**才算猜；调用方指定了架构就没有猜的成分了。
+            if guessed && root != Path::new("/") {
+                warnings.push(format!(
+                    "架构用的是本机的 {arch}；`--root` 指向的是另一棵树，如果它来自别的机器，请用 --arch 指定"
+                ));
+            }
+            (arch, warnings)
+        }
+    }
+}
+
+/// 隔着 ssh 在目标机上跑一条命令，返回标准输出。
+///
+/// 采集本来就要读目标机的文件（`run_with_stdin` 里那些脚本），这里只是借同一条通道
+/// 多问一句。**库那边不碰执行**：`deviceinfo` 里的实时探测也是由调用方提供 runner 的。
+fn ssh_exec(host: &str, command: &str, timeout: Duration) -> io::Result<String> {
+    let mut ssh = ProcessCommand::new("ssh");
+    ssh.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--"])
+        .arg(host)
+        .arg(command);
+    run_with_timeout(ssh, timeout)
 }
 
 fn write_file(path: &Path, contents: &[u8]) -> io::Result<()> {
@@ -1103,7 +1165,7 @@ mod tests {
         )
         .unwrap();
 
-        capture(&Source::local(&root), "x86_64", &out).expect("采集应当成功");
+        capture(&Source::local(&root), "x86_64", &[], &out).expect("采集应当成功");
 
         // 夹具本身要能探测出来
         let report = deviceinfo::probe_environment(&out);
@@ -1125,7 +1187,8 @@ mod tests {
         let _ = fs::remove_dir_all(&out);
 
         let source = Source::local(Path::new("/definitely/not/here"));
-        let error = capture(&source, "x86_64", &out).unwrap_err();
+
+        let error = capture(&source, "x86_64", &[], &out).unwrap_err();
         assert!(error.to_string().contains("proc/cpuinfo"), "{error}");
         assert!(
             !out.exists(),
@@ -1133,5 +1196,25 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&out);
+    }
+
+    /// 架构猜错是**静默**的错：报告里看不出那个值是探测来的还是默认值，所以猜的时候必须出声。
+    #[test]
+    fn a_guessed_arch_must_say_so() {
+        // 本机、根就是 "/"：编译进来的架构是对的，不该有噪声
+        let (arch, warnings) = resolve_arch(&Source::local(Path::new("/")), Path::new("/"), None);
+        assert_eq!(arch, std::env::consts::ARCH);
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        // 换了一棵树：它可能是别的机器的夹具，此时的默认值就只是猜
+        let tree = Path::new("/tmp/another-machine");
+        let (_, warnings) = resolve_arch(&Source::local(tree), tree, None);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("--arch"), "{warnings:?}");
+
+        // 显式指定就不算猜
+        let (arch, warnings) = resolve_arch(&Source::local(tree), tree, Some("aarch64".into()));
+        assert_eq!(arch, "aarch64");
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 }

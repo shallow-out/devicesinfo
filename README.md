@@ -178,9 +178,15 @@ x86 flag / 108 个 arm64 feature 全都躺着，下次再引入同类偏差会�
 # 本机
 cargo run -p deviceinfo-cli -- capture --out fixtures/<名字>
 # 另一台机器**隔着 ssh** 采（推荐：目标机不需要任何工具链）
-cargo run -p deviceinfo-cli -- capture --ssh <主机名> --arch <架构> --out fixtures/<名字>
+cargo run -p deviceinfo-cli -- capture --ssh <主机名> --out fixtures/<名字>
 git add fixtures/<名字>
 ```
+
+`--arch` 只在**覆盖**实机自报的架构时才需要（比如 32 位用户态跑在 64 位内核上）；
+平时不用给：`--ssh` 时会问目标机一句 `uname -m`。**这个值没法从文件里读出来**——`/proc`
+和 `/sys` 里都没有这个字段——而它又是"能不能跑"最硬的过滤条件，所以一旦拿不到、只能退回
+本机架构，报告里会带一条警告（猜错的代价是往那台机器上部署错东西）。给了 `--arch` 又与
+实机不一致时同样会出声，但**用你指定的那个**：显式指定是有意的，不该被静默覆盖。
 
 **为什么采集要能隔着 ssh 做**：夹具必须在目标机上采，而目标机往往装不了 Rust 工具链
 （路由器、嵌入式盒子），本机也未必能交叉编译到它的架构（本机 Rust 是 pacman 装的，

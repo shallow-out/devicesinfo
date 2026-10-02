@@ -68,6 +68,14 @@ impl Source {
         Self::Local(root.to_path_buf())
     }
 
+    /// 远端主机名。
+    pub(crate) fn host(&self) -> &str {
+        match self {
+            Self::Remote(remote) => &remote.host,
+            Self::Local(_) => "",
+        }
+    }
+
     pub(crate) fn remote(host: &str) -> Self {
         Self::Remote(RemoteSource {
             host: host.to_string(),
