@@ -85,25 +85,28 @@ impl Source {
     }
 
     /// 一次取回多个目录的条目名。不存在的目录返回空列表。
-    pub(crate) fn list_many(&self, dirs: &[String]) -> BTreeMap<String, Vec<Entry>> {
+    ///
+    /// 返回 `Result` 而不是"失败就给空"：采集会把结果写成一份要进回归测试的夹具，
+    /// 而**空白结果会造出一份自洽但错误的夹具**（expected.json 是从同一棵暂存树
+    /// 算出来的，所以测试反而会通过）。尤其是最后一步 `link_many` 失败时，
+    /// 夹具会静默地没有驱动软链。
+    pub(crate) fn list_many(&self, dirs: &[String]) -> io::Result<BTreeMap<String, Vec<Entry>>> {
         match self {
-            Self::Local(root) => dirs
+            Self::Local(root) => Ok(dirs
                 .iter()
                 .map(|dir| (dir.clone(), list_local(root, dir)))
-                .collect(),
+                .collect()),
             Self::Remote(remote) => {
-                remote
-                    .run_with_stdin(REMOTE_LIST_SCRIPT, &stdin_lines(dirs))
-                    .map(|out| parse_listing(&out))
-                    .unwrap_or_default()
+                let out = remote.run_with_stdin(REMOTE_LIST_SCRIPT, &stdin_lines(dirs))?;
+                Ok(parse_listing(&out))
             }
         }
     }
 
     /// 一次取回多个路径的软链目标。不是软链、或读不到，对应 `None`。
-    pub(crate) fn link_many(&self, paths: &[String]) -> BTreeMap<String, Option<String>> {
+    pub(crate) fn link_many(&self, paths: &[String]) -> io::Result<BTreeMap<String, Option<String>>> {
         match self {
-            Self::Local(root) => paths
+            Self::Local(root) => Ok(paths
                 .iter()
                 .map(|path| {
                     let target = std::fs::read_link(root.join(path))
@@ -111,12 +114,10 @@ impl Source {
                         .and_then(|target| target.to_str().map(str::to_string));
                     (path.clone(), target)
                 })
-                .collect(),
+                .collect()),
             Self::Remote(remote) => {
-                remote
-                    .run_with_stdin(REMOTE_LINK_SCRIPT, &stdin_lines(paths))
-                    .map(|out| parse_links(&out))
-                    .unwrap_or_default()
+                let out = remote.run_with_stdin(REMOTE_LINK_SCRIPT, &stdin_lines(paths))?;
+                Ok(parse_links(&out))
             }
         }
     }
@@ -174,18 +175,26 @@ impl Source {
     ///
     /// 本地是空操作；远端把几十次连接压成一次。**采集在动手前就知道完整清单**，
     /// 所以这个批量是自然的，不是妥协。
-    pub(crate) fn prefetch(&self, paths: &[String]) {
+    pub(crate) fn prefetch(&self, paths: &[String]) -> io::Result<()> {
         let Self::Remote(remote) = self else {
-            return;
+            return Ok(());
         };
-        let Ok(out) = remote.run_with_stdin(REMOTE_FETCH_SCRIPT, &stdin_lines(paths)) else {
-            return;
-        };
+        let out = remote.run_with_stdin(REMOTE_FETCH_SCRIPT, &stdin_lines(paths))?;
+        let mut failures = Vec::new();
         parse_batch(
             &out,
             &mut remote.contents.borrow_mut(),
             &mut remote.kinds.borrow_mut(),
+            &mut failures,
         );
+        if !failures.is_empty() {
+            return Err(io::Error::other(format!(
+                "远端有 {} 个文件复制不出来（例如 {}），采集结果不可信",
+                failures.len(),
+                failures[0]
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -262,14 +271,27 @@ while IFS= read -r p; do
   if [ -n \"$t\" ]; then printf '@@T %s\\n' \"$t\"; else printf '@@N\\n'; fi
 done";
 
-/// 远端取内容的脚本。**按字节数报长度**，本地据此截断——内容里什么都可能有，
-/// 唯一可靠的定界是长度。
+/// 远端取内容的脚本。
+///
+/// 两个细节都是踩过才知道的：
+///
+/// 1. **先落到临时文件，再量它的长度。** 直接写 `wc -c < "$p"; cat -- "$p"` 是读了
+///    两次，而 `/proc/meminfo`、`npu_busy_time_us`、`freq0/cur_freq` 这些**中途会变长短**。
+///    长度对不上，本地按长度截断就会**从此错位**，而错位的结果是静默的：
+///    expected.json 是从同一棵暂存树算出来的，夹具测试照样通过。
+/// 2. 复制不出来就报 `@@X`，让本地**直接失败**，而不是当成"不存在"——把读失败
+///    伪装成缺失，又会造出"自洽但错误"的夹具。
 const REMOTE_FETCH_SCRIPT: &str = "\
 while IFS= read -r p; do
   if [ -f \"$p\" ]; then
-    n=$(wc -c < \"$p\" 2>/dev/null) || n=0
-    printf '@@F %s %s\\n' \"$n\" \"$p\"
-    cat -- \"$p\"
+    t=\"${TMPDIR:-/tmp}/.deviceinfo-cat-$$\"
+    if cat -- \"$p\" > \"$t\" 2>/dev/null; then
+      printf '@@F %s %s\\n' \"$(wc -c < \"$t\")\" \"$p\"
+      cat -- \"$t\"
+      rm -f \"$t\"
+    else
+      printf '@@X %s\\n' \"$p\"
+    fi
   elif [ -e \"$p\" ]; then
     printf '@@D %s\\n' \"$p\"
   else
@@ -377,6 +399,7 @@ fn parse_batch(
     out: &[u8],
     contents: &mut BTreeMap<String, Vec<u8>>,
     kinds: &mut BTreeMap<String, EntryKind>,
+    failures: &mut Vec<String>,
 ) {
     let mut pos = 0;
     while pos < out.len() {
@@ -411,6 +434,11 @@ fn parse_batch(
                 kinds.insert(path.to_string(), EntryKind::Missing);
                 pos = body_start;
             }
+            // 远端主诉"存在但我复制不出来"——本地必须当错误，不能当缺失
+            (Some("@@X"), Some(path), None) => {
+                failures.push(path.to_string());
+                pos = body_start;
+            }
             _ => {
                 // 内容里恰好有 `@@`：跳过这一行继续找
                 pos = body_start;
@@ -436,7 +464,7 @@ mod tests {
 
         let mut contents = BTreeMap::new();
         let mut kinds = BTreeMap::new();
-        parse_batch(&out, &mut contents, &mut kinds);
+        parse_batch(&out, &mut contents, &mut kinds, &mut Vec::new());
 
         assert_eq!(contents.get("/x/one").map(Vec::as_slice), Some(&content[..]));
         assert_eq!(kinds.get("/x/one"), Some(&EntryKind::File));
@@ -446,11 +474,30 @@ mod tests {
         assert!(!kinds.contains_key("fake"));
     }
 
+    /// 远端说"存在但我复制不出来"时，本地必须当**错误**，不能当缺失——
+    /// 把读失败伪装成缺失，又会造出自洽但错误的夹具。
+    #[test]
+    fn a_read_failure_from_the_remote_is_collected_not_ignored() {
+        let out = b"@@F 5 /x/ok\nhello@@X /x/broken\n@@M /x/gone\n";
+        let mut contents = BTreeMap::new();
+        let mut kinds = BTreeMap::new();
+        let mut failures = Vec::new();
+        parse_batch(out, &mut contents, &mut kinds, &mut failures);
+
+        assert_eq!(failures, vec!["/x/broken"]);
+        assert!(
+            !kinds.contains_key("/x/broken"),
+            "读失败不能被伪装成缺失"
+        );
+        assert_eq!(kinds.get("/x/gone"), Some(&EntryKind::Missing));
+        assert_eq!(contents.get("/x/ok").map(Vec::as_slice), Some(&b"hello"[..]));
+    }
+
     #[test]
     fn parses_an_empty_batch_response() {
         let mut contents = BTreeMap::new();
         let mut kinds = BTreeMap::new();
-        parse_batch(b"", &mut contents, &mut kinds);
+        parse_batch(b"", &mut contents, &mut kinds, &mut Vec::new());
         assert!(contents.is_empty() && kinds.is_empty());
     }
 
@@ -495,7 +542,7 @@ mod tests {
 
         let source = Source::local(&root);
         let dirs = vec!["d".to_string(), "d/absent".to_string()];
-        let listing = source.list_many(&dirs);
+        let listing = source.list_many(&dirs).expect("本地列表不会失败");
 
         let mut names: Vec<(String, bool)> = listing["d"]
             .iter()
@@ -526,7 +573,9 @@ mod tests {
         assert_eq!(source.kind("d/nope"), EntryKind::Missing);
         assert_eq!(source.read("d/nope"), None);
 
-        let links = source.link_many(&["d/link".to_string(), "d/one.txt".to_string()]);
+        let links = source
+            .link_many(&["d/link".to_string(), "d/one.txt".to_string()])
+            .expect("本地读软链不会失败");
         assert_eq!(links["d/link"].as_deref(), Some("inner"));
         assert_eq!(links["d/one.txt"], None, "普通文件不是软链");
 
@@ -649,11 +698,14 @@ mod tests {
         let one = dir.join("one.txt").display().to_string();
         let mut contents = BTreeMap::new();
         let mut kinds = BTreeMap::new();
+        let mut failures = Vec::new();
         parse_batch(
             &run(REMOTE_FETCH_SCRIPT, &format!("{one}\n{missing}\n")),
             &mut contents,
             &mut kinds,
+            &mut failures,
         );
+        assert!(failures.is_empty(), "{failures:?}");
         assert_eq!(contents[&one], b"hello\n");
         assert_eq!(kinds[&one], EntryKind::File);
         assert_eq!(kinds[&missing], EntryKind::Missing);

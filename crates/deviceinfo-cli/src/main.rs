@@ -209,16 +209,21 @@ const ESSENTIAL_FILES: [&str; 2] = ["proc/cpuinfo", "proc/meminfo"];
 /// 只拉探测**读**的那些文件，加上库目录的**文件名**——库内容对夹具毫无用处，
 /// 而 `LibraryIndex` 只看名字。
 fn mirror(source: &Source, stage: &Path) -> io::Result<()> {
-    let plan = capture_plan(source);
+    let plan = capture_plan(source)?;
     // 一次 ssh 把全部内容取回来，而不是每个文件开一次连接
-    source.prefetch(&plan.files);
+    source.prefetch(&plan.files)?;
 
     for rel in &plan.files {
         let raw = match source.kind(rel) {
             // 设备节点（`/dev/accel/accel0` 这类字符设备）取不得内容：直接读会阻塞。
             // 夹具只需要"它存在"这个事实。
             EntryKind::Other => Vec::new(),
-            EntryKind::File => source.read(rel).unwrap_or_default(),
+            // **说它是普通文件就得真读到内容。** 这里以前是 `unwrap_or_default()`——
+            // 读失败就写一个空文件，而那正是我修过两次的病：空文件看起来像正常数据，
+            // 探测会把缺的值读成空字符串。读到就报错，至少能看出是哪一条。
+            EntryKind::File => source.read(rel).ok_or_else(|| {
+                io::Error::other(format!("{rel} 报为普通文件但读不到内容"))
+            })?,
             // **不存在就跳过。** 写成空文件会让探测把缺的项读成空字符串
             EntryKind::Missing => continue,
         };
@@ -235,7 +240,7 @@ fn mirror(source: &Source, stage: &Path) -> io::Result<()> {
     // 库目录一次列完。**目录名要滤掉**：`usr/lib` 的列表里含 `aarch64-linux-gnu`
     // 这样的目录，把它当库文件写成普通文件，下一步往它里面写就会 `EEXIST`。
     let library_dirs: Vec<String> = LIBRARY_DIRS.iter().map(|dir| dir.to_string()).collect();
-    for (dir, entries) in source.list_many(&library_dirs) {
+    for (dir, entries) in source.list_many(&library_dirs)? {
         for entry in entries.into_iter().filter(|entry| !entry.is_dir) {
             write_file(&stage.join(&dir).join(entry.name), b"")?;
         }
@@ -273,7 +278,7 @@ impl Drop for TempTree {
 fn capture_from_root(root: &Path, arch: &str, out: &Path) -> io::Result<()> {
     let source = Source::local(root);
     let report = probe_with(root, arch);
-    let plan = capture_plan(&source);
+    let plan = capture_plan(&source)?;
 
     // 1) 探测会读到的文件
     for rel in &plan.files {
@@ -351,7 +356,7 @@ fn capture_from_root(root: &Path, arch: &str, out: &Path) -> io::Result<()> {
     )?;
     write_file(
         &out.join("expected.json"),
-        format!("{}\n", relativize_json(&report, root)).as_bytes(),
+        format!("{}\n", relativize_json(&report, root)?).as_bytes(),
     )?;
     Ok(())
 }
@@ -366,7 +371,7 @@ struct CapturePlan {
     symlinks: Vec<(String, String)>,
 }
 
-fn capture_plan(source: &Source) -> CapturePlan {
+fn capture_plan(source: &Source) -> io::Result<CapturePlan> {
     let mut files = vec![
         "proc/cpuinfo".to_string(),
         "proc/meminfo".to_string(),
@@ -390,7 +395,7 @@ fn capture_plan(source: &Source) -> CapturePlan {
         ACCEL_DIR.to_string(),
         DRM_DIR.to_string(),
         DRI_DIR.to_string(),
-    ]);
+    ])?;
 
     for cpu in lists.numeric(CPU_DIR, "cpu") {
         for rel in [
@@ -431,8 +436,8 @@ fn capture_plan(source: &Source) -> CapturePlan {
         .collect();
     // 阶段二：所有 card 的 device 目录 + 各自的 drm/ 一次列完
     let drm_subdirs: Vec<String> = cards.iter().map(|d| format!("{d}/drm")).collect();
-    lists.ensure(&cards);
-    lists.ensure(&drm_subdirs);
+    lists.ensure(&cards)?;
+    lists.ensure(&drm_subdirs)?;
 
     let mut tile_dirs = Vec::new();
     for device in &cards {
@@ -467,7 +472,7 @@ fn capture_plan(source: &Source) -> CapturePlan {
         device_dirs.push(device.clone());
     }
     // 阶段三：tile 下面的 gt 目录
-    lists.ensure(&tile_dirs);
+    lists.ensure(&tile_dirs)?;
     for tile_dir in &tile_dirs {
         for gt in lists.numeric(tile_dir, "gt") {
             for leaf in ["max_freq", "cur_freq"] {
@@ -483,7 +488,7 @@ fn capture_plan(source: &Source) -> CapturePlan {
     // PCI 总线：找"本模块不建模的加速器"。照抄内核自己的分类（`class` 0x12xx / 0x0b40），
     // 这样 Hailo-8 / Coral / FPGA 卡这类既不走 /dev/accel 也不出 DRM 的设备不会静默消失。
     const PCI_DIR: &str = "sys/bus/pci/devices";
-    lists.ensure(&[PCI_DIR.to_string()]);
+    lists.ensure(&[PCI_DIR.to_string()])?;
     let mut pci_driver_links = Vec::new();
     for device in lists.entries(PCI_DIR) {
         let base = format!("{PCI_DIR}/{}", device.name);
@@ -504,7 +509,7 @@ fn capture_plan(source: &Source) -> CapturePlan {
         .map(|device| format!("{device}/driver"))
         .collect();
     link_paths.extend(pci_driver_links);
-    let links = source.link_many(&link_paths);
+    let links = source.link_many(&link_paths)?;
     for (path, target) in links {
         let Some(name) = target
             .as_deref()
@@ -518,7 +523,7 @@ fn capture_plan(source: &Source) -> CapturePlan {
         files.push(format!("sys/module/{name}/version"));
     }
 
-    CapturePlan { files, symlinks }
+    Ok(CapturePlan { files, symlinks })
 }
 
 /// 目录列表的缓存。
@@ -539,20 +544,21 @@ impl<'a> ListCache<'a> {
     }
 
     /// 确保这些目录都列过了。没列过的**合并成一次往返**。
-    fn ensure(&mut self, dirs: &[String]) {
+    fn ensure(&mut self, dirs: &[String]) -> io::Result<()> {
         let missing: Vec<String> = dirs
             .iter()
             .filter(|dir| !self.dirs.contains_key(*dir))
             .cloned()
             .collect();
         if missing.is_empty() {
-            return;
+            return Ok(());
         }
-        self.dirs.extend(self.source.list_many(&missing));
+        self.dirs.extend(self.source.list_many(&missing)?);
         // 远端没返回的（目录不存在）也要记下来，免得反复问
         for dir in missing {
             self.dirs.entry(dir).or_default();
         }
+        Ok(())
     }
 
     fn entries(&self, dir: &str) -> &[Entry] {
@@ -583,10 +589,13 @@ impl<'a> ListCache<'a> {
 ///
 /// 夹具要能在任何机器、任何路径下跑，期望值里就不能留 `/tmp/...` 这种绝对前缀。
 /// `tests/fixtures.rs` 用同一套规则把实际结果归一化，两边才能比。
-fn relativize_json(report: &HardwareReport, root: &Path) -> String {
-    let json = serde_json::to_string_pretty(report).expect("报告一定可序列化");
+fn relativize_json(report: &HardwareReport, root: &Path) -> io::Result<String> {
+    // 不用 `expect`：`PathBuf` 的 serde 实现会在路径不是合法 UTF-8 时失败，
+    // 而设备路径来自外部输入。报错比 panic 好。
+    let json = serde_json::to_string_pretty(report)
+        .map_err(|error| io::Error::other(format!("报告序列化失败: {error}")))?;
     let prefix = format!("{}/", root.display().to_string().trim_end_matches('/'));
-    json.replace(&prefix, "/")
+    Ok(json.replace(&prefix, "/"))
 }
 
 /// `/proc/cpuinfo` 里探测器会读的键。其余的（尤其是 `cpu MHz`）都是瞬时值。

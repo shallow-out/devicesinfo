@@ -179,10 +179,11 @@ fn probe_core_tiers(
         ));
     }
 
-    // BTreeMap 迭代是键升序，而我们要强的在前
-    groups
+    // 排序而不是靠 `rev()`：`TierKey` 是个枚举，混合键（部分核有 capacity、部分只有频率）
+    // 时按枚举顺序排会得到“只有频率的那几档反而排在前面”这种莫名其妙的结果。
+    // 按**实际强弱**排，缺 capacity 的排最后。
+    let mut tiers: Vec<CoreTier> = groups
         .into_iter()
-        .rev()
         .map(|(key, members)| CoreTier {
             cpus: members.iter().map(|(cpu, _)| *cpu).collect(),
             max_freq_mhz: members.iter().filter_map(|(_, freq)| *freq).max(),
@@ -191,7 +192,14 @@ fn probe_core_tiers(
                 TierKey::Freq(_) => None,
             },
         })
-        .collect()
+        .collect();
+    tiers.sort_by_key(|tier| {
+        (
+            std::cmp::Reverse(tier.capacity.unwrap_or(0)),
+            std::cmp::Reverse(tier.max_freq_mhz.unwrap_or(0)),
+        )
+    });
+    tiers
 }
 
 /// 物理核数。三条路径，按可靠性排序；都拿不到就 `None`，不猜。
@@ -215,19 +223,27 @@ fn probe_physical_cores(
     }
 
     let mut core_groups: Vec<Vec<usize>> = Vec::new();
+    let mut covered = 0_usize;
     for cpu in cpu_ids {
         let Some(list) = read_trimmed(&root.join(format!(
             "sys/devices/system/cpu/cpu{cpu}/topology/core_cpus_list"
         ))) else {
             continue;
         };
+        covered += 1;
         let group = parse_cpu_list(&list);
         if !group.is_empty() && !core_groups.contains(&group) {
             core_groups.push(group);
         }
     }
+    // **只有把所有核都读到了才敢用这个来源。** 只读到一部分的话，去重后的组数必然偏少，
+    // 而"物理核数偏少"会静默地让上层以为这机器比实际弱，还看不出哪里错了。
     // 多于逻辑核数说明这个来源不可信，宁可不用
-    if !core_groups.is_empty() && core_groups.len() <= logical_cores {
+    if !cpu_ids.is_empty()
+        && covered == cpu_ids.len()
+        && !core_groups.is_empty()
+        && core_groups.len() <= logical_cores
+    {
         return Some(core_groups.len());
     }
 
@@ -587,6 +603,72 @@ mod tests {
                 .machine_model
                 .as_deref(),
             Some("Radxa ROCK 5B+")
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// `core_cpus_list` 只读到一部分时**不能**拿它算物理核数：去重后的组数必然偏少，
+    /// 而"物理核数偏少"会静默地让上层以为这机器比实际弱，还看不出哪里错了。
+    #[test]
+    fn a_partially_readable_topology_is_not_trusted() {
+        let root = fake_root("partial-topology");
+        fake_meminfo(&root);
+        let mut cpuinfo = String::new();
+        for cpu in 0..4 {
+            cpuinfo.push_str(&format!(
+                "processor\t: {cpu}\nmodel name\t: x\nphysical id\t: 0\ncore id\t: {cpu}\n\n"
+            ));
+        }
+        fs::write(root.join("proc/cpuinfo"), cpuinfo).unwrap();
+        fs::create_dir_all(root.join("sys/devices/system/cpu/smt")).unwrap();
+        fs::write(root.join("sys/devices/system/cpu/smt/active"), "1\n").unwrap();
+        for cpu in 0..4 {
+            fs::create_dir_all(root.join(format!("sys/devices/system/cpu/cpu{cpu}"))).unwrap();
+        }
+        // 只有前两个核的 core_cpus_list 读得到
+        for cpu in 0..2 {
+            let topology = root.join(format!("sys/devices/system/cpu/cpu{cpu}/topology"));
+            fs::create_dir_all(&topology).unwrap();
+            fs::write(topology.join("core_cpus_list"), format!("{cpu}\n")).unwrap();
+        }
+
+        let mut warnings = Vec::new();
+        let reported = probe(&root, "x86_64", &mut warnings);
+        assert_eq!(reported.logical_cores, 4);
+        assert_eq!(
+            reported.physical_cores,
+            Some(4),
+            "只读到一半就该退回 cpuinfo，而不是少报成 2"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// 部分核有 `cpu_capacity`、部分只有频率时，分档顺序要按**实际强弱**，
+    /// 不能按枚举顺序——那会让"只有频率"的档莫名其妙排在前面。
+    #[test]
+    fn tiers_without_capacity_do_not_sort_ahead() {
+        let root = fake_root("mixed-capacity");
+        fake_meminfo(&root);
+        fs::write(
+            root.join("proc/cpuinfo"),
+            "processor\t: 0\nmodel name\t: x\n",
+        )
+        .unwrap();
+        // cpu0 有 capacity（已知是弱核），cpu1 只有很高的频率但没 capacity
+        fake_cpus(&root, &[(0, Some(900_000), Some(300)), (1, Some(2_800_000), None)]);
+
+        let mut warnings = Vec::new();
+        let reported = probe(&root, "x86_64", &mut warnings);
+        assert_eq!(reported.core_tiers.len(), 2, "{:#?}", reported.core_tiers);
+        // 有 capacity 的那档排在前面：它是"已知强弱"，只有频率的那档什么都不知道
+        assert_eq!(reported.core_tiers[0].capacity, Some(300));
+        assert_eq!(reported.core_tiers[1].capacity, None);
+        // 而且这件事要说出来（否则等效核数看起来只是个偏低的数字）
+        assert!(
+            warnings.iter().any(|w| w.contains("cpu_capacity")),
+            "{warnings:?}"
         );
 
         fs::remove_dir_all(&root).ok();
