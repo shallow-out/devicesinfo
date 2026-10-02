@@ -413,13 +413,22 @@ fn probe_containers(root: &Path) -> Vec<ContainerRuntime> {
     found
 }
 
+/// 壳脚本的大小上限。超过它就不可能是壳脚本——真二进制都是几十 MB。
+const SHIM_MAX_BYTES: u64 = 16 * 1024;
+
 /// 如果这是个"壳脚本"（某某兼容包），返回它实际调用的运行时名。
 ///
 /// 判断很保守：**必须**是 `#!` 开头的脚本文本，而且内容里出现另一个已知运行时的名字。
 /// 只读文件，不执行——所以宁可漏判，也不要把真的 docker 说成壳。
 fn shim_target(path: &Path) -> Option<&'static str> {
+    // **先看大小再读**：真二进制动辄几十 MB（`/usr/bin/podman` 45 MB），
+    // 为了看一眼 shebang 把它整个读进来是纯浪费。壳脚本都很小。
+    let meta = fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > SHIM_MAX_BYTES {
+        return None;
+    }
     let text = fs::read_to_string(path).ok()?;
-    if !text.starts_with("#!") || text.len() > 64 * 1024 {
+    if !text.starts_with("#!") {
         return None;
     }
     CONTAINER_RUNTIMES

@@ -1,5 +1,11 @@
 {
   "cgroup": "v2",
+  "declared_tags": [
+    {
+      "source": "/etc/deviceinfo/tags.conf",
+      "tag": "always-on"
+    }
+  ],
   "init": "systemd",
   "package_managers": [
     "apt-get"

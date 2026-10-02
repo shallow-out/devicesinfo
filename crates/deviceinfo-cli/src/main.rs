@@ -340,11 +340,11 @@ fn resolve_local_root(source: &Source) -> io::Result<(PathBuf, Option<TempTree>)
 fn mirror(source: &Source, stage: &Path) -> io::Result<()> {
     let plan = capture_plan(source)?;
     // 一次 ssh 把全部内容取回来，而不是每个文件开一次连接
+    // 两批分开传：**内容一定要**的，和**只要"在不在"**的。
+    // 后者如果混进"要内容"那批，远端会把 `/usr/bin/podman`（45 MB）之类整个传回来。
     let mut wanted = plan.files.clone();
     wanted.extend(plan.databases.iter().cloned());
-    // 占位的那批只要"存在/不存在"两个事实，内容不用取
-    wanted.extend(plan.existence_only.iter().cloned());
-    source.prefetch(&wanted)?;
+    source.prefetch(&wanted, &plan.existence_only)?;
 
     for rel in plan.existence_only.iter() {
         let kind = source.kind(rel);

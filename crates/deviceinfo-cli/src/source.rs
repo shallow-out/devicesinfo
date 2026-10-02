@@ -175,11 +175,18 @@ impl Source {
     ///
     /// 本地是空操作；远端把几十次连接压成一次。**采集在动手前就知道完整清单**，
     /// 所以这个批量是自然的，不是妥协。
-    pub(crate) fn prefetch(&self, paths: &[String]) -> io::Result<()> {
+    /// `content` 是**内容一定要**的路径；`existence_only` 是只要"在不在"的
+    /// （可执行文件、socket、目录标记）——后者由远端按大小决定带不带内容。
+    pub(crate) fn prefetch(&self, content: &[String], existence_only: &[String]) -> io::Result<()> {
         let Self::Remote(remote) = self else {
             return Ok(());
         };
-        let out = remote.run_with_stdin(REMOTE_FETCH_SCRIPT, &stdin_lines(paths))?;
+        let mut items: Vec<String> = content
+            .iter()
+            .map(|path| format!("c {path}"))
+            .collect();
+        items.extend(existence_only.iter().map(|path| format!("e {path}")));
+        let out = remote.run_with_stdin(&remote_fetch_script(), &stdin_lines(&items))?;
         let mut failures = Vec::new();
         parse_batch(
             &out,
@@ -274,6 +281,21 @@ while IFS= read -r p; do
   if [ -n \"$t\" ]; then printf '@@T %s\\n' \"$t\"; else printf '@@N\\n'; fi
 done";
 
+/// 取内容脚本（把大小门槛代入）。
+///
+/// **统一走这个函数**：常量里那个 `{SMALL}` 占位一旦有哪一处忘了代入，
+/// 脚本会以 `-le {SMALL}` 跑起来——shell 报个错、然后一路走 else 分支，
+/// 于是所有"只要存在"的路径都报 0 字节，**看起来像"文件都是空的"**。
+/// 这个坑真踩过一次（单元测试先红了）。
+fn remote_fetch_script() -> String {
+    REMOTE_FETCH_SCRIPT.replace("{SMALL}", &SMALL_FILE_BYTES.to_string())
+}
+
+/// "只要存在"的路径在多小时才值得把内容也带回来。
+///
+/// 与 CLI 侧的 `SMALL_FILE_BYTES` **必须是同一个数**，所以这个脚本由格式串生成。
+const SMALL_FILE_BYTES: u64 = 8 * 1024;
+
 /// 远端取内容的脚本。
 ///
 /// 两个细节都是踩过才知道的：
@@ -285,8 +307,10 @@ done";
 /// 2. 复制不出来就报 `@@X`，让本地**直接失败**，而不是当成"不存在"——把读失败
 ///    伪装成缺失，又会造出"自洽但错误"的夹具。
 const REMOTE_FETCH_SCRIPT: &str = "\
-while IFS= read -r p; do
-  if [ -f \"$p\" ]; then
+while IFS= read -r line; do
+  mode=${line%% *}
+  p=${line#* }
+  if [ \"$mode\" = c ] && [ -f \"$p\" ]; then
     t=\"${TMPDIR:-/tmp}/.deviceinfo-cat-$$\"
     if cat -- \"$p\" > \"$t\" 2>/dev/null; then
       printf '@@F %s %s\\n' \"$(wc -c < \"$t\")\" \"$p\"
@@ -294,6 +318,18 @@ while IFS= read -r p; do
       rm -f \"$t\"
     else
       printf '@@X %s\\n' \"$p\"
+    fi
+  elif [ -f \"$p\" ]; then
+    # 只要\"存在\"的路径：**只有小文件才带内容**。壳脚本只有几百字节，
+    # 而 `/usr/bin/podman` 是 45 MB——把它的内容传回来会让一次采集白走几十 MB，
+    # 现象是\"看起来卡住\"（实测就这样，而且夹具的尺寸守卫拦不住：内容根本没写进夹具）。
+    n=$(wc -c < \"$p\" 2>/dev/null) || n=0
+    if [ \"$n\" -le {SMALL} ]; then
+      printf '@@F %s %s\\n' \"$n\" \"$p\"
+      cat -- \"$p\"
+    else
+      # 报 0 字节且不带内容：本地据此写占位
+      printf '@@F 0 %s\\n' \"$p\"
     fi
   elif [ -e \"$p\" ]; then
     printf '@@D %s\\n' \"$p\"
@@ -703,7 +739,7 @@ mod tests {
         let mut kinds = BTreeMap::new();
         let mut failures = Vec::new();
         parse_batch(
-            &run(REMOTE_FETCH_SCRIPT, &format!("{one}\n{missing}\n")),
+            &run(&remote_fetch_script(), &format!("c {one}\nc {missing}\n")),
             &mut contents,
             &mut kinds,
             &mut failures,
