@@ -63,6 +63,7 @@ pub use report::{
     Accelerator, AcceleratorKind, AcceleratorMemory, CoreTier, CpuInfo, HardwareReport, MemoryInfo,
     PciId, RuntimeStatus,
 };
+pub use cpu::{PER_CORE_INPUTS as CPU_PER_CORE_INPUTS, SHARED_INPUTS as CPU_SHARED_INPUTS};
 pub use runtime::LIBRARY_DIRS;
 pub use state::{AcceleratorState, DiskUsage, MemoryState, RuntimeState, SampleOptions};
 

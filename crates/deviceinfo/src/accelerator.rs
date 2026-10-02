@@ -103,10 +103,19 @@ pub(crate) fn numbered_dirs(dir: &Path, prefix: &str) -> Vec<PathBuf> {
 
 /// GPU 频率上限（MHz）。
 ///
-/// 驱动布局不统一：xe 是 `tileN/gtN/freq0/max_freq`（本机实测 1950），
-/// i915 是 `gt/gt0/rps_max_freq_mhz`，更老的还有 `gt_max_freq_mhz`。
-/// **只取上限**：同目录下的 `cur_freq` / `act_freq` 是瞬时值。
-fn gpu_max_freq_mhz(device_dir: &Path) -> Option<u64> {
+/// 两套内核驱动、**两个不同的位置**，都是实测出来的：
+///
+/// | 驱动 | 路径 | 实测于 |
+/// |---|---|---|
+/// | xe（新，Lunar Lake 起） | `<device>/tileN/gtN/freq0/max_freq` | 本机 → 1950 |
+/// | i915（旧） | `<card>/gt/gt0/rps_max_freq_mhz`、`<card>/gt_max_freq_mhz` | `r1` → 1450 |
+///
+/// 注意 i915 那一组在 **card 目录**下，不在 `<card>/device` 下——按 `device` 找永远读不到，
+/// 而且不报错，只是永远 `None`（前两台机器都没有 i915，所以一直没暴露）。
+///
+/// **只取上限**：同一批目录里的 `cur_freq` / `act_freq` 是瞬时值。
+fn gpu_max_freq_mhz(card_dir: &Path, device_dir: &Path) -> Option<u64> {
+    // xe：按 tile/gt 枚举，编号和数量都不固定
     for tile in numbered_dirs(device_dir, "tile") {
         for gt in numbered_dirs(&tile, "gt") {
             if let Some(freq) = read_u64(&gt.join("freq0/max_freq")) {
@@ -114,13 +123,10 @@ fn gpu_max_freq_mhz(device_dir: &Path) -> Option<u64> {
             }
         }
     }
-    [
-        "gt/gt0/rps_max_freq_mhz",
-        "gt/gt0/max_freq_mhz",
-        "gt_max_freq_mhz",
-    ]
-    .iter()
-    .find_map(|path| read_u64(&device_dir.join(path)))
+    // i915：相对 card 目录
+    ["gt/gt0/rps_max_freq_mhz", "gt_max_freq_mhz"]
+        .iter()
+        .find_map(|path| read_u64(&card_dir.join(path)))
 }
 
 /// GPU 可用的内存语义，以及一条"这是推断"的说明（如果有）。
@@ -458,7 +464,7 @@ pub(crate) fn probe_gpus(
             AcceleratorKind::Display => (AcceleratorMemory::SharedWithSystem, None),
             _ => gpu_memory(&device_dir, vendor.as_deref(), pci_id.as_ref()),
         };
-        let max_freq_mhz = gpu_max_freq_mhz(&device_dir);
+        let max_freq_mhz = gpu_max_freq_mhz(&card_path, &device_dir);
 
         let mut notes = Vec::new();
         if let Some(note) = memory_note {
@@ -1074,18 +1080,43 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
+    /// GPU 频率上限的**两套真实布局**（各自在哪台机器上实测过）。
+    ///
+    /// 这条测试的重点是**相对谁**：xe 在 `<device>/tileN/gtN/freq0/`，
+    /// 而 i915 在 **card 目录**下。按 `device` 找 i915 的路径永远 `None`，
+    /// 而且不报错——前两台机器都没有 i915，所以一直没暴露。
     #[test]
-    fn max_freq_prefers_the_xe_layout_then_falls_back_to_i915() {
+    fn gpu_max_freq_handles_both_real_driver_layouts() {
         let root = fake_root("freq");
-        let device = root.join("sys/class/drm/card0/device");
-        // i915 的老布局：gt_max_freq_mhz
+        let card = root.join("sys/class/drm/card0");
+        let device = card.join("device");
+
+        // i915（实测于 r1，Intel Alder Lake-P）：两个位置都试
         fs::create_dir_all(&device).unwrap();
-        fs::write(device.join("gt_max_freq_mhz"), "1200\n").unwrap();
-        assert_eq!(gpu_max_freq_mhz(&device), Some(1200));
-        // 有 xe 布局时以它为准
+        fs::write(card.join("gt_max_freq_mhz"), "1450\n").unwrap();
+        assert_eq!(gpu_max_freq_mhz(&card, &device), Some(1450));
+        // 更细的那个位置优先
+        fs::create_dir_all(card.join("gt/gt0")).unwrap();
+        fs::write(card.join("gt/gt0/rps_max_freq_mhz"), "1400\n").unwrap();
+        assert_eq!(gpu_max_freq_mhz(&card, &device), Some(1400));
+
+        // xe（实测于本机，Lunar Lake）：tileN/gtN/freq0/max_freq，在 device 下
         fs::create_dir_all(device.join("tile0/gt1/freq0")).unwrap();
         fs::write(device.join("tile0/gt1/freq0/max_freq"), "1950\n").unwrap();
-        assert_eq!(gpu_max_freq_mhz(&device), Some(1950));
+        assert_eq!(gpu_max_freq_mhz(&card, &device), Some(1950));
+
+        // 只有 device 那一份、没有 card 那份时，i915 的路径读不到（这正是那个 bug 的形状）
+        let bare = fake_root("freq-no-card");
+        let bare_device = bare.join("sys/class/drm/card0/device");
+        fs::create_dir_all(bare_device.join("gt/gt0")).unwrap();
+        fs::write(bare_device.join("gt/gt0/rps_max_freq_mhz"), "1400\n").unwrap();
+        assert_eq!(
+            gpu_max_freq_mhz(&bare.join("sys/class/drm/card0"), &bare_device),
+            None,
+            "i915 的频率不在 device 下；写错层级就该读不到，而不是读错值"
+        );
+
         fs::remove_dir_all(&root).ok();
+        fs::remove_dir_all(&bare).ok();
     }
 }

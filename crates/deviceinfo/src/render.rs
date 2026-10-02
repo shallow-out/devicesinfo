@@ -37,7 +37,17 @@ pub fn human(report: &HardwareReport) -> String {
     let _ = writeln!(out, "{core_line}");
 
     for tier in &report.cpu.core_tiers {
-        let mut line = format!("         · {:>2} 核", tier.count());
+        // 物理核和线程分开写：SMT 机器上“4 核”到底是 4 个核还是 4 个线程，
+        // 对"能并行几个任务"完全不是一回事
+        let mut line = if tier.physical_cores == tier.count() {
+            format!("         · {:>2} 核", tier.count())
+        } else {
+            format!(
+                "         · {:>2} 物理核（{} 线程）",
+                tier.physical_cores,
+                tier.count()
+            )
+        };
         if let Some(freq) = tier.max_freq_mhz {
             let _ = write!(line, " @ {:.2} GHz", freq as f64 / 1000.0);
         }
@@ -318,6 +328,7 @@ mod tests {
                 physical_cores: Some(8),
                 core_tiers: vec![CoreTier {
                     cpus: (0..8).collect(),
+                    physical_cores: 8,
                     max_freq_mhz: Some(4800),
                     capacity: Some(1024),
                 }],

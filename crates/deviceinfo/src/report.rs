@@ -181,7 +181,8 @@ pub struct CpuInfo {
     ///
     /// 混合架构（Intel 的 P+E、ARM 的 big.LITTLE）下**这一项才是机器的真实形状**：
     /// 只报一个总核数会高估算力——实测某台 Lunar Lake 的 8 核里有 4 个
-    /// `cpu_capacity` 只有 676/1024。
+    /// `cpu_capacity` 只有 676/1024，而另一台 i9-12900H 的 20 个逻辑核其实只有 14 个
+    /// 物理核、还是 6 P + 8 E。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub core_tiers: Vec<CoreTier>,
     /// 内核报告的全部指令集特征，**原样**（排序去重）。
@@ -195,10 +196,13 @@ pub struct CpuInfo {
 }
 
 impl CpuInfo {
-    /// 等效核数：各核 `cpu_capacity` 之和 ÷ 1024。
+    /// 等效核数：各**物理核** `cpu_capacity` 之和 ÷ 1024。
     ///
-    /// 同构机器上等于核数；混合架构上**小于**核数（实测 8 核的 Lunar Lake ≈ 6.6）。
-    /// 估算吞吐时按容量折算，是不系统性高估的唯一做法。
+    /// 同构机器上等于物理核数；混合架构上**小于**核数（实测 8 核的 Lunar Lake ≈ 6.6）。
+    ///
+    /// ⚠️ **按物理核算，不按逻辑核。** SMT 的两个线程不等于两个核：实测那台
+    /// i9-12900H（6 P + 8 E，20 线程）按逻辑核求和会给 20.0，而按物理核算约 10.7。
+    /// 每档各有多少物理核记在 [`CoreTier::physical_cores`]。
     ///
     /// 部分核没有 `cpu_capacity` 时返回 `None`——宁可没有数字，也不要一个偏低的数字。
     pub fn effective_cores(&self) -> Option<f64> {
@@ -214,7 +218,7 @@ impl CpuInfo {
         let total: u64 = self
             .core_tiers
             .iter()
-            .filter_map(|tier| tier.capacity.map(|capacity| capacity * tier.count() as u64))
+            .filter_map(|tier| tier.capacity.map(|capacity| capacity * tier.physical_cores as u64))
             .sum();
         Some(total as f64 / 1024.0)
     }
@@ -226,15 +230,26 @@ pub struct CoreTier {
     /// 属于这一组的逻辑核编号（`/sys/devices/system/cpu/cpuN` 的 N）。
     /// 存编号而不只是计数：调度要真把活钉在强核上，光知道"有两个"没用。
     pub cpus: Vec<usize>,
+    /// 这一组里有几个**物理核**（SMT 的线程已经算成一个）。
+    ///
+    /// 与 `cpus.len()` 的区别在 SMT 机器上才看得出来：实测那台 i9-12900H 上
+    /// 有两档是「2 物理核 / 4 线程」和「4 物理核 / 8 线程」。
+    pub physical_cores: usize,
     /// 组内单核最大频率（MHz）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_freq_mhz: Option<u64>,
-    /// sysfs `cpu_capacity`，最强核为 1024。跨架构唯一可靠的相对性能来源。
+    /// 相对性能，最强核为 1024。
+    ///
+    /// 优先由 `acpi_cppc/highest_perf` 归一化而来，退化到内核的 `cpu_capacity`
+    /// ——理由见 `cpu::observe_cores` 的注释。
+    ///
+    /// **只有同机内的比率有意义**，不同机器的值不可比。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capacity: Option<u64>,
 }
 
 impl CoreTier {
+    /// 这一组的**逻辑核**数（线程数）。
     pub fn count(&self) -> usize {
         self.cpus.len()
     }

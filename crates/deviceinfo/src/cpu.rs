@@ -10,6 +10,31 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
+/// 探测 CPU 会读的**整机共享**输入（相对探测根）。
+///
+/// 公开是为了让采集夹具的一方按**同一份**清单去取。理由不是"省事"，而是**不允许漂移**：
+/// `acpi_cppc/highest_perf` 就漏过一次——本地探测用它算出了 P/E 分档，而采集清单里没有
+/// 这个文件，于是**远端夹具**把三档 capacity 全报成 1024，而本地（两台来源恰好一致）看不出
+/// 任何异常。
+pub const SHARED_INPUTS: [&str; 5] = [
+    "proc/cpuinfo",
+    "proc/meminfo",
+    "sys/devices/system/cpu/smt/active",
+    // arm64 的整机型号（`/proc/cpuinfo` 在 arm64 上未必有）
+    "sys/firmware/devicetree/base/model",
+    // ACPI 平台的整机型号
+    "sys/class/dmi/id/product_name",
+];
+
+/// 探测 CPU 会**逐核**读的输入（相对 `sys/devices/system/cpu/cpuN/`）。
+pub const PER_CORE_INPUTS: [&str; 4] = [
+    // P/E 相对性能的**源头**（`cpu_capacity` 会退化，见 `observe_cores`）
+    "acpi_cppc/highest_perf",
+    "cpu_capacity",
+    "cpufreq/cpuinfo_max_freq",
+    "topology/core_cpus_list",
+];
+
 pub(crate) fn probe(root: &Path, arch: &str, warnings: &mut Vec<String>) -> CpuInfo {
     let cpuinfo_path = root.join("proc/cpuinfo");
     let cpuinfo = fs::read_to_string(&cpuinfo_path).ok();
@@ -127,6 +152,73 @@ fn parse_cpu_list(text: &str) -> Vec<usize> {
     out
 }
 
+/// 一个核的观测值。
+struct CoreObservation {
+    cpu: usize,
+    /// 相对性能，最强核为 1024。
+    capacity: Option<u64>,
+    max_freq_mhz: Option<u64>,
+    /// 它属于哪个物理核（同一个 `core_cpus_list` 的线程共享同一个编号）。
+    core: Option<usize>,
+}
+
+/// 逐个核读观测值，并把相对性能归一化到 1024。
+///
+/// # 为什么相对性能不从 `cpu_capacity` 取
+///
+/// **`cpu_capacity` 会在整机全同的时候退化。** 实测那台 i9-12900H（6 P + 8 E）上
+/// 它是**全 1024**，而 `acpi_cppc/highest_perf` 是 64/63/38、频率是 5.0/4.9/3.8 GHz
+/// ——只看 `cpu_capacity` 会把 P/E 完全抹平，报告就成了一句"20 核 @5.00 GHz"。
+///
+/// 内核的 `cpu_capacity` 本来就是从 `highest_perf` 推出来的（本机 56/55/37 ↔
+/// 1024/1005/676 完全对应），所以这里直接看源头。`highest_perf` 的**绝对值是平台相关**的
+/// （本机 56、那台 i9 是 64），只有同机内的比率有意义，所以归一化到 1024
+/// ——与 `cpu_capacity` 同一个刻度：最强核 = 1024。
+fn observe_cores(root: &Path, candidates: &[usize]) -> Vec<CoreObservation> {
+    let mut raw = Vec::with_capacity(candidates.len());
+    // `core_cpus_list` → 物理核编号（第一次见到分组时编号）
+    let mut core_index: BTreeMap<Vec<usize>, usize> = BTreeMap::new();
+
+    for &cpu in candidates {
+        let base = root.join(format!("sys/devices/system/cpu/cpu{cpu}"));
+        let highest_perf = read_u64(&base.join("acpi_cppc/highest_perf"));
+        let cpu_capacity = read_u64(&base.join("cpu_capacity"));
+        // cpuinfo_max_freq 的单位是 kHz
+        let max_freq_mhz = read_u64(&base.join("cpufreq/cpuinfo_max_freq")).map(|khz| khz / 1000);
+        let core = read_trimmed(&base.join("topology/core_cpus_list"))
+            .map(|list| parse_cpu_list(&list))
+            .filter(|group| !group.is_empty())
+            .map(|group| {
+                let next = core_index.len() + 1;
+                *core_index.entry(group).or_insert(next)
+            });
+        raw.push((cpu, highest_perf, cpu_capacity, max_freq_mhz, core));
+    }
+
+    // 只有**所有**核都报了 highest_perf 才用它归一化：一半有、一半没有的话，
+    // 把两种来源混在一个刻度上只会更乱，不如退回 cpu_capacity。
+    let highest = |entry: &(usize, Option<u64>, Option<u64>, Option<u64>, Option<usize>)| entry.1;
+    let scale = raw
+        .iter()
+        .filter_map(highest)
+        .max()
+        .filter(|max| *max > 0 && raw.iter().all(|entry| entry.1.is_some()));
+
+    raw.into_iter()
+        .map(
+            |(cpu, highest_perf, cpu_capacity, max_freq_mhz, core)| CoreObservation {
+                cpu,
+                capacity: match (scale, highest_perf) {
+                    (Some(max), Some(value)) => Some(value * 1024 / max),
+                    _ => cpu_capacity,
+                },
+                max_freq_mhz,
+                core,
+            },
+        )
+        .collect()
+}
+
 /// 核分组键。
 ///
 /// **只用一个维度**：拿 `(capacity, freq)` 当联合键，会把同一性能档、频率只差几十 MHz
@@ -151,46 +243,81 @@ fn probe_core_tiers(
         cpu_ids.to_vec()
     };
 
-    let mut groups: BTreeMap<TierKey, Vec<(usize, Option<u64>)>> = BTreeMap::new();
-    let mut seen = 0_usize;
-    let mut with_capacity = 0_usize;
-
-    for cpu in candidates {
-        let base = root.join(format!("sys/devices/system/cpu/cpu{cpu}"));
-        let capacity = read_u64(&base.join("cpu_capacity"));
-        // cpuinfo_max_freq 的单位是 kHz
-        let freq_mhz = read_u64(&base.join("cpufreq/cpuinfo_max_freq")).map(|khz| khz / 1000);
-        if capacity.is_none() && freq_mhz.is_none() {
-            continue;
-        }
-        seen += 1;
-        if capacity.is_some() {
-            with_capacity += 1;
-        }
-        if let Some(key) = capacity.map(TierKey::Capacity).or(freq_mhz.map(TierKey::Freq)) {
-            groups.entry(key).or_default().push((cpu, freq_mhz));
-        }
+    let observations = observe_cores(root, &candidates);
+    let seen = observations.len();
+    let with_capacity = observations
+        .iter()
+        .filter(|observation| observation.capacity.is_some())
+        .count();
+    if with_capacity > 0 && with_capacity < seen {
+        // 部分核没有相对性能：等效核数要么算不出来、要么偏低，必须说出来
+        warnings.push(format!(
+            "只有 {with_capacity}/{seen} 个核暴露相对性能（highest_perf/cpu_capacity），等效核数不可信"
+        ));
+    }
+    let with_core = observations
+        .iter()
+        .filter(|observation| observation.core.is_some())
+        .count();
+    if with_core > 0 && with_core < seen {
+        // 拓扑读不全 → 某些档的"物理核数"会退化成线程数，等效算力随之偏高
+        warnings.push(format!(
+            "只有 {with_core}/{seen} 个核能读出 topology/core_cpus_list，各档的物理核数可能偏高"
+        ));
     }
 
-    if with_capacity > 0 && with_capacity < seen {
-        // 部分核没有 capacity：等效核数要么算不出来、要么偏低，必须说出来
-        warnings.push(format!(
-            "只有 {with_capacity}/{seen} 个核暴露 cpu_capacity，等效核数不可信"
-        ));
+    // 分组键：优先相对性能；**当它在整机范围内全同时会退化**（实测那台 i9-12900H
+    // 的 `cpu_capacity` 全是 1024），那时退到频率——频率不反映 P/E 的 IPC 差异，
+    // 但至少能把两类核分开。两个都没有的核不进分组。
+    let capacities: Vec<u64> = observations
+        .iter()
+        .filter_map(|observation| observation.capacity)
+        .collect();
+    let capacity_is_uniform =
+        capacities.len() > 1 && capacities.iter().all(|value| *value == capacities[0]);
+
+    let mut groups: BTreeMap<TierKey, Vec<&CoreObservation>> = BTreeMap::new();
+    for observation in &observations {
+        let by_capacity = observation.capacity.map(TierKey::Capacity);
+        let by_freq = observation.max_freq_mhz.map(TierKey::Freq);
+        let key = if capacity_is_uniform {
+            by_freq.or(by_capacity)
+        } else {
+            by_capacity.or(by_freq)
+        };
+        if let Some(key) = key {
+            groups.entry(key).or_default().push(observation);
+        }
     }
 
     // 排序而不是靠 `rev()`：`TierKey` 是个枚举，混合键（部分核有 capacity、部分只有频率）
     // 时按枚举顺序排会得到“只有频率的那几档反而排在前面”这种莫名其妙的结果。
     // 按**实际强弱**排，缺 capacity 的排最后。
     let mut tiers: Vec<CoreTier> = groups
-        .into_iter()
-        .map(|(key, members)| CoreTier {
-            cpus: members.iter().map(|(cpu, _)| *cpu).collect(),
-            max_freq_mhz: members.iter().filter_map(|(_, freq)| *freq).max(),
-            capacity: match key {
-                TierKey::Capacity(capacity) => Some(capacity),
-                TierKey::Freq(_) => None,
-            },
+        .into_values()
+        .map(|members| {
+            let cpus: Vec<usize> = members.iter().map(|member| member.cpu).collect();
+            // 物理核数：同一 `core_cpus_list` 的线程算一个。读不到拓扑的核各自算一个
+            // ——这让数字偏大，所以上面会发一条警告。
+            let mut cores: Vec<usize> = members
+                .iter()
+                .filter_map(|member| member.core)
+                .collect();
+            let unknown = members.iter().filter(|member| member.core.is_none()).count();
+            cores.sort_unstable();
+            cores.dedup();
+            CoreTier {
+                cpus,
+                physical_cores: cores.len() + unknown,
+                max_freq_mhz: members.iter().filter_map(|member| member.max_freq_mhz).max(),
+                // 这一档的相对性能：取成员里的最大值。**按频率分组时也要报**
+                // ——那种情况说明整机 capacity 全同，它依然是已知事实（只是区分不了核），
+                // 丢掉它会让 `effective_cores` 变成 None。
+                capacity: members
+                    .iter()
+                    .filter_map(|member| member.capacity)
+                    .max(),
+            }
         })
         .collect();
     tiers.sort_by_key(|tier| {
@@ -641,6 +768,103 @@ mod tests {
             Some(4),
             "只读到一半就该退回 cpuinfo，而不是少报成 2"
         );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// 一台真实的 **i9-12900H**（6 P + 8 E，20 线程）的简化形状：
+    ///
+    /// - `cpu_capacity` **全是 1024**（在这台内核上它就是退化的）
+    /// - `acpi_cppc/highest_perf` 是 64 / 63 / 38 → P/E 只能从这里看出来
+    /// - P 核有 SMT（两个线程一个物理核），E 核没有
+    ///
+    /// 这条同时盯两件事：相对性能的来源（否则 P/E 会被抹平成一档），
+    /// 以及等效算力必须**按物理核**折算（否则 SMT 的两个线程会当两个核）。
+    #[test]
+    fn uniform_capacity_falls_back_to_cppc_and_counts_physical_cores() {
+        let root = fake_root("hybrid-cppc");
+        fake_meminfo(&root);
+        fs::write(
+            root.join("proc/cpuinfo"),
+            "processor\t: 0\nmodel name\t: 12th Gen Intel(R) Core(TM) i9-12900H\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("sys/devices/system/cpu/smt")).unwrap();
+        fs::write(root.join("sys/devices/system/cpu/smt/active"), "1\n").unwrap();
+
+        // (cpu, highest_perf, max_freq_khz, core_cpus_list)
+        let cores: [(usize, u64, u64, &str); 4] = [
+            (0, 63, 4_900_000, "0-1"),
+            (1, 63, 4_900_000, "0-1"),
+            (2, 64, 5_000_000, "2"),
+            (3, 38, 3_800_000, "3"),
+        ];
+        for (cpu, highest, freq, group) in cores {
+            let base = root.join(format!("sys/devices/system/cpu/cpu{cpu}"));
+            fs::create_dir_all(base.join("acpi_cppc")).unwrap();
+            fs::create_dir_all(base.join("cpufreq")).unwrap();
+            fs::create_dir_all(base.join("topology")).unwrap();
+            // 关键：capacity 一律 1024，只看它是分不出 P/E 的
+            fs::write(base.join("cpu_capacity"), "1024\n").unwrap();
+            fs::write(base.join("acpi_cppc/highest_perf"), format!("{highest}\n")).unwrap();
+            fs::write(
+                base.join("cpufreq/cpuinfo_max_freq"),
+                format!("{freq}\n"),
+            )
+            .unwrap();
+            fs::write(base.join("topology/core_cpus_list"), format!("{group}\n")).unwrap();
+        }
+
+        let mut warnings = Vec::new();
+        let reported = probe(&root, "x86_64", &mut warnings);
+        assert_eq!(reported.logical_cores, 4);
+        assert_eq!(reported.physical_cores, Some(3), "P 核的两个线程算一个核");
+
+        let tiers = &reported.core_tiers;
+        assert_eq!(tiers.len(), 3, "P/E 必须分开: {tiers:#?}");
+        // 归一化到 1024：64→1024、63→1008、38→608
+        assert_eq!(tiers[0].capacity, Some(1024));
+        assert_eq!(tiers[0].cpus, vec![2]);
+        assert_eq!(tiers[1].capacity, Some(1008));
+        assert_eq!(tiers[1].cpus, vec![0, 1]);
+        assert_eq!(
+            tiers[1].physical_cores, 1,
+            "两个线程属于同一个物理核: {tiers:#?}"
+        );
+        assert_eq!(tiers[2].capacity, Some(608));
+        assert_eq!(tiers[2].max_freq_mhz, Some(3800));
+
+        // 按**物理核**折算：(1024 + 1008 + 608) / 1024 ≈ 2.58
+        // 按逻辑核会算成 (1024 + 1008×2 + 608) / 1024 ≈ 3.56，那是高估
+        let effective = reported.effective_cores().expect("应当算得出");
+        assert!(
+            (effective - 2.58).abs() < 0.01,
+            "等效核数应为 2.58（按物理核），实际 {effective}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// 相对性能**和**频率都区分不了核时（同构机器），只有一档——不能凭空造分档。
+    #[test]
+    fn a_homogeneous_machine_stays_one_tier() {
+        let root = fake_root("homogeneous");
+        fake_meminfo(&root);
+        fs::write(root.join("proc/cpuinfo"), "processor\t: 0\nmodel name\t: x\n").unwrap();
+        fake_cpus(
+            &root,
+            &[
+                (0, Some(2_400_000), Some(1024)),
+                (1, Some(2_400_000), Some(1024)),
+                (2, Some(2_400_000), Some(1024)),
+                (3, Some(2_400_000), Some(1024)),
+            ],
+        );
+
+        let reported = probe(&root, "x86_64", &mut Vec::new());
+        assert_eq!(reported.core_tiers.len(), 1, "{:#?}", reported.core_tiers);
+        assert_eq!(reported.core_tiers[0].physical_cores, 4);
+        assert_eq!(reported.effective_cores(), Some(4.0));
 
         fs::remove_dir_all(&root).ok();
     }

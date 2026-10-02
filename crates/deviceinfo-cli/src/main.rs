@@ -8,8 +8,8 @@ mod source;
 use clap::{Parser, Subcommand};
 use deviceinfo::pci::{PCI_DATABASE_PATHS, extract_entries};
 use deviceinfo::{
-    HardwareReport, LIBRARY_DIRS, PciId, RuntimeStatus, SampleOptions, probe_with, render,
-    sample_state_with,
+    CPU_PER_CORE_INPUTS, CPU_SHARED_INPUTS, HardwareReport, LIBRARY_DIRS, PciId, RuntimeStatus,
+    SampleOptions, probe_with, render, sample_state_with,
 };
 use source::{Entry, EntryKind, Source};
 use std::collections::BTreeMap;
@@ -250,9 +250,11 @@ fn resolve_local_root(source: &Source) -> io::Result<(PathBuf, Option<TempTree>)
 fn mirror(source: &Source, stage: &Path) -> io::Result<()> {
     let plan = capture_plan(source)?;
     // 一次 ssh 把全部内容取回来，而不是每个文件开一次连接
-    source.prefetch(&plan.files)?;
+    let mut wanted = plan.files.clone();
+    wanted.extend(plan.databases.iter().cloned());
+    source.prefetch(&wanted)?;
 
-    for rel in &plan.files {
+    for rel in plan.files.iter().chain(plan.databases.iter()) {
         let raw = match source.kind(rel) {
             // 设备节点（`/dev/accel/accel0` 这类字符设备）取不得内容：直接读会阻塞。
             // 夹具只需要"它存在"这个事实。
@@ -406,22 +408,24 @@ fn capture_from_root(root: &Path, arch: &str, out: &Path) -> io::Result<()> {
 /// 宁可多列几个不存在的路径（`fs::metadata` 会跳过），也不要漏。
 struct CapturePlan {
     files: Vec<String>,
+    /// 只复制到暂存树的"探测输入数据库"（`pci.ids`）。
+    ///
+    /// 必须和 `files` 分开：**暂存树要它**（否则 `pci::lookup` 查不到名字，
+    /// `hardware --ssh` 会把 `0x46a6` 原样印出来），但**夹具里不能放整份**
+    /// （1.6 MB，而且会随系统 hwdata 更新而变）。夹具只留用到的那几条，
+    /// 那一步由 `capture_from_root` 单独做。
+    databases: Vec<String>,
     /// `(相对路径, 软链指向的字符串)`。指向什么不重要，探测只取末段做驱动名。
     symlinks: Vec<(String, String)>,
 }
 
 fn capture_plan(source: &Source) -> io::Result<CapturePlan> {
-    let mut files = vec![
-        "proc/cpuinfo".to_string(),
-        "proc/meminfo".to_string(),
-        "sys/devices/system/cpu/smt/active".to_string(),
-        // arm64 的型号来源之一（`/proc/cpuinfo` 在 arm64 上**未必**有型号，
-        // 取决于内核；这台 CIX 的有，那台 Rockchip 的没有）
-        "sys/firmware/devicetree/base/model".to_string(),
-        // ACPI 平台没有设备树，DMI 才是对应物
-        "sys/class/dmi/id/product_name".to_string(),
-    ];
+    // CPU 那部分**直接用库里的清单**，不在这里重抄一遍：抄一遍就会漂移，
+    // 而漂移的后果（远端夹具静默少一个输入）很难发现。
+    let mut files: Vec<String> = CPU_SHARED_INPUTS.iter().map(|path| path.to_string()).collect();
     let mut symlinks = Vec::new();
+    // 探测会读 pci.ids（`pci::lookup`），所以要镜像进暂存树——但写夹具时另走一条路
+    let databases: Vec<String> = PCI_DATABASE_PATHS.iter().map(|path| path.to_string()).collect();
     let mut lists = ListCache::new(source);
 
     // 阶段一：固定目录一次列完（远端每次调用都要在那边起一个 shell，很贵）
@@ -437,11 +441,7 @@ fn capture_plan(source: &Source) -> io::Result<CapturePlan> {
     ])?;
 
     for cpu in lists.numeric(CPU_DIR, "cpu") {
-        for rel in [
-            "cpu_capacity",
-            "cpufreq/cpuinfo_max_freq",
-            "topology/core_cpus_list",
-        ] {
+        for rel in CPU_PER_CORE_INPUTS {
             files.push(format!("{CPU_DIR}/{cpu}/{rel}"));
         }
     }
@@ -468,30 +468,46 @@ fn capture_plan(source: &Source) -> io::Result<CapturePlan> {
         device_dirs.push(device);
     }
 
-    let cards: Vec<String> = lists
+    // card 目录与它的 device 目录都要：**频率节点分居两处**（见下面 i915 那段注释）
+    let card_dirs: Vec<String> = lists
         .numeric(DRM_DIR, "card")
         .iter()
-        .map(|card| format!("{DRM_DIR}/{card}/device"))
+        .map(|card| format!("{DRM_DIR}/{card}"))
+        .collect();
+    let card_device_dirs: Vec<String> = card_dirs
+        .iter()
+        .map(|card_dir| format!("{card_dir}/device"))
         .collect();
     // 阶段二：所有 card 的 device 目录 + 各自的 drm/ 一次列完
-    let drm_subdirs: Vec<String> = cards.iter().map(|d| format!("{d}/drm")).collect();
-    lists.ensure(&cards)?;
+    let drm_subdirs: Vec<String> = card_device_dirs
+        .iter()
+        .map(|device| format!("{device}/drm"))
+        .collect();
+    lists.ensure(&card_device_dirs)?;
     lists.ensure(&drm_subdirs)?;
 
     let mut tile_dirs = Vec::new();
-    for device in &cards {
+    for card_dir in &card_dirs {
+        let device = format!("{card_dir}/device");
         for rel in [
             "vendor",
             "device",
             "mem_info_vram_total",
             "mem_info_vram_used",
+            "of_node/compatible",
+            // xe 的频率在 `<device>/tileN/gtN/freq0/` 下（见阶段三）
+        ] {
+            files.push(format!("{device}/{rel}"));
+        }
+        // **i915 的频率在 card 目录下，不在 `<card>/device` 下**（实测于 r1）：
+        // 弄错层级不会报错，只会永远读不到。
+        for rel in [
             "gt/gt0/rps_max_freq_mhz",
             "gt/gt0/rps_cur_freq_mhz",
             "gt_max_freq_mhz",
             "gt_cur_freq_mhz",
-            "of_node/compatible",
         ] {
-            files.push(format!("{device}/{rel}"));
+            files.push(format!("{card_dir}/{rel}"));
         }
         // render 节点的**归属**靠 `<device>/drm/` 的目录项表达，而不是靠
         // sys/class/drm 的软链（软链存不进夹具）。
@@ -505,10 +521,10 @@ fn capture_plan(source: &Source) -> io::Result<CapturePlan> {
             files.push(format!("{drm_subdir}/{}", entry.name));
         }
         // xe 的 tile*/gt*/freq0/{max,cur}_freq
-        for tile in lists.numeric(device, "tile") {
+        for tile in lists.numeric(&device, "tile") {
             tile_dirs.push(format!("{device}/{tile}"));
         }
-        device_dirs.push(device.clone());
+        device_dirs.push(device);
     }
     // 阶段三：tile 下面的 gt 目录
     lists.ensure(&tile_dirs)?;
@@ -562,7 +578,11 @@ fn capture_plan(source: &Source) -> io::Result<CapturePlan> {
         files.push(format!("sys/module/{name}/version"));
     }
 
-    Ok(CapturePlan { files, symlinks })
+    Ok(CapturePlan {
+        files,
+        databases,
+        symlinks,
+    })
 }
 
 /// 目录列表的缓存。
@@ -722,6 +742,31 @@ fn write_file(path: &Path, contents: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `pci.ids` 必须进采集清单。
+    ///
+    /// 它是探测的**输入**（`pci::lookup` 读它），所以暂存树里必须有——否则
+    /// `hardware --ssh` 会把 `0x46a6` 原样印出来。但夹具里只该留用到的那几条，
+    /// 所以它走 `databases` 而不是 `files`。这个洞在只跑 ARM 机器时看不见
+    /// （那些加速器没有 PCI 标识），换到一台 x86 机器才暴露。
+    #[test]
+    fn the_capture_plan_includes_the_pci_database() {
+        let root = std::env::temp_dir().join(format!("deviceinfo-plan-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("proc")).unwrap();
+        let plan = capture_plan(&Source::local(&root)).expect("本地规划不会失败");
+        assert!(
+            plan.databases.iter().any(|path| path.ends_with("pci.ids")),
+            "{:?}",
+            plan.databases
+        );
+        // 它不能混进 files：那会把整份 1.6 MB 的 pci.ids 抄进夹具
+        assert!(
+            !plan.files.iter().any(|path| path.ends_with("pci.ids")),
+            "pci.ids 该在 databases 里，不是 files"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
 
     /// 采集源不对时**必须报错**。以前它会"成功"写出一份空壳夹具——而空壳夹具比没有
     /// 夹具更坏：它会让后来的所有探测变更都"通过"。

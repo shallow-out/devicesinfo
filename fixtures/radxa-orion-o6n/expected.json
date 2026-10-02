@@ -11,6 +11,7 @@
           0,
           1
         ],
+        "physical_cores": 2,
         "max_freq_mhz": 2600,
         "capacity": 1024
       },
@@ -19,6 +20,7 @@
           10,
           11
         ],
+        "physical_cores": 2,
         "max_freq_mhz": 2500,
         "capacity": 984
       },
@@ -27,6 +29,7 @@
           6,
           7
         ],
+        "physical_cores": 2,
         "max_freq_mhz": 2300,
         "capacity": 905
       },
@@ -35,6 +38,7 @@
           8,
           9
         ],
+        "physical_cores": 2,
         "max_freq_mhz": 2200,
         "capacity": 866
       },
@@ -45,6 +49,7 @@
           4,
           5
         ],
+        "physical_cores": 4,
         "max_freq_mhz": 1800,
         "capacity": 279
       }

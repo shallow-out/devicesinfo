@@ -182,10 +182,10 @@ pub(crate) fn sample(root: &Path, options: &SampleOptions) -> RuntimeState {
 /// 拆出来反而难读），靠 `state_and_hardware_agree_on_which_devices_exist`
 /// 这个测试保证两边不会走偏——**包括顺序**：两边都按设备名排序，
 /// 所以第 N 个状态对应第 N 个设备。
-fn accelerator_devices(root: &Path) -> Vec<(AcceleratorKind, String, PathBuf)> {
+fn accelerator_devices(root: &Path) -> Vec<(AcceleratorKind, String, PathBuf, PathBuf)> {
     // 顺序必须由名字决定，不能由目录项顺序决定：否则状态列表和硬件列表对不上，
     // 而两份都声称自己在描述同一批设备
-    let mut entries: Vec<(String, AcceleratorKind, String, PathBuf)> = Vec::new();
+    let mut entries: Vec<(String, AcceleratorKind, String, PathBuf, PathBuf)> = Vec::new();
     if let Ok(dir) = fs::read_dir(root.join("dev/accel")) {
         for entry in dir.flatten() {
             let node = entry.file_name().to_string_lossy().into_owned();
@@ -195,6 +195,7 @@ fn accelerator_devices(root: &Path) -> Vec<(AcceleratorKind, String, PathBuf)> {
                     format!("0accel/{node}"),
                     AcceleratorKind::Npu,
                     node.clone(),
+                    root.join("sys/class/accel").join(&node),
                     device,
                 ));
             }
@@ -221,6 +222,8 @@ fn accelerator_devices(root: &Path) -> Vec<(AcceleratorKind, String, PathBuf)> {
                     format!("1drm/{node}"),
                     kind,
                     node.clone(),
+                    // card 目录本身：i915 的 `gt_max_freq_mhz` 这一类在它下面，不在 device 下
+                    entry.path(),
                     device,
                 ));
             }
@@ -229,7 +232,7 @@ fn accelerator_devices(root: &Path) -> Vec<(AcceleratorKind, String, PathBuf)> {
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     entries
         .into_iter()
-        .map(|(_, kind, node, dir)| (kind, node, dir))
+        .map(|(_, kind, node, node_dir, dir)| (kind, node, node_dir, dir))
         .collect()
 }
 
@@ -239,7 +242,7 @@ fn sample_accelerators(
     warnings: &mut Vec<String>,
 ) -> Vec<AcceleratorState> {
     let mut found = Vec::new();
-    for (kind, node, device_dir) in accelerator_devices(root) {
+    for (kind, node, node_dir, device_dir) in accelerator_devices(root) {
         // 设备节点在、但 sysfs 目录读不到：实例指标会全是 None，而"全是 None"
         // 与"设备真的没有这些指标"看起来一样，得说出来
         if !device_dir.exists() {
@@ -252,7 +255,7 @@ fn sample_accelerators(
             kind,
             node,
             pci_id: crate::accelerator::read_pci_id(&device_dir),
-            current_freq_mhz: current_freq_mhz(&device_dir, kind),
+            current_freq_mhz: current_freq_mhz(&node_dir, &device_dir, kind),
             resident_memory_bytes: resident_memory_bytes(&device_dir),
             busy_time_us: None,
         };
@@ -269,12 +272,13 @@ fn sample_accelerators(
 ///
 /// NPU 优先读 `freq/current_freq`：驱动文档把 `npu_*_frequency_mhz` 明确标为
 /// **Legacy attributes (backward compatibility)**，先读新路径、旧路径当兜底。
-fn current_freq_mhz(device_dir: &Path, kind: AcceleratorKind) -> Option<u64> {
+fn current_freq_mhz(node_dir: &Path, device_dir: &Path, kind: AcceleratorKind) -> Option<u64> {
     if kind == AcceleratorKind::Npu {
         return crate::sysfs::read_u64(&device_dir.join("freq/current_freq"))
             .or_else(|| crate::sysfs::read_u64(&device_dir.join("npu_current_frequency_mhz")));
     }
-    // xe 把 GPU 按 tileN/gtN 组织；i915 的布局不一样
+    // 布局同 `gpu_max_freq_mhz`：xe 在 device/tileN/gtN/freq0，i915 在 **card** 目录下。
+    // 弄错层级不会报错，只会永远 None——实测在 r1（i915）上就是这么错的。
     for tile in crate::accelerator::numbered_dirs(device_dir, "tile") {
         for gt in crate::accelerator::numbered_dirs(&tile, "gt") {
             if let Some(freq) = crate::sysfs::read_u64(&gt.join("freq0/cur_freq")) {
@@ -284,7 +288,7 @@ fn current_freq_mhz(device_dir: &Path, kind: AcceleratorKind) -> Option<u64> {
     }
     ["gt/gt0/rps_cur_freq_mhz", "gt_cur_freq_mhz"]
         .iter()
-        .find_map(|path| crate::sysfs::read_u64(&device_dir.join(path)))
+        .find_map(|path| crate::sysfs::read_u64(&node_dir.join(path)))
 }
 
 /// 常驻内存（字节）。
