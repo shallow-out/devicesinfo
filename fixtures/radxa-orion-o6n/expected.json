@@ -1,59 +1,111 @@
 {
+  "accelerators": [
+    {
+      "device_path": "/dev/dri/renderD128",
+      "driver": "panthor",
+      "kind": "gpu",
+      "memory": {
+        "kind": "shared-with-system"
+      },
+      "name": "GPU (card0)",
+      "notes": [],
+      "runtime": {
+        "reason": "厂商未识别，不知道该找哪些组件",
+        "state": "unknown"
+      }
+    },
+    {
+      "driver": "linlondp",
+      "kind": "display",
+      "memory": {
+        "kind": "shared-with-system"
+      },
+      "name": "card1",
+      "notes": [],
+      "runtime": {
+        "reason": "只能做显示输出，不涉及推理运行时",
+        "state": "not-applicable"
+      }
+    },
+    {
+      "driver": "linlondp",
+      "kind": "display",
+      "memory": {
+        "kind": "shared-with-system"
+      },
+      "name": "card2",
+      "notes": [],
+      "runtime": {
+        "reason": "只能做显示输出，不涉及推理运行时",
+        "state": "not-applicable"
+      }
+    },
+    {
+      "driver": "linlondp",
+      "kind": "display",
+      "memory": {
+        "kind": "shared-with-system"
+      },
+      "name": "card3",
+      "notes": [],
+      "runtime": {
+        "reason": "只能做显示输出，不涉及推理运行时",
+        "state": "not-applicable"
+      }
+    }
+  ],
   "cpu": {
     "arch": "aarch64",
-    "cpu_model": "CIX P1 CD8180",
-    "machine_model": "Radxa Orion O6N",
-    "logical_cores": 12,
-    "physical_cores": 12,
     "core_tiers": [
       {
+        "capacity": 1024,
         "cpus": [
           0,
           1
         ],
-        "physical_cores": 2,
         "max_freq_mhz": 2600,
-        "capacity": 1024
+        "physical_cores": 2
       },
       {
+        "capacity": 984,
         "cpus": [
           10,
           11
         ],
-        "physical_cores": 2,
         "max_freq_mhz": 2500,
-        "capacity": 984
+        "physical_cores": 2
       },
       {
+        "capacity": 905,
         "cpus": [
           6,
           7
         ],
-        "physical_cores": 2,
         "max_freq_mhz": 2300,
-        "capacity": 905
+        "physical_cores": 2
       },
       {
+        "capacity": 866,
         "cpus": [
           8,
           9
         ],
-        "physical_cores": 2,
         "max_freq_mhz": 2200,
-        "capacity": 866
+        "physical_cores": 2
       },
       {
+        "capacity": 279,
         "cpus": [
           2,
           3,
           4,
           5
         ],
-        "physical_cores": 4,
         "max_freq_mhz": 1800,
-        "capacity": 279
+        "physical_cores": 4
       }
     ],
+    "cpu_model": "CIX P1 CD8180",
     "features": [
       "aes",
       "afp",
@@ -106,65 +158,13 @@
       "svesm4",
       "uscat",
       "wfxt"
-    ]
+    ],
+    "logical_cores": 12,
+    "machine_model": "Radxa Orion O6N",
+    "physical_cores": 12
   },
   "memory": {
     "total_bytes": 33361620992
   },
-  "accelerators": [
-    {
-      "kind": "gpu",
-      "name": "GPU (card0)",
-      "device_path": "/dev/dri/renderD128",
-      "driver": "panthor",
-      "memory": {
-        "kind": "shared-with-system"
-      },
-      "runtime": {
-        "state": "unknown",
-        "reason": "厂商未识别，不知道该找哪些组件"
-      },
-      "notes": []
-    },
-    {
-      "kind": "display",
-      "name": "card1",
-      "driver": "linlondp",
-      "memory": {
-        "kind": "shared-with-system"
-      },
-      "runtime": {
-        "state": "not-applicable",
-        "reason": "只能做显示输出，不涉及推理运行时"
-      },
-      "notes": []
-    },
-    {
-      "kind": "display",
-      "name": "card2",
-      "driver": "linlondp",
-      "memory": {
-        "kind": "shared-with-system"
-      },
-      "runtime": {
-        "state": "not-applicable",
-        "reason": "只能做显示输出，不涉及推理运行时"
-      },
-      "notes": []
-    },
-    {
-      "kind": "display",
-      "name": "card3",
-      "driver": "linlondp",
-      "memory": {
-        "kind": "shared-with-system"
-      },
-      "runtime": {
-        "state": "not-applicable",
-        "reason": "只能做显示输出，不涉及推理运行时"
-      },
-      "notes": []
-    }
-  ],
   "warnings": []
 }

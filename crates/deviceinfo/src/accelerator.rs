@@ -358,8 +358,11 @@ pub(crate) fn probe_npus(
 ) -> Vec<Accelerator> {
     let dir = root.join("dev/accel");
     let mut found = Vec::new();
-    for (node, node_path) in sorted_entries(&dir, |name| name.starts_with("accel")) {
+    for (node, _) in sorted_entries(&dir, |name| name.starts_with("accel")) {
         let sys = root.join("sys/class/accel").join(&node);
+        // 报告里的路径是**机器上的路径**（不带探测根）：本机、远端、夹具三种来源
+        // 应当给出同一串，否则既不可比、又会把暂存目录泄漏到输出里。
+        let node_path = PathBuf::from("/dev/accel").join(&node);
         let device_dir = sys.join("device");
         let vendor = read_trimmed(&device_dir.join("vendor")).map(|v| vendor_name(&v));
         let driver = driver_of(&device_dir);
@@ -457,7 +460,9 @@ pub(crate) fn probe_gpus(
             },
         });
 
-        let device_path = nodes.first().map(|name| root.join("dev/dri").join(name));
+        let device_path = nodes
+            .first()
+            .map(|name| PathBuf::from("/dev/dri").join(name));
         // 字面量里字段是按书写顺序求值的：先把借 vendor 的算完再 move 它
         let (memory, memory_note) = match kind {
             // 显示控制器拿系统内存做 framebuffer，没有"独立显存"这回事
@@ -635,7 +640,7 @@ mod tests {
         assert_eq!(gpu.memory, AcceleratorMemory::SharedWithSystem);
         assert_eq!(
             gpu.device_path.as_deref(),
-            Some(root.join("dev/dri/renderD128").as_path())
+            Some(Path::new("/dev/dri/renderD128"))
         );
 
         fs::remove_dir_all(&root).ok();
@@ -984,10 +989,7 @@ mod tests {
         // 显示设备既没 PCI 标识也没 `compatible`，名字就是节点名——类别在 kind 里
         let card1 = found.iter().find(|a| a.name == "card1").unwrap();
         assert_eq!(card0.kind, AcceleratorKind::Gpu);
-        assert_eq!(
-            card0.device_path.as_deref(),
-            Some(root.join("dev/dri/renderD128").as_path())
-        );
+        assert_eq!(card0.device_path.as_deref(), Some(Path::new("/dev/dri/renderD128")));
         // 有 `drm/` 目录但里面只有 control 节点 → 只能显示输出，不是 GPU
         assert_eq!(card1.kind, AcceleratorKind::Display);
         assert!(card1.device_path.is_none(), "card1 没有 render 节点");

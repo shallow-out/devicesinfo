@@ -1,23 +1,47 @@
 {
+  "accelerators": [
+    {
+      "device_path": "/dev/dri/renderD128",
+      "driver": "i915",
+      "kind": "gpu",
+      "max_freq_mhz": 1450,
+      "memory": {
+        "kind": "shared-with-system"
+      },
+      "name": "Intel Alder Lake-P GT2 [Iris Xe Graphics]",
+      "notes": [
+        "驱动未暴露显存上限；按 Intel 在 Linux 上的常见形态推断为共享系统内存——这是推断，不是本机证据（独显此处会判错）"
+      ],
+      "pci_id": {
+        "device": "0x46a6",
+        "vendor": "0x8086"
+      },
+      "runtime": {
+        "components": [
+          "libOpenCL.so"
+        ],
+        "stack": "Level Zero / OpenCL",
+        "state": "ready"
+      },
+      "vendor": "Intel"
+    }
+  ],
   "cpu": {
     "arch": "x86_64",
-    "cpu_model": "12th Gen Intel(R) Core(TM) i9-12900H",
-    "machine_model": "Venus Series",
-    "logical_cores": 20,
-    "physical_cores": 14,
     "core_tiers": [
       {
+        "capacity": 1024,
         "cpus": [
           4,
           5,
           8,
           9
         ],
-        "physical_cores": 2,
         "max_freq_mhz": 5000,
-        "capacity": 1024
+        "physical_cores": 2
       },
       {
+        "capacity": 1008,
         "cpus": [
           0,
           1,
@@ -28,11 +52,11 @@
           10,
           11
         ],
-        "physical_cores": 4,
         "max_freq_mhz": 4900,
-        "capacity": 1008
+        "physical_cores": 4
       },
       {
+        "capacity": 608,
         "cpus": [
           12,
           13,
@@ -43,11 +67,11 @@
           18,
           19
         ],
-        "physical_cores": 8,
         "max_freq_mhz": 3800,
-        "capacity": 608
+        "physical_cores": 8
       }
     ],
+    "cpu_model": "12th Gen Intel(R) Core(TM) i9-12900H",
     "features": [
       "3dnowprefetch",
       "abm",
@@ -188,37 +212,13 @@
       "xsaves",
       "xtopology",
       "xtpr"
-    ]
+    ],
+    "logical_cores": 20,
+    "machine_model": "Venus Series",
+    "physical_cores": 14
   },
   "memory": {
     "total_bytes": 33354477568
   },
-  "accelerators": [
-    {
-      "kind": "gpu",
-      "name": "Intel Alder Lake-P GT2 [Iris Xe Graphics]",
-      "device_path": "/dev/dri/renderD128",
-      "driver": "i915",
-      "vendor": "Intel",
-      "pci_id": {
-        "vendor": "0x8086",
-        "device": "0x46a6"
-      },
-      "memory": {
-        "kind": "shared-with-system"
-      },
-      "max_freq_mhz": 1450,
-      "runtime": {
-        "state": "ready",
-        "stack": "Level Zero / OpenCL",
-        "components": [
-          "libOpenCL.so"
-        ]
-      },
-      "notes": [
-        "驱动未暴露显存上限；按 Intel 在 Linux 上的常见形态推断为共享系统内存——这是推断，不是本机证据（独显此处会判错）"
-      ]
-    }
-  ],
   "warnings": []
 }

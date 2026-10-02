@@ -1,0 +1,28 @@
+{
+  "cgroup": "v2",
+  "containers": [
+    {
+      "name": "docker",
+      "path": "/usr/bin/docker",
+      "sockets": [
+        "/run/docker.sock",
+        "/var/run/docker.sock"
+      ]
+    }
+  ],
+  "init": "systemd",
+  "package_managers": [
+    "apt-get"
+  ],
+  "registry_mirrors": [
+    {
+      "source": "/etc/docker/daemon.json",
+      "url": "https://docker.fnnas.com"
+    },
+    {
+      "source": "/etc/docker/daemon.json",
+      "url": "https://registry.hub.docker.com"
+    }
+  ],
+  "warnings": []
+}

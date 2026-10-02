@@ -12,19 +12,24 @@
 use deviceinfo::{HardwareReport, probe_with};
 use std::path::{Path, PathBuf};
 
+/// 递归统计一个目录的字节数。
+fn walk_size(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| match entry.metadata() {
+            Ok(meta) if meta.is_dir() => walk_size(&entry.path()),
+            Ok(meta) => meta.len(),
+            Err(_) => 0,
+        })
+        .sum()
+}
+
 fn fixtures_dir() -> PathBuf {
     // crates/deviceinfo/tests/ → 仓库根
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures")
-}
-
-/// 把报告里的绝对路径统一成"相对于探测根"的形式再比较。
-///
-/// 夹具要能在任何路径下跑，所以期望值里不能留 `<tmp>/fixtures/x/dev/...`。
-/// `capture` 写期望值时用的是同一套规则。
-fn relativize(report: &HardwareReport, root: &Path) -> HardwareReport {
-    let json = serde_json::to_string(report).expect("报告一定可序列化");
-    let prefix = format!("{}/", root.display().to_string().trim_end_matches('/'));
-    serde_json::from_str(&json.replace(&prefix, "/")).expect("归一化后仍然可解析")
 }
 
 #[test]
@@ -52,7 +57,10 @@ fn captured_machines_still_probe_the_same() {
         let expected: HardwareReport =
             serde_json::from_str(&expected_text).expect("expected.json 应可解析");
 
-        let actual = relativize(&probe_with(&fixture, arch), &fixture);
+        // **直接比，不做任何路径归一化**：报告里的路径是"机器上的路径"
+        // （`/dev/accel/accel0`），本机、远端、夹具三种来源本来就该给出同一串。
+        // 以前要归一化，是因为路径里混了探测根——那掩盖了"夹具与真机不同"这类偏差。
+        let actual = probe_with(&fixture, arch);
         assert_eq!(
             actual,
             expected,
@@ -61,7 +69,41 @@ fn captured_machines_still_probe_the_same() {
             fixture.display()
         );
 
+        // 环境报告也要对：它和硬件报告一样是可缓存的事实，而且它的输入
+        // （可执行文件候选、socket、镜像源配置）最容易被采集清单漏掉。
+        let expected_environment = std::fs::read_to_string(
+            fixture.join("expected-environment.json"),
+        )
+        .unwrap_or_else(|error| {
+            panic!("{} 缺 expected-environment.json: {error}", fixture.display())
+        });
+        let expected_environment: deviceinfo::EnvironmentReport =
+            serde_json::from_str(&expected_environment).expect("expected-environment.json 应可解析");
+        assert_eq!(
+            deviceinfo::probe_environment(&fixture),
+            expected_environment,
+            "\n夹具 {} 的环境探测结果变了。\n",
+            fixture.display()
+        );
+
         checked += 1;
+    }
+
+    // 夹具必须是**小文本**的集合。这条守卫是有原因的：环境探测要问
+    // "`/usr/bin/podman` 在不在"，而那是 45 MB 的二进制——一旦被当成"要复制内容"，
+    // 夹具会从 33 KB 涨到 428 MB，而且**没有任何测试会红**。
+    // 现在采集端也在拦（`refuse_if_oversized`），这里再钉一次。
+    for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+        let fixture = entry.path();
+        if !fixture.is_dir() {
+            continue;
+        }
+        let bytes: u64 = walk_size(&fixture);
+        assert!(
+            bytes < 1024 * 1024,
+            "{} 有 {bytes} 字节——夹具该全是小文本",
+            fixture.display()
+        );
     }
 
     assert!(

@@ -1,0 +1,24 @@
+{
+  "cgroup": "v2",
+  "containers": [
+    {
+      "name": "docker",
+      "notes": [
+        "不是真的 docker：是个壳脚本，实际调用 podman"
+      ],
+      "path": "/usr/bin/docker"
+    },
+    {
+      "name": "podman",
+      "path": "/usr/bin/podman",
+      "sockets": [
+        "/run/user/1000/podman/podman.sock"
+      ]
+    }
+  ],
+  "init": "systemd",
+  "package_managers": [
+    "pacman"
+  ],
+  "warnings": []
+}

@@ -6,6 +6,7 @@
 //! 硬件报告和运行时状态**分开渲染**：这两份数据的生命周期不同，一起打印会让人以为
 //! "可用内存"和"CPU 型号"是同一类东西。
 
+use crate::environment::EnvironmentReport;
 use crate::report::{AcceleratorKind, AcceleratorMemory, HardwareReport, RuntimeStatus};
 use crate::state::RuntimeState;
 use std::fmt::Write;
@@ -137,6 +138,88 @@ pub fn human(report: &HardwareReport) -> String {
             if !accel.notes.is_empty() {
                 let _ = writeln!(out, "             ! {}", accel.notes.join("; "));
             }
+        }
+    }
+
+    for warning in &report.warnings {
+        let _ = writeln!(out, "警告     {warning}");
+    }
+
+    out
+}
+
+/// 把环境报告渲染成多行文本（带末尾换行）。
+///
+/// 与硬件/状态分开渲染：这三份数据的**变化频率**不同，混在一起会让人
+/// 以为"装了 docker"和"CPU 有几个核"是同一类事实。
+pub fn human_environment(report: &EnvironmentReport) -> String {
+    let mut out = String::new();
+
+    let mut platform = Vec::new();
+    if !report.package_managers.is_empty() {
+        platform.push(format!("包管理 {}", report.package_managers.join("/")));
+    }
+    if let Some(init) = &report.init {
+        platform.push(format!("init {init}"));
+    } else {
+        // None 不是"探测失败"，是"没有常驻服务机制"——那直接决定能不能部署成服务
+        platform.push("init 无（跑不了常驻服务）".into());
+    }
+    if let Some(cgroup) = &report.cgroup {
+        platform.push(format!("cgroup {cgroup}"));
+    }
+    let _ = writeln!(out, "系统     {}", platform.join(" · "));
+
+    if report.containers.is_empty() {
+        let _ = writeln!(out, "容器     无 —— 要用容器得先装");
+    } else {
+        for (index, container) in report.containers.iter().enumerate() {
+            let label = if index == 0 { "容器     " } else { "         " };
+            let mut line = format!(
+                "{label}{:<8} {}",
+                container.name,
+                container.path.display()
+            );
+            if container.sockets.is_empty() {
+                // 「装了」和「在跑」是两件事，别让读者以为它在跑
+                line.push_str("   （没看到 socket，可能没在跑）");
+            } else {
+                let sockets: Vec<String> = container
+                    .sockets
+                    .iter()
+                    .map(|socket| socket.display().to_string())
+                    .collect();
+                let _ = write!(line, "   socket {}", sockets.join("、"));
+            }
+            let _ = writeln!(out, "{line}");
+            if !container.notes.is_empty() {
+                let _ = writeln!(out, "         ! {}", container.notes.join("; "));
+            }
+        }
+    }
+
+    if report.inference_tools.is_empty() {
+        let _ = writeln!(out, "推理     无 —— 需要部署");
+    } else {
+        let tools: Vec<String> = report
+            .inference_tools
+            .iter()
+            .map(|tool| format!("{} ({})", tool.name, tool.path.display()))
+            .collect();
+        let _ = writeln!(out, "推理     已装 {} —— 别重复部署", tools.join("、"));
+    }
+
+    if report.registry_mirrors.is_empty() {
+        let _ = writeln!(out, "镜像源   无（拉镜像走默认 registry）");
+    } else {
+        for (index, mirror) in report.registry_mirrors.iter().enumerate() {
+            let label = if index == 0 { "镜像源   " } else { "         " };
+            let _ = writeln!(
+                out,
+                "{label}{}   （来自 {}）",
+                mirror.url,
+                mirror.source.display()
+            );
         }
     }
 

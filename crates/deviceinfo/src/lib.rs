@@ -49,6 +49,7 @@
 
 mod accelerator;
 mod cpu;
+pub mod environment;
 mod features;
 mod memory;
 mod report;
@@ -64,6 +65,7 @@ pub use report::{
     PciId, RuntimeStatus,
 };
 pub use cpu::{PER_CORE_INPUTS as CPU_PER_CORE_INPUTS, SHARED_INPUTS as CPU_SHARED_INPUTS};
+pub use environment::EnvironmentReport;
 pub use runtime::LIBRARY_DIRS;
 pub use state::{AcceleratorState, DiskUsage, MemoryState, RuntimeState, SampleOptions};
 
@@ -105,6 +107,17 @@ pub fn probe_with(root: &Path, arch: &str) -> HardwareReport {
         accelerators,
         warnings,
     }
+}
+
+/// 探测软件环境：**这台机器装了什么、配了什么**。
+///
+/// 与 [`probe`] 的区别是变化频率：硬件装了就不变，环境**装了/配了才变**。
+/// 所以它可以缓存，但它不是机器本身的固有属性——不要拿它跨机器比较"谁更强"。
+pub fn probe_environment(root: &Path) -> EnvironmentReport {
+    let mut warnings = Vec::new();
+    let mut report = environment::probe(root, &mut warnings);
+    report.warnings = warnings;
+    report
 }
 
 /// 采样一次运行时状态。

@@ -1,41 +1,91 @@
 {
+  "accelerators": [
+    {
+      "device_path": "/dev/accel/accel0",
+      "driver": "intel_vpu",
+      "driver_version": "1.0.0 7.2.6-arch2-1-xzl01",
+      "kind": "npu",
+      "max_freq_mhz": 1900,
+      "memory": {
+        "kind": "shared-with-system"
+      },
+      "name": "Intel Core Ultra 200V Series Processors NPU",
+      "notes": [],
+      "pci_id": {
+        "device": "0x643e",
+        "vendor": "0x8086"
+      },
+      "runtime": {
+        "components": [
+          "libze_loader.so",
+          "libze_intel_npu.so",
+          "libopenvino_intel_npu_compiler_loader.so"
+        ],
+        "stack": "OpenVINO NPU",
+        "state": "ready"
+      },
+      "vendor": "Intel"
+    },
+    {
+      "device_path": "/dev/dri/renderD128",
+      "driver": "xe",
+      "kind": "gpu",
+      "max_freq_mhz": 1950,
+      "memory": {
+        "kind": "shared-with-system"
+      },
+      "name": "Intel Core Ultra 200V Series Processors Arc Graphics 130V/140V GPU",
+      "notes": [
+        "驱动未暴露显存上限；按 Intel 在 Linux 上的常见形态推断为共享系统内存——这是推断，不是本机证据（独显此处会判错）"
+      ],
+      "pci_id": {
+        "device": "0x64a0",
+        "vendor": "0x8086"
+      },
+      "runtime": {
+        "components": [
+          "libze_intel_gpu.so"
+        ],
+        "stack": "Level Zero / OpenCL",
+        "state": "ready"
+      },
+      "vendor": "Intel"
+    }
+  ],
   "cpu": {
     "arch": "x86_64",
-    "cpu_model": "Intel(R) Core(TM) Ultra 7 258V",
-    "machine_model": "83LC",
-    "logical_cores": 8,
-    "physical_cores": 8,
     "core_tiers": [
       {
+        "capacity": 1024,
         "cpus": [
           0,
           1
         ],
-        "physical_cores": 2,
         "max_freq_mhz": 4800,
-        "capacity": 1024
+        "physical_cores": 2
       },
       {
+        "capacity": 1005,
         "cpus": [
           2,
           3
         ],
-        "physical_cores": 2,
         "max_freq_mhz": 4700,
-        "capacity": 1005
+        "physical_cores": 2
       },
       {
+        "capacity": 676,
         "cpus": [
           4,
           5,
           6,
           7
         ],
-        "physical_cores": 4,
         "max_freq_mhz": 3700,
-        "capacity": 676
+        "physical_cores": 4
       }
     ],
+    "cpu_model": "Intel(R) Core(TM) Ultra 7 258V",
     "features": [
       "3dnowprefetch",
       "abm",
@@ -181,63 +231,13 @@
       "xsaves",
       "xtopology",
       "xtpr"
-    ]
+    ],
+    "logical_cores": 8,
+    "machine_model": "83LC",
+    "physical_cores": 8
   },
   "memory": {
     "total_bytes": 33129861120
   },
-  "accelerators": [
-    {
-      "kind": "npu",
-      "name": "Intel Core Ultra 200V Series Processors NPU",
-      "device_path": "/dev/accel/accel0",
-      "driver": "intel_vpu",
-      "driver_version": "1.0.0 7.2.6-arch2-1-xzl01",
-      "vendor": "Intel",
-      "pci_id": {
-        "vendor": "0x8086",
-        "device": "0x643e"
-      },
-      "memory": {
-        "kind": "shared-with-system"
-      },
-      "max_freq_mhz": 1900,
-      "runtime": {
-        "state": "ready",
-        "stack": "OpenVINO NPU",
-        "components": [
-          "libze_loader.so",
-          "libze_intel_npu.so",
-          "libopenvino_intel_npu_compiler_loader.so"
-        ]
-      },
-      "notes": []
-    },
-    {
-      "kind": "gpu",
-      "name": "Intel Core Ultra 200V Series Processors Arc Graphics 130V/140V GPU",
-      "device_path": "/dev/dri/renderD128",
-      "driver": "xe",
-      "vendor": "Intel",
-      "pci_id": {
-        "vendor": "0x8086",
-        "device": "0x64a0"
-      },
-      "memory": {
-        "kind": "shared-with-system"
-      },
-      "max_freq_mhz": 1950,
-      "runtime": {
-        "state": "ready",
-        "stack": "Level Zero / OpenCL",
-        "components": [
-          "libze_intel_gpu.so"
-        ]
-      },
-      "notes": [
-        "驱动未暴露显存上限；按 Intel 在 Linux 上的常见形态推断为共享系统内存——这是推断，不是本机证据（独显此处会判错）"
-      ]
-    }
-  ],
   "warnings": []
 }

@@ -22,23 +22,26 @@
    （"有没有 AMX"、"有没有 SVE2"、"有没有 FP8"），生产者一旦筛掉，信息就永久丢失，
    而且丢失是无声的。好看不好看交给显示层（`render`）。
 
-## 硬件 vs 运行时状态
+## 三个入口，别混
 
-两个入口，别混：
-
-| | `probe()` → `HardwareReport` | `sample_state()` → `RuntimeState` |
-|---|---|---|
-| 描述 | 这台机器**是什么** | **此刻**怎样 |
-| 内容 | 架构、核数与性能分层、指令集、加速器与运行时就绪度、内存总量 | 可用内存、swap、磁盘余量、加速器的频率/常驻内存/累积忙碌时间 |
-| 变化频率 | 装上就不变 | 每一秒都在变 |
-| 能否缓存 / 跨机器 diff | 能 | 不能 |
+| | `probe()` → `HardwareReport` | `probe_environment()` → `EnvironmentReport` | `sample_state()` → `RuntimeState` |
+|---|---|---|---|
+| 描述 | 这台机器**是什么** | **装了什么、配了什么** | **此刻**怎样 |
+| 内容 | 架构、处理器/整机型号、核数与性能分层、指令集、加速器与运行时就绪度、内存总量 | 包管理器、init、cgroup、容器运行时与其 socket、已装推理框架、容器镜像源 | 可用内存、swap、磁盘余量、加速器的频率/常驻内存/累积忙碌时间 |
+| 变化频率 | 装上就不变 | **装了/配了才变** | 每一秒都在变 |
+| 能否缓存 | 能 | 能 | 不能 |
+| 能否跨机器比较 | 能 | **不能**（它是可改的） | 不能 |
 
 混在一起会让硬件报告失去它最大的用处：拿两台机器的报告直接 `diff`。
+
+**报告里的路径都是"被探测机器上的路径"**（`/usr/bin/podman`），不带探测根。
+这样本机、`--ssh`、夹具三种来源给出同一串，既可比，也不会把临时目录泄漏到输出里。
 
 ## 用法
 
 ```bash
 cargo run -p deviceinfo-cli                       # 硬件与能力（默认子命令）
+cargo run -p deviceinfo-cli -- environment --ssh r1   # 软件环境（含 --ssh）
 cargo run -p deviceinfo-cli -- state --watch /var/cache
 cargo run -p deviceinfo-cli -- state --counters    # 额外读累积计数器（见下）
 cargo run -p deviceinfo-cli -- --json hardware     # 跨机器 diff 用
@@ -286,6 +289,18 @@ diff <(deviceinfo --json hardware) \
   是**每个簇的核类型**，不是整颗 CPU 的型号——一台 A76+A55 的机器填哪个都是误导，
   所以刻意没收。
 
+- **环境探测不执行任何命令**，所以拿不到版本号。`docker --version` 要跑一遍；包数据库
+  虽然能读，但在 Debian 上是一个 1 MB、装一次包就变一次的大文件（`/var/lib/dpkg/status`），
+  读完还会污染夹具。这类属于**实时探测**，还没有做——它是"跑了一次"而不是"读了一个事实"。
+- **出网能力（能不能拉镜像）也没做**，理由同上：那是连接测试，一秒后就可能变。
+  注意它**必须按目标分别测**：实测那台 NAS 出得去 baidu 但到不了 Docker Hub
+  （DNS 被污染），靠 `daemon.json` 里的镜像源拉——只测 `docker.io` 会得出错误结论。
+- **容器镜像源只解析到"配置文件里写了什么"**：`podman` 的 `registries.conf` 解析
+  **没有真机验证过**（三台 Arch 上那份是上游模板、整份都被注释掉），只有合成样本的单元测试。
+  Docker 那条有真样本（那台 NAS）。
+- **正在监听的端口**没进环境报告：那是**状态**（服务起了才变），该进 `state`，而 `state`
+  目前不支持 `--ssh`（磁盘余量查的是本机挂载的文件系统）。
+- **`socket` 存在与否不等于守护进程健康**：只能说明"有人起过它"。
 - **`libc` 依赖**：只为了 `statvfs`（标准库至今没有 `std::fs::statfs`/`statvfs`）。
   全部 `unsafe` 只出现在 `state::filesystem_usage` 一处。
 

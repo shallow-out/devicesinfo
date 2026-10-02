@@ -8,8 +8,8 @@ mod source;
 use clap::{Parser, Subcommand};
 use deviceinfo::pci::{PCI_DATABASE_PATHS, extract_entries};
 use deviceinfo::{
-    CPU_PER_CORE_INPUTS, CPU_SHARED_INPUTS, HardwareReport, LIBRARY_DIRS, PciId, RuntimeStatus,
-    SampleOptions, probe_with, render, sample_state_with,
+    CPU_PER_CORE_INPUTS, CPU_SHARED_INPUTS, LIBRARY_DIRS, PciId, RuntimeStatus, SampleOptions,
+    probe_with, render, sample_state_with,
 };
 use source::{Entry, EntryKind, Source};
 use std::collections::BTreeMap;
@@ -52,6 +52,18 @@ enum Command {
         #[arg(long, value_name = "ARCH")]
         arch: Option<String>,
         /// 有 warning 就以退出码 1 结束（给 CI 用）
+        #[arg(long)]
+        strict: bool,
+    },
+    /// 软件环境：装了什么、配了什么（变了才变）
+    Environment {
+        /// 探测的根目录
+        #[arg(long, value_name = "PATH", default_value = "/", conflicts_with = "ssh")]
+        root: PathBuf,
+        /// 隔着 ssh 探测另一台机器
+        #[arg(long, value_name = "HOST")]
+        ssh: Option<String>,
+        /// 有 warning 就以退出码 1 结束
         #[arg(long)]
         strict: bool,
     },
@@ -123,6 +135,28 @@ fn main() {
                 print_json(&report);
             } else {
                 print!("{}", render::human(&report));
+            }
+            if strict && !report.warnings.is_empty() {
+                std::process::exit(1);
+            }
+        }
+        Command::Environment { root, ssh, strict } => {
+            let source = match &ssh {
+                Some(host) => Source::remote(host),
+                None => Source::local(&root),
+            };
+            let (local_root, _staging) = match resolve_local_root(&source) {
+                Ok(pair) => pair,
+                Err(error) => {
+                    eprintln!("探测失败: {error}");
+                    std::process::exit(2);
+                }
+            };
+            let report = deviceinfo::probe_environment(&local_root);
+            if cli.json {
+                print_json(&report);
+            } else {
+                print!("{}", render::human_environment(&report));
             }
             if strict && !report.warnings.is_empty() {
                 std::process::exit(1);
@@ -212,6 +246,12 @@ fn capture(source: &Source, arch: &str, out: &Path) -> io::Result<()> {
     // 列目录全返回空，于是采集**不报错**、写出一份几乎空的夹具、还说"已采集"。
     // `--root` 指错地方同理。而夹具是要进回归测试的——**一份空壳夹具比没有夹具更坏**，
     // 它会让后来的所有探测变更都"通过"。
+    // 夹具不该大：它的内容是"探测读了什么"，全是小文本文件。
+    // 一旦混进了要复制内容的大文件（可执行文件、模型、数据库），这里会拦住——
+    // 实测环境探测把 `/usr/bin/podman`（45 MB）当内容复制过，夹具从 33 KB 涨到 428 MB，
+    // 而且**没有任何测试会红**。
+    refuse_if_oversized(out)?;
+
     for required in ESSENTIAL_FILES {
         if !root.join(required).is_file() {
             return Err(io::Error::other(format!(
@@ -223,6 +263,56 @@ fn capture(source: &Source, arch: &str, out: &Path) -> io::Result<()> {
     }
 
     capture_from_root(&root, arch, out)
+}
+
+/// "顺手带上内容"的大小门槛。
+///
+/// 超过它的一律只占位：实测环境探测把 `/usr/bin/podman`（45 MB）和 docker（42 MB）
+/// 当内容复制过，夹具从 33 KB 涨到 428 MB。
+///
+/// 门槛取得很小（8 KB）是因为**只有壳脚本的判据需要内容**，而壳脚本就是几百字节
+/// （实测 `podman-docker` 的 `/usr/bin/docker` 是 228 字节）。取太大会把无关的小启动器
+/// 也抄进夹具：本机的 `llama-server` 是个 14 KB 的启动器，六份就是 86 KB，而探测根本不读它。
+///
+/// 阈值选错的后果是**响亮的**：壳脚本一旦落到占位那一侧，夹具里的环境报告就与真机不符，
+/// 夹具测试会红——所以这个数字可以按实际情况调。
+const SMALL_FILE_BYTES: u64 = 8 * 1024;
+
+/// 夹具的大小上限。所有正常夹具都在 1 MB 以内（全是小文本）。
+const FIXTURE_SIZE_LIMIT_BYTES: u64 = 8 * 1024 * 1024;
+
+/// 超过上限就报错。理由见 [`capture`] 里的那道守卫。
+fn refuse_if_oversized(out: &Path) -> io::Result<()> {
+    let mut total = 0_u64;
+    let mut stack = vec![out.to_path_buf()];
+    let mut biggest: Option<(u64, PathBuf)> = None;
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            total += meta.len();
+            if biggest.as_ref().is_none_or(|(size, _)| meta.len() > *size) {
+                biggest = Some((meta.len(), path));
+            }
+        }
+    }
+    if total <= FIXTURE_SIZE_LIMIT_BYTES {
+        return Ok(());
+    }
+    let hint = biggest
+        .map(|(size, path)| format!("，最大的是 {}（{} 字节）", path.display(), size))
+        .unwrap_or_default();
+    Err(io::Error::other(format!(
+        "夹具写到 {total} 字节，超过上限 {FIXTURE_SIZE_LIMIT_BYTES}{hint}；\
+         采集清单里多半混进了该只放占位的东西（可执行文件？）"
+    )))
 }
 
 /// 采集前必须存在的文件。理由见 [`capture`] 里的守卫。
@@ -252,7 +342,27 @@ fn mirror(source: &Source, stage: &Path) -> io::Result<()> {
     // 一次 ssh 把全部内容取回来，而不是每个文件开一次连接
     let mut wanted = plan.files.clone();
     wanted.extend(plan.databases.iter().cloned());
+    // 占位的那批只要"存在/不存在"两个事实，内容不用取
+    wanted.extend(plan.existence_only.iter().cloned());
     source.prefetch(&wanted)?;
+
+    for rel in plan.existence_only.iter() {
+        let kind = source.kind(rel);
+        if kind == EntryKind::Missing {
+            continue;
+        }
+        // **小文件顺手带上内容**：壳脚本的判据要读文件内容（`/usr/bin/docker` 是不是
+        // 一个调用 podman 的脚本），而占位空文件会让夹具判不出来、于是夹具与真机不一致。
+        // 大文件（真二进制，动辄几十 MB）当然还是只占位。
+        let content = match kind {
+            EntryKind::File => source
+                .read(rel)
+                .filter(|bytes| bytes.len() as u64 <= SMALL_FILE_BYTES)
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        write_file(&stage.join(rel), &content)?;
+    }
 
     for rel in plan.files.iter().chain(plan.databases.iter()) {
         let raw = match source.kind(rel) {
@@ -320,6 +430,23 @@ fn capture_from_root(root: &Path, arch: &str, out: &Path) -> io::Result<()> {
     let source = Source::local(root);
     let report = probe_with(root, arch);
     let plan = capture_plan(&source)?;
+
+    // 0) **只需要"存在"**的输入：夹具里放空占位。可执行文件动辄几十 MB，
+    //    复制内容会让夹具爆掉（真的发生过：428 MB）。
+    for rel in &plan.existence_only {
+        let from = root.join(rel);
+        if !from.exists() {
+            continue;
+        }
+        // 同 `mirror`：小文件带内容（壳脚本判据要读它），大文件只占位
+        let content = match fs::metadata(&from) {
+            Ok(meta) if meta.is_file() && meta.len() <= SMALL_FILE_BYTES => {
+                fs::read(&from).unwrap_or_default()
+            }
+            _ => Vec::new(),
+        };
+        write_file(&out.join(rel), &content)?;
+    }
 
     // 1) 探测会读到的文件
     for rel in &plan.files {
@@ -395,9 +522,26 @@ fn capture_from_root(root: &Path, arch: &str, out: &Path) -> io::Result<()> {
         &out.join("meta.json"),
         format!("{}\n", serde_json::to_string_pretty(&meta)?).as_bytes(),
     )?;
+    let to_json = |value: &serde_json::Value| -> io::Result<String> {
+        serde_json::to_string_pretty(value)
+            .map(|text| format!("{text}\n"))
+            .map_err(|error| io::Error::other(format!("序列化失败: {error}")))
+    };
+    // 硬件报告与环境报告**都要快照**：只冻结硬件的话，环境探测的行为变化
+    // （比如镜像时把目录写成了文件、于是 init 永远报 null）不会被任何测试发现。
     write_file(
         &out.join("expected.json"),
-        format!("{}\n", relativize_json(&report, root)?).as_bytes(),
+        to_json(&serde_json::to_value(&report).map_err(|error| {
+            io::Error::other(format!("报告序列化失败: {error}"))
+        })?)?
+        .as_bytes(),
+    )?;
+    write_file(
+        &out.join("expected-environment.json"),
+        to_json(&serde_json::to_value(deviceinfo::probe_environment(root)).map_err(
+            |error| io::Error::other(format!("环境报告序列化失败: {error}")),
+        )?)? 
+        .as_bytes(),
     )?;
     Ok(())
 }
@@ -408,6 +552,11 @@ fn capture_from_root(root: &Path, arch: &str, out: &Path) -> io::Result<()> {
 /// 宁可多列几个不存在的路径（`fs::metadata` 会跳过），也不要漏。
 struct CapturePlan {
     files: Vec<String>,
+    /// **只需要"存在"**的路径：只放空占位，不复制内容。
+    ///
+    /// 必须和 `files` 分开：环境探测要问"`/usr/bin/podman` 在不在"，而那是 45 MB
+    /// 的二进制——复制内容会让夹具从 33 KB 涨到 428 MB（真的发生过）。
+    existence_only: Vec<String>,
     /// 只复制到暂存树的"探测输入数据库"（`pci.ids`）。
     ///
     /// 必须和 `files` 分开：**暂存树要它**（否则 `pci::lookup` 查不到名字，
@@ -424,6 +573,7 @@ fn capture_plan(source: &Source) -> io::Result<CapturePlan> {
     // 而漂移的后果（远端夹具静默少一个输入）很难发现。
     let mut files: Vec<String> = CPU_SHARED_INPUTS.iter().map(|path| path.to_string()).collect();
     let mut symlinks = Vec::new();
+    let mut existence_only = Vec::new();
     // 探测会读 pci.ids（`pci::lookup`），所以要镜像进暂存树——但写夹具时另走一条路
     let databases: Vec<String> = PCI_DATABASE_PATHS.iter().map(|path| path.to_string()).collect();
     let mut lists = ListCache::new(source);
@@ -553,6 +703,23 @@ fn capture_plan(source: &Source) -> io::Result<CapturePlan> {
         pci_driver_links.push(format!("{base}/driver"));
     }
 
+    // 软件环境：**输入清单由库提供**（`environment::inputs`），这里不重抄一份。
+    // 硬件那边因为重抄栽过一次（`acpi_cppc/highest_perf` 漏加 → 远端夹具静默少一个输入）。
+    let environment_dirs = deviceinfo::environment::input_dirs();
+    lists.ensure(&environment_dirs)?;
+    for input in deviceinfo::environment::inputs(&|dir| {
+        lists
+            .entries(dir)
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect()
+    }) {
+        match input {
+            deviceinfo::environment::Input::Content(path) => files.push(path),
+            deviceinfo::environment::Input::Existence(path) => existence_only.push(path),
+        }
+    }
+
     // 已发现加速器的 uevent：里面有 `PCI_SLOT_NAME`，扫 PCI 总线时用它去重
     for device in &device_dirs {
         files.push(format!("{device}/uevent"));
@@ -580,6 +747,7 @@ fn capture_plan(source: &Source) -> io::Result<CapturePlan> {
 
     Ok(CapturePlan {
         files,
+        existence_only,
         databases,
         symlinks,
     })
@@ -647,16 +815,6 @@ impl<'a> ListCache<'a> {
 /// 把报告里的绝对路径统一成"相对于探测根"的形式（`/dev/accel/accel0`）。
 ///
 /// 夹具要能在任何机器、任何路径下跑，期望值里就不能留 `/tmp/...` 这种绝对前缀。
-/// `tests/fixtures.rs` 用同一套规则把实际结果归一化，两边才能比。
-fn relativize_json(report: &HardwareReport, root: &Path) -> io::Result<String> {
-    // 不用 `expect`：`PathBuf` 的 serde 实现会在路径不是合法 UTF-8 时失败，
-    // 而设备路径来自外部输入。报错比 panic 好。
-    let json = serde_json::to_string_pretty(report)
-        .map_err(|error| io::Error::other(format!("报告序列化失败: {error}")))?;
-    let prefix = format!("{}/", root.display().to_string().trim_end_matches('/'));
-    Ok(json.replace(&prefix, "/"))
-}
-
 /// `/proc/cpuinfo` 里探测器会读的键。其余的（尤其是 `cpu MHz`）都是瞬时值。
 const CPUINFO_KEYS: [&str; 9] = [
     "processor",

@@ -1,0 +1,8 @@
+{
+  "cgroup": "v2",
+  "init": "systemd",
+  "package_managers": [
+    "apt-get"
+  ],
+  "warnings": []
+}

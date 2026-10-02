@@ -1,0 +1,35 @@
+{
+  "cgroup": "v2",
+  "containers": [
+    {
+      "name": "docker",
+      "notes": [
+        "不是真的 docker：是个壳脚本，实际调用 podman"
+      ],
+      "path": "/usr/bin/docker"
+    },
+    {
+      "name": "podman",
+      "path": "/usr/bin/podman"
+    }
+  ],
+  "inference_tools": [
+    {
+      "name": "llama-server",
+      "path": "/usr/bin/llama-server"
+    },
+    {
+      "name": "llama-cli",
+      "path": "/usr/bin/llama-cli"
+    },
+    {
+      "name": "llama-bench",
+      "path": "/usr/bin/llama-bench"
+    }
+  ],
+  "init": "systemd",
+  "package_managers": [
+    "pacman"
+  ],
+  "warnings": []
+}
