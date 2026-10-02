@@ -270,6 +270,53 @@ diff <(deviceinfo --json hardware) \
 - **`libc` 依赖**：只为了 `statvfs`（标准库至今没有 `std::fs::statfs`/`statvfs`）。
   全部 `unsafe` 只出现在 `state::filesystem_usage` 一处。
 
+## 拿到实机后怎么补
+
+上面那几条的共同点是**必须有对应硬件才算验证过**——没有硬件就写，写出来的就是没验证过的
+枚举逻辑。拿到机器时按下面的配方走，基本都是几分钟的事。
+
+### NVIDIA / AMD 的运行时判据
+
+```bash
+ssh <host> 'ls /usr/lib/libcuda.so* /usr/lib/libnvidia-ml.so* /usr/lib/libze_* /usr/lib/libamd* 2>/dev/null;
+            command -v nvidia-smi rocminfo'
+deviceinfo hardware --ssh <host>     # 现在会报 "运行时 未知 · 还没有 NVIDIA 的用户态运行时判据"
+```
+
+加一条 `spec_for` 的分支即可。**关键是先确认"缺了哪个包就真的跑不起来"**——判据的力量来自
+"缺了就一定能拦住"，不是来自"装齐了就有"。加完要**故意少装一个包**验证它变 `Incomplete`。
+
+### PCI 加速器点名逻辑（Hailo-8 / Coral / FPGA）
+
+```bash
+lspci -nn | grep -iE '\[1200\]|\[0b40\]'   # 确认内核给它的 class
+deviceinfo hardware | tail -3                   # 应当有一条警告点名它
+```
+
+如果它同时也走 `/dev/accel`（有些卡会），要确认**去重生效**——同一块卡只能被点名一次。
+
+### Intel 独显的显存语义
+
+```bash
+ls /sys/class/drm/card*/device/mem_info_vram_total   # xe 在独显上到底暴不暴露显存
+```
+
+- **暴露了** → 会得到 `Dedicated{bytes}`，那么"Intel → 推断为共享"这条分支只在集显上生效，
+  可以接受（但仍建议把推断说明保留）。
+- **没暴露** → 会得到 `SharedWithSystem` **加一条"这是推断"的说明**。那条说明正好证明了它
+  存在的必要：此时 Intel（Intel/AMD）分支应当改成 `Unknown`，或者继续找更硬的判据
+  （BAR 大小和 PCI class 都试过，都不行，见上）。
+
+### `0x1200` / `0x0b40` 之外的加速器类别
+
+见到具体设备再收。`0x11xx` 已经实测确认**不是**（本机那两个是 Intel DTT 功耗控制和
+Crash Log Telemetry，`lspci` 也把它们分开标），别提前扩。
+
+### arm64 的处理器型号
+
+设备树 `cpus/cpu@N/compatible` 是**每个簇的核类型**（`arm,cortex-a76`），不是整颗 CPU 的型号
+——要补的话得先想清楚 `cpu_model` 怎么表达"一颗 CPU 有三种核"，否则填哪个都是误导。
+
 ## 许可
 
 GPL-3.0-or-later
