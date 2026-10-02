@@ -3,11 +3,15 @@
 //! 存在意义有三个：让这个模块**能脱离任何上层单独验证**；给出一份可以直接
 //! `diff` 两台机器的输出；把真机采集成测试夹具。
 
+mod source;
+
 use clap::{Parser, Subcommand};
 use deviceinfo::pci::{PCI_DATABASE_PATHS, extract_entries};
 use deviceinfo::{
-    HardwareReport, PciId, RuntimeStatus, SampleOptions, probe_with, render, sample_state_with,
+    HardwareReport, LIBRARY_DIRS, PciId, RuntimeStatus, SampleOptions, probe_with, render,
+    sample_state_with,
 };
+use source::{EntryKind, Source};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -65,9 +69,15 @@ enum Command {
         /// 输出目录，例如 fixtures/lunar-lake-258v
         #[arg(long, value_name = "DIR")]
         out: PathBuf,
-        /// 采集源
-        #[arg(long, value_name = "PATH", default_value = "/")]
+        /// 采集源（本地的一棵文件树）
+        #[arg(long, value_name = "PATH", default_value = "/", conflicts_with = "ssh")]
         root: PathBuf,
+        /// 隔着 ssh 采集另一台机器。
+        ///
+        /// 夹具必须在**目标机**上采，而目标机往往装不了 Rust 工具链（路由器、嵌入式盒子），
+        /// 本机也未必能交叉编译到它的架构。主机名可以是 `~/.ssh/config` 里的别名。
+        #[arg(long, value_name = "HOST")]
+        ssh: Option<String>,
         /// 记录到 meta.json 里的架构
         #[arg(long, value_name = "ARCH")]
         arch: Option<String>,
@@ -115,13 +125,24 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Command::Capture { out, root, arch } => {
+        Command::Capture {
+            out,
+            root,
+            ssh,
+            arch,
+        } => {
             let arch = arch.unwrap_or_else(|| std::env::consts::ARCH.to_string());
-            if let Err(error) = capture(&root, &arch, &out) {
-                eprintln!("采集失败: {error}");
-                std::process::exit(2);
+            let source = match &ssh {
+                Some(host) => Source::remote(host),
+                None => Source::local(&root),
+            };
+            match capture(&source, &arch, &out) {
+                Ok(()) => println!("已从 {} 采集到 {}", source.describe(), out.display()),
+                Err(error) => {
+                    eprintln!("采集失败: {error}");
+                    std::process::exit(2);
+                }
             }
-            println!("已写入 {}", out.display());
         }
     }
 }
@@ -148,13 +169,91 @@ fn print_json<T: serde::Serialize>(value: &T) {
 ///
 /// 这样 `tests/fixtures.rs` 就能"拿真机形状跑一遍，结果必须一样"——
 /// 手写的假 flags 列表抓不到真实内核里的意外（`smep` 就是这么混进指令集列表的）。
-fn capture(source: &Path, arch: &str, out: &Path) -> io::Result<()> {
-    let report = probe_with(source, arch);
+fn capture(source: &Source, arch: &str, out: &Path) -> io::Result<()> {
+    // 远端先镜像成本地临时树，之后一切都按本地处理——这样本地采集的路径一字未变，
+    // 远端采集只是多了一步落地。
+    let staging = TempTree::new()?;
+    let root = match source {
+        Source::Local(root) => root.clone(),
+        Source::Remote(_) => {
+            mirror(source, &staging.path)?;
+            staging.path.clone()
+        }
+    };
+    capture_from_root(&root, arch, out)
+}
+
+/// 把远端的东西落到本地临时树。
+///
+/// 只拉探测**读**的那些文件，加上库目录的**文件名**——库内容对夹具毫无用处，
+/// 而 `LibraryIndex` 只看名字。
+fn mirror(source: &Source, stage: &Path) -> io::Result<()> {
     let plan = capture_plan(source);
+    // 一次 ssh 把全部内容取回来，而不是每个文件开一次连接
+    source.prefetch(&plan.files);
+
+    for rel in &plan.files {
+        let raw = match source.kind(rel) {
+            // 设备节点（`/dev/accel/accel0` 这类字符设备）取不得内容：直接读会阻塞。
+            // 夹具只需要"它存在"这个事实。
+            EntryKind::Other => Vec::new(),
+            EntryKind::File => source.read(rel).unwrap_or_default(),
+            // **不存在就跳过。** 写成空文件会让探测把缺的项读成空字符串
+            EntryKind::Missing => continue,
+        };
+        write_file(&stage.join(rel), &raw)?;
+    }
+    for (rel, target) in &plan.symlinks {
+        let to = stage.join(rel);
+        if let Some(parent) = to.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let _ = fs::remove_file(&to);
+        std::os::unix::fs::symlink(target, &to)?;
+    }
+    for dir in LIBRARY_DIRS {
+        for name in source.list_files(dir) {
+            write_file(&stage.join(dir).join(name), b"")?;
+        }
+    }
+    Ok(())
+}
+
+/// 采集期间用的临时目录，用完自动删。
+struct TempTree {
+    path: PathBuf,
+}
+
+impl TempTree {
+    fn new() -> io::Result<Self> {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|taken| taken.as_nanos())
+            .unwrap_or_default();
+        let path = std::env::temp_dir().join(format!(
+            "deviceinfo-mirror-{}-{stamp}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&path)?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for TempTree {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+/// 从一棵**本地**文件树写夹具。
+fn capture_from_root(root: &Path, arch: &str, out: &Path) -> io::Result<()> {
+    let source = Source::local(root);
+    let report = probe_with(root, arch);
+    let plan = capture_plan(&source);
 
     // 1) 探测会读到的文件
     for rel in &plan.files {
-        let from = source.join(rel);
+        let from = root.join(rel);
         // 只有状态采样读的瞬时值：夹具只保留"读到得到"这个事实，不保留读数
         if is_volatile_leaf(rel) {
             if from.exists() {
@@ -208,7 +307,7 @@ fn capture(source: &Path, arch: &str, out: &Path) -> io::Result<()> {
         .collect();
     if !ids.is_empty() {
         for path in PCI_DATABASE_PATHS {
-            let Ok(text) = fs::read_to_string(source.join(path)) else {
+            let Ok(text) = fs::read_to_string(root.join(path)) else {
                 continue;
             };
             write_file(&out.join(path), extract_entries(&text, &ids).as_bytes())?;
@@ -228,7 +327,7 @@ fn capture(source: &Path, arch: &str, out: &Path) -> io::Result<()> {
     )?;
     write_file(
         &out.join("expected.json"),
-        format!("{}\n", relativize_json(&report, source)).as_bytes(),
+        format!("{}\n", relativize_json(&report, root)).as_bytes(),
     )?;
     Ok(())
 }
@@ -243,7 +342,7 @@ struct CapturePlan {
     symlinks: Vec<(String, String)>,
 }
 
-fn capture_plan(source: &Path) -> CapturePlan {
+fn capture_plan(source: &Source) -> CapturePlan {
     let mut files = vec![
         "proc/cpuinfo".to_string(),
         "proc/meminfo".to_string(),
@@ -319,10 +418,10 @@ fn capture_plan(source: &Path) -> CapturePlan {
     }
 
     for device in device_dirs {
-        let Ok(target) = fs::read_link(source.join(&device).join("driver")) else {
+        let Some(target) = source.read_link(&format!("{device}/driver")) else {
             continue;
         };
-        let Some(name) = target.file_name().and_then(|name| name.to_str()) else {
+        let Some(name) = Path::new(&target).file_name().and_then(|name| name.to_str()) else {
             continue;
         };
         // 指向哪儿无所谓，探测只读软链的末段；用 module/<名字> 便于人看
@@ -337,13 +436,10 @@ fn capture_plan(source: &Path) -> CapturePlan {
 ///
 /// 要求"数字"而不是"以数字开头"：`card0-DP-1` 是显示连接器不是 GPU，
 /// 而 `cpufreq` / `cpuidle` 会和 `cpu0` 一起混进 `cpu` 前缀里。
-fn numeric_entries(root: &Path, rel_dir: &str, prefix: &str) -> Vec<String> {
-    let Ok(entries) = fs::read_dir(root.join(rel_dir)) else {
-        return Vec::new();
-    };
-    let mut names: Vec<String> = entries
-        .flatten()
-        .filter_map(|entry| entry.file_name().into_string().ok())
+fn numeric_entries(source: &Source, rel_dir: &str, prefix: &str) -> Vec<String> {
+    let mut names: Vec<String> = source
+        .list(rel_dir)
+        .into_iter()
         .filter(|name| {
             name.strip_prefix(prefix).is_some_and(|rest| {
                 !rest.is_empty() && rest.bytes().all(|byte| byte.is_ascii_digit())

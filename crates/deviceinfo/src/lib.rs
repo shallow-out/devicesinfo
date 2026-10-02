@@ -63,6 +63,7 @@ pub use report::{
     Accelerator, AcceleratorKind, AcceleratorMemory, CoreTier, CpuInfo, HardwareReport, MemoryInfo,
     PciId, RuntimeStatus,
 };
+pub use runtime::LIBRARY_DIRS;
 pub use state::{AcceleratorState, DiskUsage, MemoryState, RuntimeState, SampleOptions};
 
 use std::path::Path;

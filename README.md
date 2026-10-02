@@ -43,6 +43,7 @@ cargo run -p deviceinfo-cli -- state --watch /var/cache
 cargo run -p deviceinfo-cli -- state --counters    # 额外读累积计数器（见下）
 cargo run -p deviceinfo-cli -- --json hardware     # 跨机器 diff 用
 cargo run -p deviceinfo-cli -- hardware --root ./fixtures/lunar-lake-ultra7-258v
+cargo run -p deviceinfo-cli -- capture --ssh o6n --arch aarch64 --out fixtures/新机器
 cargo test
 ```
 
@@ -77,6 +78,8 @@ let state = deviceinfo::sample_state(&[std::path::PathBuf::from("/var/cache")]);
 ## 真机夹具（`fixtures/`）
 
 `fixtures/` 下每一棵树都是一台**真实机器**的采样，配一份 `expected.json` 快照。
+目前三台：Intel Lunar Lake（x86 混合架构，有 NPU）、Rockchip RK3588S（ARM，RKNPU 走 DRM）、
+CIX CD8180（ARM，ACPI 启动无设备树，5 个 CPU 簇，panthor GPU + 3 个显示控制器）。
 `cargo test` 会拿着夹具重跑一遍探测，结果和快照不一致就失败。
 
 这解决的是一个具体问题：**手写的假 features 列表抓不到真实内核里的意外。**
@@ -88,9 +91,32 @@ x86 flag / 108 个 arm64 feature 全都躺着，下次再引入同类偏差会�
 加一台机器：
 
 ```bash
+# 本机
 cargo run -p deviceinfo-cli -- capture --out fixtures/<名字>
+# 另一台机器**隔着 ssh** 采（推荐：目标机不需要任何工具链）
+cargo run -p deviceinfo-cli -- capture --ssh <主机名> --arch <架构> --out fixtures/<名字>
 git add fixtures/<名字>
 ```
+
+**为什么采集要能隔着 ssh 做**：夹具必须在目标机上采，而目标机往往装不了 Rust 工具链
+（路由器、嵌入式盒子），本机也未必能交叉编译到它的架构（本机 Rust 是 pacman 装的，
+只有 host target，没有 rustup）。远端采集的做法是先把清单里的东西镜像成本地临时树，
+之后**一切都按本地处理**——本地路径一字未改。
+
+采集期间踩过的两个坑，都是"不报错但结果全错"那类：
+
+- **每条远端命令必须先 `cd /`。** 远端 shell 的 cwd 是 HOME，而清单里的路径都是从根
+  起算的相对路径；少了这一步整份清单会全报"不存在"，采集"成功"但内容全是空的。
+- **库目录要只取非目录。** `LIBRARY_DIRS` 里既有 `usr/lib` 又有 `usr/lib/aarch64-linux-gnu`，
+  而 `usr/lib` 的列表里就含 `aarch64-linux-gnu` 这个**目录名**——当成库文件写成普通文件后，
+  下一步往它里面写就 `EEXIST`。
+
+另外**不存在的路径必须跳过**，不能写成空文件：那会让探测把缺的 `vendor`/`device`
+读成空字符串，报告里就冒出 `GPU (card0, id )` 和 `(:)` 这种垃圾。
+
+性能：单次 ssh 往返在同一局域网实测 **770ms**（握手 + 认证 + 远端起 shell），
+而一次采集有二十来次往返，所以默认开了连接复用（`ControlMaster`）。
+即使如此，`o6n` 那台仍要 4s——进一步的办法是把多次 `ls` 合并成一次往返。
 
 采集是幂等的（`/proc` 里的瞬时字段会被剔掉；只被状态采样读的瞬时值文件——
 `npu_busy_time_us`、`*_cur_freq`、`npu_memory_utilization`——读数归一化成 `0`，
@@ -165,11 +191,13 @@ git add fixtures/<名字>
 - **`freq/set_min_freq` / `set_max_freq` 是**可写**的**：驱动允许配置 NPU 频率上下限，
   本模块只读不写——写属于调度策略，不该由探测库做。
 - **其它厂商的运行时判据**：目前只有 Intel NPU 和 Intel GPU 两套。
-- **ARM64 真机夹具**：已采集（`fixtures/radxa-rock-5b-plus/`，Rockchip RK3588S，
-  big.LITTLE 4+4，RKNPU 走 DRM）。但采集是**手工跑脚本**做的——本机 Rust 是 pacman 装的
-  （只有 host target，无 rustup），**无法交叉编译 aarch64**，目标机上也没有工具链。
-  OpenWrt 上这个问题更严重。应考虑让 `capture` 直接读远端（一个 `--ssh <target>` 的
-  文件来源抽象），而不是要求目标机能跑二进制。
+- **显示控制器被归进了 `accelerators`**：`o6n` 上有 4 个 DRM card，其中 3 个是
+  `linlondp` 显示控制器（没有 render 节点）。它们现在被报成 GPU 并附一条提示，
+  但严格说它们**不是加速器**——`has_gpu()` 会因此返回 true。可选做法：加一个
+  `Display` 类别，或者把没有 render 节点的 card 从 `accelerators` 里挪出去
+  （那片信息就丢了）。
+- **`capture --ssh` 仍然慢**：即使开了连接复用，`o6n` 那台仍要 4s——每次调用都要在
+  远端起一个 shell（约 190ms）。把多次 `ls` 合并成一次往返还能再降一个数量级。
 - **`libc` 依赖**：只为了 `statvfs`（标准库至今没有 `std::fs::statfs`/`statvfs`）。
   全部 `unsafe` 只出现在 `state::filesystem_usage` 一处。
 

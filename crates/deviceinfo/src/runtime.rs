@@ -23,11 +23,14 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
-/// 库文件的候选目录（相对 root）。
+/// 库文件的候选目录（相对探测根）。
 ///
 /// 发行版把同一批库放在不同地方：`/usr/lib`、`/usr/lib64`、Debian 系的 multiarch 目录。
 /// 全部列出来比"猜一个再修"便宜。
-const LIB_DIRS: [&str; 7] = [
+///
+/// 公开是因为采集夹具的一方需要按同一份清单去目标机上取库名——两边的清单必须一致，
+/// 不能各写一份。
+pub const LIBRARY_DIRS: [&str; 7] = [
     "usr/lib",
     "usr/lib64",
     "usr/local/lib",
@@ -81,7 +84,7 @@ pub(crate) struct LibraryIndex {
 impl LibraryIndex {
     pub(crate) fn build(root: &Path) -> Self {
         let mut names = BTreeSet::new();
-        for dir in LIB_DIRS {
+        for dir in LIBRARY_DIRS {
             let Ok(entries) = fs::read_dir(root.join(dir)) else {
                 continue;
             };

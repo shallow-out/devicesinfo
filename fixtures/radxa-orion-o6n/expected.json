@@ -1,0 +1,174 @@
+{
+  "cpu": {
+    "arch": "aarch64",
+    "model": "CIX P1 CD8180",
+    "logical_cores": 12,
+    "physical_cores": 12,
+    "core_tiers": [
+      {
+        "cpus": [
+          0,
+          1
+        ],
+        "max_freq_mhz": 2600,
+        "capacity": 1024
+      },
+      {
+        "cpus": [
+          10,
+          11
+        ],
+        "max_freq_mhz": 2500,
+        "capacity": 984
+      },
+      {
+        "cpus": [
+          6,
+          7
+        ],
+        "max_freq_mhz": 2300,
+        "capacity": 905
+      },
+      {
+        "cpus": [
+          8,
+          9
+        ],
+        "max_freq_mhz": 2200,
+        "capacity": 866
+      },
+      {
+        "cpus": [
+          2,
+          3,
+          4,
+          5
+        ],
+        "max_freq_mhz": 1800,
+        "capacity": 279
+      }
+    ],
+    "features": [
+      "aes",
+      "afp",
+      "asimd",
+      "asimddp",
+      "asimdfhm",
+      "asimdhp",
+      "asimdrdm",
+      "atomics",
+      "bf16",
+      "bti",
+      "cpuid",
+      "crc32",
+      "dcpodp",
+      "dcpop",
+      "dgh",
+      "dit",
+      "ecv",
+      "evtstrm",
+      "fcma",
+      "flagm",
+      "flagm2",
+      "fp",
+      "fphp",
+      "frint",
+      "i8mm",
+      "ilrcpc",
+      "jscvt",
+      "lrcpc",
+      "mte",
+      "mte3",
+      "paca",
+      "pacg",
+      "pmull",
+      "sb",
+      "sha1",
+      "sha2",
+      "sha3",
+      "sha512",
+      "sm3",
+      "sm4",
+      "sve",
+      "sve2",
+      "sveaes",
+      "svebf16",
+      "svebitperm",
+      "svei8mm",
+      "svepmull",
+      "svesha3",
+      "svesm4",
+      "uscat",
+      "wfxt"
+    ]
+  },
+  "memory": {
+    "total_bytes": 33361620992
+  },
+  "accelerators": [
+    {
+      "kind": "gpu",
+      "name": "GPU (card0)",
+      "device_path": "/dev/dri/renderD128",
+      "driver": "panthor",
+      "memory": {
+        "kind": "unknown",
+        "reason": "厂商未识别，无法判断显存是独立还是共享"
+      },
+      "runtime": {
+        "state": "unknown",
+        "reason": "厂商未识别，不知道该找哪些组件"
+      },
+      "notes": []
+    },
+    {
+      "kind": "gpu",
+      "name": "GPU (card1)",
+      "driver": "linlondp",
+      "memory": {
+        "kind": "unknown",
+        "reason": "厂商未识别，无法判断显存是独立还是共享"
+      },
+      "runtime": {
+        "state": "unknown",
+        "reason": "厂商未识别，不知道该找哪些组件"
+      },
+      "notes": [
+        "没有 render 节点，可能只做显示输出，不能用于计算"
+      ]
+    },
+    {
+      "kind": "gpu",
+      "name": "GPU (card2)",
+      "driver": "linlondp",
+      "memory": {
+        "kind": "unknown",
+        "reason": "厂商未识别，无法判断显存是独立还是共享"
+      },
+      "runtime": {
+        "state": "unknown",
+        "reason": "厂商未识别，不知道该找哪些组件"
+      },
+      "notes": [
+        "没有 render 节点，可能只做显示输出，不能用于计算"
+      ]
+    },
+    {
+      "kind": "gpu",
+      "name": "GPU (card3)",
+      "driver": "linlondp",
+      "memory": {
+        "kind": "unknown",
+        "reason": "厂商未识别，无法判断显存是独立还是共享"
+      },
+      "runtime": {
+        "state": "unknown",
+        "reason": "厂商未识别，不知道该找哪些组件"
+      },
+      "notes": [
+        "没有 render 节点，可能只做显示输出，不能用于计算"
+      ]
+    }
+  ],
+  "warnings": []
+}
