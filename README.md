@@ -155,6 +155,8 @@ git add fixtures/<名字>
 - **`AcceleratorMemory` 是三态**，不是 `Option<u64>`：`Dedicated` 有确定容量，
   `SharedWithSystem` 是"和系统内存共享，没有独立上限"（集显、NPU），`Unknown` 是"读不到"
   并附原因。合成一个 `None` 会让上层只能猜，而两个方向猜错都是错的。
+  另外**推断会明说**：有的 `SharedWithSystem` 是证据（设备没有 PCI 标识），有的是按厂商
+  常见形态猜的，后者会附一条 `notes`。
 - **`RuntimeStatus::Unknown` 不是失败**，是"认不出这个厂商该找什么"。NVIDIA / AMD 目前
   都走这条路——编一个"就绪"会让用户装上一个跑不起来的模型。
 - **`warnings` 不含 `Incomplete`**：那是**确定的观测**（确定缺件），不是不确定。
@@ -195,44 +197,48 @@ git add fixtures/<名字>
 - **"没看到 render 节点"有两种原因，不能混。** `Some(0)` 是确实看到了那个目录、
   里面没有（→ 显示设备）；`None` 是我们**没能看到目录**（老内核？）——那就什么都不改，
   继续当 GPU 并注明。把后者也当显示设备，会在老内核上把真 GPU 静默降级。
-- **身份来源按****设备****选，不按架构选。** 有这个设备的 PCI 标识就用它（`pci.ids` 给人名、
+- **身份来源按「设备」选，不按架构选。** 有这个设备的 PCI 标识就用它（`pci.ids` 给人名、
   独立显存也看这个节点）；没有才退到设备树 `compatible`。判据是"**这个设备**有没有 PCI
   标识"，不是"这台机器是什么架构"——**ARM 服务器一样有 PCIe，一样能插独显/加速卡**
   （本机那颗 Intel NPU 就是 PCI 设备，class `0x120000`）。少了 `compatible`，
-  没有 PCI 标识的加速器就只能叫 `GPU (card0, id 未知)`，信息量为零。
-- **arm64 的机器型号只能从设备树读**（`/sys/firmware/devicetree/base/model`）：
-  `/proc/cpuinfo` 在 arm64 上**不报型号**，一行都没有。设备树属性是 NUL 结尾、
-  可能是 NUL 分隔的多个值，`trim()` 去不掉。
+  没有 PCI 标识的加速器就只能叫 `GPU (card0)`，信息量为零。
+- **处理器型号和整机型号是两个字段**（`cpu_model` / `machine_model`）：x86 上两者都有
+  （`Intel(R) Core(TM) Ultra 7 258V` / `83LC`），而以前挤在一个字段里、含义还随架构变。
+  整机型号按固件接口取：**设备树 `model` → DMI `product_name`**，实测两台 ARM 各走一条
+  （Rockchip 有设备树、CIX 是 ACPI 机器只有 DMI）。设备树属性是 NUL 结尾、可能是 NUL
+  分隔的多个值，`trim()` 去不掉。
 - **`npu_memory_utilization` 的单位是字节**（驱动文档原话：*report in bytes a current NPU
   memory utilization*），即当前常驻的 NPU 内存总量。之前因为单位不明而不敢收，现在确定。
 - **累积计数器默认不读**（`SampleOptions::counters`）。驱动文档：
   *"shouldn't be read too often as it may have an impact on job submission performance"*，
   推荐周期 1 秒。默认开启会让高频轮询的面板在无意中拖慢 NPU 作业提交，而这种损害
   在数据里看不出来。
-- **`AcceleratorState` 用 PCI 标识当连接键**（不是列表下标——顺序不是契约）。
-  没有 PCI 的加速器（ARM 上的 NPU 之类）只能靠 `kind` 对应。
+- **`AcceleratorState` 用 `node`（`accel0` / `card1`）+ PCI 标识标识自己**，不用列表位置
+  ——顺序不是契约。`node` 是必要的：平台设备没有 PCI 标识，否则三个显示控制器会给出
+  三条一模一样的记录。
 - **`npu_max_frequency_mhz` / `npu_current_frequency_mhz` 读的是新路径 `freq/*`**，
   驱动文档把前者标为 *Legacy attributes (backward compatibility)*，旧路径只当兜底。
 
 ## 已知未做
 
-- **Intel 独显的显存**：驱动没暴露 `mem_info_vram_total` 且厂商是 Intel/AMD 时判为
-  `SharedWithSystem`。Linux 上这绝大多数机器是对的（那两个厂商基本都是集显，而独显会
-  暴露该节点），但**没有 Intel 独显可以验证**。
+- **PCI 设备的"集显还是独显"从 sysfs 判不出来**：驱动没暴露 `mem_info_vram_total` 时，
+  Intel/AMD 会被**推断**为共享系统内存并附 `notes`（那是概率，不是证据），其余厂商给
+  `Unknown`。想找更硬的判据但没找到：BAR 大小不行（非 ReBAR 独显也是 256 MB），
+  PCI class `0x030000`/`0x030200` 也不行。**没有独显可以验证**。
 - **`sched_mode` 未收**：驱动文档已经说明它是 `HW` / `OS` 调度模式（属于**硬件事实**，
   不是瞬时值），但当前判断它对"能不能跑 / 跑多快"没有直接影响，所以没进报告。
-- **DRM 上的 NPU 靠名字识别**：`classify_drm_device` 用驱动名 / `compatible` 里是否含
-  `npu`，再加一张极短的表（目前只有 `rknpu`）。DRM 层面 NPU 和 GPU 长得一样，
-  没有结构性判据；认不出来就保守地当 GPU 并在 `notes` 里说明。
-- **ARM 上加速器的运行时判据仍然缺失**：`runtime::spec_for` 只有 Intel 的两套，
-  所以那台 Rockchip 机器上 NPU 报"运行时 未知"。这是诚实的——没有验证过的栈就不编判据。
+- **DRM 上的 NPU 只能靠名字认**：`classify_drm_device` 先看驱动名/`compatible` 里有没有
+  `npu`（再加一张只含 `rknpu` 的表），**再看有没有 render 节点**——有就是 GPU，
+  有 `drm/` 目录却没有 render 节点就是显示设备。第一步没有结构性判据（DRM 层面 NPU 和
+  GPU 长得一样），认不出来会当 GPU。
 - **NPU 的其它频率档位未收**：`freq/hw_min_freq`（650）、`freq/hw_efficient_freq`（950）
   是驱动暴露的硬件事实，对能效调度有用，暂未收。
-- **`freq/set_min_freq` / `set_max_freq` 是**可写**的**：驱动允许配置 NPU 频率上下限，
+- **`freq/set_min_freq` / `set_max_freq` 是可写的**：驱动允许配置 NPU 频率上下限，
   本模块只读不写——写属于调度策略，不该由探测库做。
-- **其它厂商的运行时判据**：目前只有 Intel NPU 和 Intel GPU 两套。
+- **运行时判据只有 Intel 两套**（Intel NPU / Intel GPU）。所以 Rockchip 那台的 NPU 报
+  "运行时 未知"、`o6n` 的 panthor 也报未知。这是诚实的——没有验证过的栈就不编判据。
 - **加速器的身份来源有三种，按设备挑**：PCI 标识、设备树 `compatible`、以及什么都没有。
-  `o6n` 那台**整个 `/sys/firmware/devicetree` 都不存在**，它的 DRM 设备又是平台设备
+  `o6n` 那台**没有 `/sys/firmware/devicetree/base`**，它的 DRM 设备又是平台设备
   （没有 PCI 标识），所以名字只能退回 `GPU (card0)`。（整机型号走了 DMI 兜底，
   但**单个设备**的 DMI 信息拿不到。）
 - **`warnings`** 会点名"本模块不认识的加速器"：内核给出的通用加速器入口只有
@@ -247,9 +253,10 @@ git add fixtures/<名字>
   accelerators [1200]" 分开标。
   **这套逻辑没有真机验证过**：手上没有任何一块这类卡，只有单元测试 + 本机那颗
   已被 `/dev/accel` 覆盖的 Intel NPU（用它验证去重是对的）。
-- **处理器型号在 arm64 上往往拿不到**：`cpu_model` 只有内核报 `model name` 时才有值
-  （Rockchip 那台就没有）。设备树里其实有 `cpus/cpu@0/compatible`（形如
-  `arm,cortex-a76`）可以补，但那是另一条路径，暂未收。
+- **arm64 的处理器型号常常拿不到**：`cpu_model` 只有内核报 `model name` 时才有值
+  （Rockchip 那台就没有）。设备树里的 `cpus/cpu@N/compatible`（形如 `arm,cortex-a76`）
+  是**每个簇的核类型**，不是整颗 CPU 的型号——一台 A76+A55 的机器填哪个都是误导，
+  所以刻意没收。
 
 - **`libc` 依赖**：只为了 `statvfs`（标准库至今没有 `std::fs::statfs`/`statvfs`）。
   全部 `unsafe` 只出现在 `state::filesystem_usage` 一处。
