@@ -16,6 +16,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::{Command as ProcessCommand, Stdio};
+use std::time::Duration;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -63,6 +65,24 @@ enum Command {
         /// 隔着 ssh 探测另一台机器
         #[arg(long, value_name = "HOST")]
         ssh: Option<String>,
+        /// 有 warning 就以退出码 1 结束
+        #[arg(long)]
+        strict: bool,
+    },
+    /// 实时探测：会**执行命令**、会**连网络**的那些问题（opt-in）
+    Live {
+        /// 探测的根目录
+        #[arg(long, value_name = "PATH", default_value = "/", conflicts_with = "ssh")]
+        root: PathBuf,
+        /// 隔着 ssh 探测另一台机器（命令也在那台上跑）
+        #[arg(long, value_name = "HOST")]
+        ssh: Option<String>,
+        /// 只查版本号，不查连通性
+        #[arg(long)]
+        no_network: bool,
+        /// 每次检查的超时（秒）
+        #[arg(long, value_name = "SECS", default_value_t = 6)]
+        timeout: u64,
         /// 有 warning 就以退出码 1 结束
         #[arg(long)]
         strict: bool,
@@ -157,6 +177,47 @@ fn main() {
                 print_json(&report);
             } else {
                 print!("{}", render::human_environment(&report));
+            }
+            if strict && !report.warnings.is_empty() {
+                std::process::exit(1);
+            }
+        }
+        Command::Live {
+            root,
+            ssh,
+            no_network,
+            timeout,
+            strict,
+        } => {
+            let source = match &ssh {
+                Some(host) => Source::remote(host),
+                None => Source::local(&root),
+            };
+            let (local_root, _staging) = match resolve_local_root(&source) {
+                Ok(pair) => pair,
+                Err(error) => {
+                    eprintln!("探测失败: {error}");
+                    std::process::exit(2);
+                }
+            };
+            let environment = deviceinfo::probe_environment(&local_root);
+            let options = deviceinfo::LiveOptions {
+                timeout: Duration::from_secs(timeout.max(1)),
+                skip_network: no_network,
+                ..Default::default()
+            };
+            let runner = Runner {
+                root: local_root,
+                host: ssh.clone(),
+                timeout: options.timeout,
+            };
+            let report = deviceinfo::live::probe(&environment, &options, &|program, args| {
+                runner.run(program, args)
+            });
+            if cli.json {
+                print_json(&report);
+            } else {
+                print!("{}", render::human_live(&report));
             }
             if strict && !report.warnings.is_empty() {
                 std::process::exit(1);
@@ -888,6 +949,102 @@ fn filter_volatile(rel: &str, text: &str) -> String {
     let mut text = out.join("\n");
     text.push('\n');
     text
+}
+
+/// 在目标机器上跑命令：本地就直接起进程，远端就 ssh 过去起。
+///
+/// 两条路都**主动兜一层超时**（真杀进程）。库那边只能靠 `curl --max-time` 之类的
+/// 自保参数，那是被动的；这里主动兜底，免得一个卡住的检查拖死整轮探测。
+/// **不持有 `&Source`**：那个类型里有 `RefCell`（采集时的缓存），于是不是 `Sync`，
+/// 而连通性检查要并发跑。这里只拿解析好的两样东西——根目录和主机名。
+struct Runner {
+    root: PathBuf,
+    /// `Some(host)` 表示命令要在那台上跑，`None` 表示本机。
+    host: Option<String>,
+    timeout: Duration,
+}
+
+impl Runner {
+    fn run(&self, program: &str, args: &[&str]) -> io::Result<String> {
+        match &self.host {
+            // 本地：直接执行**机器上的路径**（`/usr/bin/podman`）。拿夹具当 root 时
+            // 那里是空的占位文件，会干净地失败——这是对的，实时探测本来就只对本机有意义。
+            None => {
+                // **绝对路径**（`/usr/bin/podman`，环境报告给的是机器上的路径）要拼探测根；
+                // **裸名字**（`curl`/`wget`，检查工具）走 PATH。
+                // 一律拼根会把 curl 变成 `/curl`，然后报出一个完全误导的"没法查"。
+                let executable = match program.strip_prefix('/') {
+                    Some(relative) => self.root.join(relative),
+                    None => PathBuf::from(program),
+                };
+                let mut command = ProcessCommand::new(executable);
+                command.args(args);
+                run_with_timeout(command, self.timeout)
+            }
+            // 远端：整条命令交给 ssh，在那台上执行
+            Some(host) => {
+                let mut words: Vec<String> = vec![source::quoted(program)];
+                words.extend(args.iter().map(|arg| source::quoted(arg)));
+                let mut command = ProcessCommand::new("ssh");
+                command
+                    .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--"])
+                    .arg(host)
+                    .arg(words.join(" "));
+                run_with_timeout(command, self.timeout + Duration::from_secs(5))
+            }
+        }
+    }
+}
+
+/// 跑子进程，**超时就真杀**。
+///
+/// 前提：输出要小（`--version`、`curl -w` 都是几十字节）。这里不读管道，所以在子进程
+/// 退出前写满管道缓冲会让它卡住——实时探测的命令都满足这个前提，但换命令时要留意。
+fn run_with_timeout(mut command: ProcessCommand, timeout: Duration) -> io::Result<String> {
+    use std::time::Instant;
+
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait()?.is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("超时（{} 秒）", timeout.as_secs()),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        // 取**最后一行**非空 stderr——报错通常在那儿，而前面可能是几十行无关输出
+        // （实测 `llama-bench --version` 先打印了一屏 Vulkan 设备信息）。
+        // 再限长：这些字要进人看的报告，不是日志。
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let last = stderr
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .next_back()
+            .unwrap_or("")
+            .chars()
+            .take(160)
+            .collect::<String>();
+        return Err(io::Error::other(format!(
+            "退出码 {:?}{}",
+            output.status.code(),
+            if last.is_empty() { String::new() } else { format!(": {last}") }
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 fn write_file(path: &Path, contents: &[u8]) -> io::Result<()> {

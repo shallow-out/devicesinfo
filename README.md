@@ -22,20 +22,48 @@
    （"有没有 AMX"、"有没有 SVE2"、"有没有 FP8"），生产者一旦筛掉，信息就永久丢失，
    而且丢失是无声的。好看不好看交给显示层（`render`）。
 
-## 三个入口，别混
+## 四个入口，别混
 
-| | `probe()` → `HardwareReport` | `probe_environment()` → `EnvironmentReport` | `sample_state()` → `RuntimeState` |
-|---|---|---|---|
-| 描述 | 这台机器**是什么** | **装了什么、配了什么** | **此刻**怎样 |
-| 内容 | 架构、处理器/整机型号、核数与性能分层、指令集、加速器与运行时就绪度、内存总量 | 包管理器、init、cgroup、容器运行时与其 socket、已装推理框架、容器镜像源 | 可用内存、swap、磁盘余量、加速器的频率/常驻内存/累积忙碌时间 |
-| 变化频率 | 装上就不变 | **装了/配了才变** | 每一秒都在变 |
-| 能否缓存 | 能 | 能 | 不能 |
-| 能否跨机器比较 | 能 | **不能**（它是可改的） | 不能 |
+| | `probe()` → `HardwareReport` | `probe_environment()` → `EnvironmentReport` | `sample_state()` → `RuntimeState` | `live::probe()` → `LiveReport` |
+|---|---|---|---|---|
+| 描述 | 这台机器**是什么** | **装了什么、配了什么** | **此刻**怎样 | **跑一次才知道**的 |
+| 内容 | 架构、型号、核数与性能分层、指令集、加速器、内存总量 | 包管理器、init、cgroup、容器运行时与 socket、已装推理框架、镜像源、**人为声明的标签** | 可用内存、swap、磁盘余量、加速器的瞬时指标 | 工具版本、**逐个目标的连通性** |
+| 怎么拿到的 | 读文件 | 读文件 | 读文件 | **执行命令 / 连网络** |
+| 变化频率 | 装上就不变 | 装了/配了才变 | 每一秒都在变 | 随时在变 |
+| 能否缓存 / 进夹具 | 能 | 能 | 不能 | **不能，也不进夹具** |
+| 能否跨机器比较 | 能 | 不能（可改） | 不能 | 分目标比（"那台能不能拉镜像"） |
 
 混在一起会让硬件报告失去它最大的用处：拿两台机器的报告直接 `diff`。
 
 **报告里的路径都是"被探测机器上的路径"**（`/usr/bin/podman`），不带探测根。
 这样本机、`--ssh`、夹具三种来源给出同一串，既可比，也不会把临时目录泄漏到输出里。
+
+## 实时探测（`live`）：唯一**会执行命令、会连网络**的入口
+
+```bash
+deviceinfo live                       # 版本号 + 连通性
+deviceinfo live --no-network          # 只查版本号
+deviceinfo live --ssh r1 --timeout 4
+```
+
+三个刻意的限制：
+
+1. **opt-in，不进 `EnvironmentReport`。** 那些数一秒后就可能变，混进可缓存的报告里会把它污染掉。
+2. **不进夹具。** 夹具冻结的是"这台机器是什么"；把网络状态冻进去，重采必然 diff，快照信号就废了。
+3. **每个检查有超时，而且并发跑。** 串行的话 N 个目标 × 超时就是几十秒。超时是**真杀进程**，不只是给 `curl` 加 `--max-time`。
+
+**连通性必须逐个目标看**，而且机器自己配的镜像源会自动进列表——它才是那台机器实际拉镜像的通道。实测那台 NAS：
+
+```
+连通性   通      https://docker.fnnas.com          HTTP 403  （来自 /etc/docker/daemon.json）
+         不通     https://huggingface.co            curl: (28) Connection timed out after 6001 ms
+         不通     https://registry-1.docker.io/v2/  curl: (28) Connection timed out after 6001 ms
+         通      https://www.modelscope.cn          HTTP 302
+```
+
+只测 `docker.io` 会得出"这台不能部署"的错误结论；真相是**它只能走自己的镜像源**。
+
+> **401 算通**：Docker Hub 的 v2 API 未鉴权就回 401，把它当失败会误判能拉镜像的机器。
 
 ## 标签：唯一**人为声明**的东西
 
@@ -87,6 +115,7 @@ Always_On  powersave
 ```bash
 cargo run -p deviceinfo-cli                       # 硬件与能力（默认子命令）
 cargo run -p deviceinfo-cli -- environment --ssh r1   # 软件环境（含 --ssh）
+cargo run -p deviceinfo-cli -- live --ssh r1          # 实时：版本号 + 连通性
 cargo run -p deviceinfo-cli -- state --watch /var/cache
 cargo run -p deviceinfo-cli -- state --counters    # 额外读累积计数器（见下）
 cargo run -p deviceinfo-cli -- --json hardware     # 跨机器 diff 用
@@ -334,12 +363,12 @@ diff <(deviceinfo --json hardware) \
   是**每个簇的核类型**，不是整颗 CPU 的型号——一台 A76+A55 的机器填哪个都是误导，
   所以刻意没收。
 
-- **环境探测不执行任何命令**，所以拿不到版本号。`docker --version` 要跑一遍；包数据库
-  虽然能读，但在 Debian 上是一个 1 MB、装一次包就变一次的大文件（`/var/lib/dpkg/status`），
-  读完还会污染夹具。这类属于**实时探测**，还没有做——它是"跑了一次"而不是"读了一个事实"。
-- **出网能力（能不能拉镜像）也没做**，理由同上：那是连接测试，一秒后就可能变。
-  注意它**必须按目标分别测**：实测那台 NAS 出得去 baidu 但到不了 Docker Hub
-  （DNS 被污染），靠 `daemon.json` 里的镜像源拉——只测 `docker.io` 会得出错误结论。
+- **版本号靠 `--version`，而它不被所有工具支持。** 实测 `llama-cli` 会成功但什么都不输出，
+  `llama-bench` 直接报参数错误。报告里会把这类如实写成"查不到（命令成功但没有输出）"，
+  而不是假装没有版本——但**要拿到 llama.cpp 的真实版本得换别的问法**（比如解析 `--help`），
+  那属于按工具定制，暂不做。
+- **连通性只回答"这个 URL 此刻有没有响应"**：不验证证书链之外的东西，也不代表能完成一次
+  真实的镜像拉取（鉴权、manifest、平台匹配都还没发生）。
 - **容器镜像源只解析到"配置文件里写了什么"**：`podman` 的 `registries.conf` 解析
   **没有真机验证过**（三台 Arch 上那份是上游模板、整份都被注释掉），只有合成样本的单元测试。
   Docker 那条有真样本（那台 NAS）。

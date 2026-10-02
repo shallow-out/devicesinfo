@@ -51,6 +51,7 @@ mod accelerator;
 mod cpu;
 pub mod environment;
 mod features;
+pub mod live;
 mod memory;
 mod report;
 mod runtime;
@@ -66,6 +67,7 @@ pub use report::{
 };
 pub use cpu::{PER_CORE_INPUTS as CPU_PER_CORE_INPUTS, SHARED_INPUTS as CPU_SHARED_INPUTS};
 pub use environment::EnvironmentReport;
+pub use live::{LiveOptions, LiveReport};
 pub use runtime::LIBRARY_DIRS;
 pub use state::{AcceleratorState, DiskUsage, MemoryState, RuntimeState, SampleOptions};
 

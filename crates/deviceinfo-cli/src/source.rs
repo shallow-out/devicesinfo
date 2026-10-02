@@ -354,7 +354,7 @@ fn stdin_lines(items: &[String]) -> Vec<u8> {
 ///
 /// 路径里出现单引号就直接拒绝：采集路径只会有 `/`、字母、数字、`_`、`.`、`-`，
 /// 真出现了说明来源不对，宁可失败也不要拼出一条能被解释成别的东西的命令。
-fn quoted(path: &str) -> String {
+pub(crate) fn quoted(path: &str) -> String {
     if path.contains('\'') {
         // 用一个必然失败的表达式，让这一步读不到东西而不是执行别的
         return "''".to_string();

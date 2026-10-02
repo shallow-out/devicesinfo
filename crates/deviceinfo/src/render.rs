@@ -7,6 +7,7 @@
 //! "可用内存"和"CPU 型号"是同一类东西。
 
 use crate::environment::EnvironmentReport;
+use crate::live::{LiveReport, ReachabilityOutcome};
 use crate::report::{AcceleratorKind, AcceleratorMemory, HardwareReport, RuntimeStatus};
 use crate::state::RuntimeState;
 use std::fmt::Write;
@@ -139,6 +140,70 @@ pub fn human(report: &HardwareReport) -> String {
             if !accel.notes.is_empty() {
                 let _ = writeln!(out, "             ! {}", accel.notes.join("; "));
             }
+        }
+    }
+
+    for warning in &report.warnings {
+        let _ = writeln!(out, "警告     {warning}");
+    }
+
+    out
+}
+
+/// 把实时探测渲染成多行文本（带末尾换行）。
+///
+/// 单独渲染：这些数**一秒后就可能变**，和硬件/环境放在一起会让人以为它们是同一类事实。
+pub fn human_live(report: &LiveReport) -> String {
+    let mut out = String::new();
+
+    if report.versions.is_empty() {
+        let _ = writeln!(out, "版本     没有可查的工具（环境报告里没有容器运行时/推理框架）");
+    } else {
+        for (index, tool) in report.versions.iter().enumerate() {
+            let label = if index == 0 { "版本     " } else { "         " };
+            match (&tool.output, &tool.error) {
+                (Some(output), _) => {
+                    let _ = writeln!(out, "{label}{:<28} {output}", tool.tool);
+                }
+                // 查不到要说清跑的是什么、为什么——"查不到"和"没有版本"不是一回事
+                (None, error) => {
+                    let _ = writeln!(
+                        out,
+                        "{label}{:<28} 查不到（{}: {}）",
+                        tool.tool,
+                        tool.command,
+                        error.clone().unwrap_or_else(|| "未知原因".into())
+                    );
+                }
+            }
+        }
+    }
+
+    if report.reachability.is_empty() {
+        let _ = writeln!(out, "连通性   未检查");
+    } else {
+        for (index, entry) in report.reachability.iter().enumerate() {
+            let label = if index == 0 { "连通性   " } else { "         " };
+            let (mark, detail) = match &entry.outcome {
+                ReachabilityOutcome::Reachable { http_status } => (
+                    "通",
+                    match http_status {
+                        // 401/403 是通的：Docker Hub 的 v2 API 未鉴权就回 401
+                        Some(status) => format!("HTTP {status}"),
+                        None => String::new(),
+                    },
+                ),
+                ReachabilityOutcome::Unreachable { reason } => ("不通", reason.clone()),
+                ReachabilityOutcome::Unknown { reason } => ("没法查", reason.clone()),
+            };
+            let mut line = format!("{label}{mark:<6} {:<40}", entry.target);
+            if !detail.is_empty() {
+                let _ = write!(line, " {detail}");
+            }
+            if let Some(from) = &entry.from {
+                let _ = write!(line, "  （来自 {from}）");
+            }
+            let _ = writeln!(out, "{line}");
         }
     }
 
