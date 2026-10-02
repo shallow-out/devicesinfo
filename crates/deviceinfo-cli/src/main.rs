@@ -926,6 +926,41 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// 标签是**唯一人为声明的输入**，也是最容易在采集清单里被漏掉的东西——
+    /// 漏了的话远端夹具会报"没有标签"，而任务路由会因此永远绕过这台机器，
+    /// 且没有任何测试会红。这条端到端钉住它。
+    #[test]
+    fn capture_preserves_declared_tags() {
+        let root = std::env::temp_dir().join(format!("deviceinfo-tagcapture-{}", std::process::id()));
+        let out = std::env::temp_dir().join(format!("deviceinfo-tagout-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&out);
+
+        // 一棵最小的"机器"：采集守卫要求 proc/cpuinfo 与 proc/meminfo 在
+        fs::create_dir_all(root.join("proc")).unwrap();
+        fs::write(root.join("proc/cpuinfo"), "processor\t: 0\nmodel name\t: x\n").unwrap();
+        fs::write(root.join("proc/meminfo"), "MemTotal: 1000 kB\n").unwrap();
+        fs::create_dir_all(root.join("etc/deviceinfo")).unwrap();
+        fs::write(
+            root.join("etc/deviceinfo/tags.conf"),
+            "# 角色\nAlways_On   powersave\n",
+        )
+        .unwrap();
+
+        capture(&Source::local(&root), "x86_64", &out).expect("采集应当成功");
+
+        // 夹具本身要能探测出来
+        let report = deviceinfo::probe_environment(&out);
+        assert!(report.always_on(), "{:#?}", report.declared_tags);
+        assert!(report.powersave());
+        // 期望值里也要有（否则夹具测试不会因为标签丢失而失败）
+        let expected = fs::read_to_string(out.join("expected-environment.json")).unwrap();
+        assert!(expected.contains("always-on"), "{expected}");
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&out);
+    }
+
     /// 采集源不对时**必须报错**。以前它会"成功"写出一份空壳夹具——而空壳夹具比没有
     /// 夹具更坏：它会让后来的所有探测变更都"通过"。
     #[test]

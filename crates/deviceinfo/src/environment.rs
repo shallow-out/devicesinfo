@@ -107,6 +107,38 @@ pub struct InstalledTool {
     pub path: PathBuf,
 }
 
+/// 一条**人为声明**的角色标签。
+///
+/// 这是整个 crate 里唯一不是探测出来的东西——`always-on` 说的是"这台机器会被一直开着"，
+/// 而 sysfs 不知道用户会不会合盖、会不会拔电。所以它必须由人声明，也必须标明来源：
+/// 标签写错会让任务**静默**地找不到这台机器，那时候要知道去哪儿改。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeclaredTag {
+    pub tag: String,
+    pub source: PathBuf,
+}
+
+/// 标签文件的候选路径。**管理员写的优先**，出厂/发行版那份当默认。
+///
+/// 分层是有理由的：硬件产品随附的声明（"这台是随身超算"）装在 `usr/share`，
+/// 用户改自己的角色时不至于去动厂商的文件。
+const TAG_CONFIGS: [&str; 2] = [
+    "etc/deviceinfo/tags.conf",
+    "usr/share/deviceinfo/tags.conf",
+];
+
+/// 分片标签目录，方便按用途拆开写。
+const TAG_CONFIG_DIR: &str = "etc/deviceinfo/tags.d";
+
+/// 这台机器被安排成**一直开着**。
+///
+/// 探测不出来，只能人为声明。它是任务路由里最常用的一个：
+/// 「内核编译」需要一直开机且性能不差，「定时提醒」需要一直开机且省电。
+pub const TAG_ALWAYS_ON: &str = "always-on";
+
+/// 这台机器被安排成**省电优先**，适合轻任务（定时提醒、心跳、小模型）。
+pub const TAG_POWERSAVE: &str = "powersave";
+
 /// 一条容器镜像源。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegistryMirror {
@@ -137,12 +169,33 @@ pub struct EnvironmentReport {
     /// （这时拉镜像走默认 registry，能不能通是另一回事——那属于实时探测）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub registry_mirrors: Vec<RegistryMirror>,
+    /// **人为声明**的角色标签（见 [`DeclaredTag`]）。
+    ///
+    /// 名字里带 `declared` 是刻意的：它是这份报告里唯一不是探测出来的东西，
+    /// 混在观测事实里不标出来，读的人会以为"机器自己知道它一直开着"。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub declared_tags: Vec<DeclaredTag>,
     /// 探测过程中的不确定之处。
     #[serde(default)]
     pub warnings: Vec<String>,
 }
 
 impl EnvironmentReport {
+    /// 有没有某个声明标签。标签名不区分大小写（解析时已规范化）。
+    pub fn has_tag(&self, tag: &str) -> bool {
+        self.declared_tags.iter().any(|declared| declared.tag == tag)
+    }
+
+    /// 这台机器被声明成一直开着——任务路由的第一步筛的就是它。
+    pub fn always_on(&self) -> bool {
+        self.has_tag(TAG_ALWAYS_ON)
+    }
+
+    /// 这台机器被声明成省电优先。
+    pub fn powersave(&self) -> bool {
+        self.has_tag(TAG_POWERSAVE)
+    }
+
     /// 有没有可用的容器运行时（装了就算，不要求在跑）。
     pub fn has_container_runtime(&self) -> bool {
         !self.containers.is_empty()
@@ -171,6 +224,7 @@ pub(crate) fn probe(root: &Path, warnings: &mut Vec<String>) -> EnvironmentRepor
         cgroup: probe_cgroup(root),
         containers: probe_containers(root),
         inference_tools: probe_inference_tools(root),
+        declared_tags: probe_declared_tags(root, warnings),
         registry_mirrors: probe_registry_mirrors(root, warnings),
         // 子探测往**调用方**的 `warnings` 里写（和硬件那边同一个约定），
         // 由 `probe_environment` 把它装进报告——这里留空壳，不要 take，
@@ -187,6 +241,7 @@ pub(crate) fn probe(root: &Path, warnings: &mut Vec<String>) -> EnvironmentRepor
 pub fn input_dirs() -> Vec<String> {
     vec![
         REGISTRY_CONFIG_DIR.to_string(),
+        TAG_CONFIG_DIR.to_string(),
         "run/user".to_string(),
     ]
 }
@@ -221,6 +276,9 @@ pub fn inputs(list_dir: &dyn Fn(&str) -> Vec<String>) -> Vec<Input> {
         Input::Content("etc/docker/daemon.json".into()),
         Input::Content(REGISTRY_CONFIGS[0].into()),
         Input::Content(REGISTRY_CONFIGS[1].into()),
+        // 人为声明的标签：内容要读（它是唯一非观测的输入，更不能漏）
+        Input::Content(TAG_CONFIGS[0].into()),
+        Input::Content(TAG_CONFIGS[1].into()),
         // init / cgroup 的判据：只要"存在"
         Input::Existence("run/systemd/system".into()),
         Input::Existence("run/openrc".into()),
@@ -248,10 +306,12 @@ pub fn inputs(list_dir: &dyn Fn(&str) -> Vec<String>) -> Vec<Input> {
         }
     }
 
-    // 分片配置目录里的文件：内容要读
-    for entry in list_dir(REGISTRY_CONFIG_DIR) {
-        if entry.ends_with(".conf") {
-            inputs.push(Input::Content(format!("{REGISTRY_CONFIG_DIR}/{entry}")));
+    // 分片目录里的文件：内容都要读
+    for dir in [REGISTRY_CONFIG_DIR, TAG_CONFIG_DIR] {
+        for entry in list_dir(dir) {
+            if entry.ends_with(".conf") {
+                inputs.push(Input::Content(format!("{dir}/{entry}")));
+            }
         }
     }
     // rootless socket：占位
@@ -379,6 +439,77 @@ fn probe_inference_tools(root: &Path) -> Vec<InstalledTool> {
             })
         })
         .collect()
+}
+
+/// 读人为声明的标签。
+///
+/// 格式是一个极简的行格式：每行若干标签，`#` 开头是注释。
+///
+/// **规范化是刻意的**（转小写、`_` 换成 `-`）：标签的用途是**匹配**，大小写或下划线
+/// 不一致会让路由静默失配——而"任务永远找不到这台机器"这种故障极难查。
+/// 其他字符一律拒绝并出声，理由同上：静默忽略一个拼错的标签，比报错难查得多。
+fn probe_declared_tags(root: &Path, warnings: &mut Vec<String>) -> Vec<DeclaredTag> {
+    let mut configs: Vec<String> = TAG_CONFIGS.iter().map(|path| path.to_string()).collect();
+    if let Ok(entries) = fs::read_dir(root.join(TAG_CONFIG_DIR)) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".conf") {
+                configs.push(format!("{TAG_CONFIG_DIR}/{name}"));
+            }
+        }
+    }
+
+    let mut tags = Vec::new();
+    for config in configs {
+        let Some(text) = fs::read_to_string(root.join(&config)).ok() else {
+            continue;
+        };
+        // 报告里记机器上的路径（`/etc/...`），读的时候才拼探测根
+        parse_tags(&text, &PathBuf::from("/").join(&config), &mut tags, warnings);
+    }
+
+    tags.sort_by(|a, b| (&a.tag, &a.source).cmp(&(&b.tag, &b.source)));
+    tags.dedup();
+    tags
+}
+
+/// 解析标签文件。`source` 会记进每条标签里，方便回头找到那一行。
+fn parse_tags(
+    text: &str,
+    source: &Path,
+    tags: &mut Vec<DeclaredTag>,
+    warnings: &mut Vec<String>,
+) {
+    for (number, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        for token in line.split_whitespace() {
+            match normalize_tag(token) {
+                Some(tag) => tags.push(DeclaredTag {
+                    tag,
+                    source: source.to_path_buf(),
+                }),
+                None => warnings.push(format!(
+                    "{} 第 {} 行的 {:?} 不是合法标签（只接受字母、数字、`.`、`_`、`-`），已跳过",
+                    source.display(),
+                    number + 1,
+                    token
+                )),
+            }
+        }
+    }
+}
+
+/// 标签规范化：转小写、`_` 换成 `-`。非法字符返回 `None`（由调用方出声）。
+fn normalize_tag(token: &str) -> Option<String> {
+    if token.is_empty()
+        || !token.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return None;
+    }
+    Some(token.to_ascii_lowercase().replace('_', "-"))
 }
 
 /// 收集配置好的容器镜像源。
@@ -535,6 +666,96 @@ mod tests {
         );
         // 真的 podman 不该被标成壳
         assert!(report.container("podman").unwrap().notes.is_empty());
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// 标签是**人为声明**的：从 `/etc/deviceinfo/tags.conf` 读，规范化后能用
+    /// 大小写不敏感的方式匹配。
+    #[test]
+    fn declared_tags_are_read_and_normalized() {
+        let root = fake_root("tags");
+        write(
+            &root,
+            "etc/deviceinfo/tags.conf",
+            "# 这台机器的角色\nAlways_On   powersave\n\n",
+        );
+        // 出厂那份当默认，管理员那份优先（这里两者都有，取并集）
+        write(&root, "usr/share/deviceinfo/tags.conf", "vendor-preinstalled\n");
+
+        let mut warnings = Vec::new();
+        let report = probe(&root, &mut warnings);
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        // `Always_On` → `always-on`（匹配要可预测）
+        assert!(report.always_on(), "{:#?}", report.declared_tags);
+        assert!(report.powersave());
+        assert!(report.has_tag("always-on"));
+        assert!(!report.has_tag("ALWAYS-ON"), "存的是规范化后的形式");
+        assert_eq!(
+            report
+                .declared_tags
+                .iter()
+                .map(|declared| declared.tag.as_str())
+                .collect::<Vec<_>>(),
+            vec!["always-on", "powersave", "vendor-preinstalled"]
+        );
+        // 来源要记下来：标签写错时得能直接找到那一行
+        let always_on = report
+            .declared_tags
+            .iter()
+            .find(|declared| declared.tag == "always-on")
+            .unwrap();
+        assert_eq!(always_on.source, Path::new("/etc/deviceinfo/tags.conf"));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// 拼错的标签必须**出声**：静默忽略一张拼错的标签，等于让任务永远找不到这台机器，
+    /// 而这种故障极难查。
+    #[test]
+    fn an_invalid_tag_is_a_warning_not_a_silent_skip() {
+        let root = fake_root("bad-tags");
+        write(
+            &root,
+            "etc/deviceinfo/tags.conf",
+            "always-on\n不只是拼错\nalways on\n",
+        );
+
+        let mut warnings = Vec::new();
+        let report = probe(&root, &mut warnings);
+        // 合法的留下；不合法的两个都出声（`always on` 会被拆成两个合法标签，
+        // 所以这里只断言"有出声"这件事）
+        assert!(report.always_on());
+        assert!(!warnings.is_empty(), "{:#?}", report.declared_tags);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// 没有标签文件就是没有标签——不是错误，也不该出声。
+    #[test]
+    fn no_tag_file_means_no_tags() {
+        let root = fake_root("no-tags");
+        let mut warnings = Vec::new();
+        let report = probe(&root, &mut warnings);
+        assert!(report.declared_tags.is_empty());
+        assert!(!report.always_on());
+        assert!(!report.powersave());
+        assert!(warnings.is_empty(), "{warnings:?}");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// 标签分片目录也要读。
+    #[test]
+    fn tag_drop_ins_are_merged() {
+        let root = fake_root("tag-dropins");
+        write(&root, "etc/deviceinfo/tags.d/10-role.conf", "always-on\n");
+        write(&root, "etc/deviceinfo/tags.d/20-power.conf", "powersave\n");
+
+        let mut warnings = Vec::new();
+        let report = probe(&root, &mut warnings);
+        assert!(report.always_on() && report.powersave(), "{:#?}", report.declared_tags);
+        assert!(warnings.is_empty(), "{warnings:?}");
 
         fs::remove_dir_all(&root).ok();
     }

@@ -10,6 +10,7 @@ use crate::environment::EnvironmentReport;
 use crate::report::{AcceleratorKind, AcceleratorMemory, HardwareReport, RuntimeStatus};
 use crate::state::RuntimeState;
 use std::fmt::Write;
+use std::path::Path;
 
 /// 把硬件报告渲染成多行文本（带末尾换行）。
 pub fn human(report: &HardwareReport) -> String {
@@ -207,6 +208,24 @@ pub fn human_environment(report: &EnvironmentReport) -> String {
             .map(|tool| format!("{} ({})", tool.name, tool.path.display()))
             .collect();
         let _ = writeln!(out, "推理     已装 {} —— 别重复部署", tools.join("、"));
+    }
+
+    if report.declared_tags.is_empty() {
+        // 标签是唯一非观测的东西，所以无值时要指出该去哪儿写
+        let _ = writeln!(out, "标签     无（人为声明写在 /etc/deviceinfo/tags.conf）");
+    } else {
+        let tags: Vec<String> = report
+            .declared_tags
+            .iter()
+            .map(|declared| {
+                if declared.source == Path::new("/etc/deviceinfo/tags.conf") {
+                    declared.tag.clone()
+                } else {
+                    format!("{}（{}）", declared.tag, declared.source.display())
+                }
+            })
+            .collect();
+        let _ = writeln!(out, "标签     {}   —— 人为声明", tags.join("、"));
     }
 
     if report.registry_mirrors.is_empty() {

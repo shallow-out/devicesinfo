@@ -37,6 +37,51 @@
 **报告里的路径都是"被探测机器上的路径"**（`/usr/bin/podman`），不带探测根。
 这样本机、`--ssh`、夹具三种来源给出同一串，既可比，也不会把临时目录泄漏到输出里。
 
+## 标签：唯一**人为声明**的东西
+
+前面所有字段都是**探测**出来的，只有标签不是。`always-on` 说的是"这台机器会被一直开着"，
+而 sysfs 不知道用户会不会合盖、会不会拔电——**只能由人声明**。
+
+```bash
+# /etc/deviceinfo/tags.conf      本机管理员（优先）
+# /usr/share/deviceinfo/tags.conf  出厂/发行版默认（硬件产品随附）
+# /etc/deviceinfo/tags.d/*.conf    分片，按用途拆开写
+Always_On  powersave
+```
+
+格式是一个极简行格式：每行若干标签，`#` 开头是注释。**规范化是刻意的**（转小写、
+`_` 换成 `-`）：标签的用途是**匹配**，大小写不一致会让路由静默失配。字符集限
+`[A-Za-z0-9._-]`，其他字符一律拒绝并**出声**——静默忽略一张拼错的标签，等于让任务
+永远找不到这台机器，而这种故障极难查。
+
+两个规范标签（其余名字自由取，按需扩展）：
+
+| 标签 | 含义 |
+|---|---|
+| `always-on` | 一直开着。任务路由第一步筛的就是它 |
+| `powersave` | 省电优先，适合轻任务 |
+
+### 路由怎么用（策略不在本模块里）
+
+**路由策略属于调度器，探测库不做决定**——但把三份报告合起来就能筛：
+
+| 任务 | 条件 | 依据 |
+|---|---|---|
+| 内核编译 | `always-on` 且 逻辑核/等效算力够 | 标签 + `HardwareReport.cpu` |
+| 定时提醒 | `always-on` 且 `powersave` | 只用标签 |
+| 大模型推理 | `has_usable_npu()` 或 `has_usable_gpu()` 且有容器或已装推理框架 | `HardwareReport` + `EnvironmentReport` |
+| 拉镜像跑容器 | `has_container_runtime()` 且镜像源/出网可达 | `EnvironmentReport` |
+
+```python
+# 例：内核编译交给"一直开着且性能不差"的设备
+[host for host in fleet
+ if host.env.always_on() and host.hw.cpu.effective_cores >= 6]
+
+# 例：定时提醒交给"一直开着且省电"的设备
+[host for host in fleet
+ if host.env.always_on() and host.env.powersave()]
+```
+
 ## 用法
 
 ```bash
