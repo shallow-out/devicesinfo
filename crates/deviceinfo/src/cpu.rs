@@ -42,7 +42,7 @@ pub(crate) fn probe(root: &Path, arch: &str, warnings: &mut Vec<String>) -> CpuI
                 .find_map(|key| field(text, key))
                 .map(str::to_string)
         })
-        .or_else(|| devicetree_model(root));
+        .or_else(|| machine_model(root));
 
     let simd = cpuinfo.as_deref().map(features::parse).unwrap_or_default();
 
@@ -56,13 +56,20 @@ pub(crate) fn probe(root: &Path, arch: &str, warnings: &mut Vec<String>) -> CpuI
     }
 }
 
-/// 从设备树读机器型号。
+/// 整机型号。两级，对应两种固件接口：
 ///
-/// **这是 arm64 上唯一的型号来源。** `/proc/cpuinfo` 在 arm64 上只有
-/// `processor` / `BogoMIPS` / `Features` / `CPU implementer` / `CPU part`，
-/// 一行型号都没有——少了这一步，每一台 ARM 机器都会显示"未知 CPU"。
-fn devicetree_model(root: &Path) -> Option<String> {
+/// - **设备树**（ARM/嵌入式的常见形态）：`/sys/firmware/devicetree/base/model`，
+///   例如 `Radxa ROCK 5B+`。
+/// - **DMI**（ACPI 平台，包括 ACPI 启动的 ARM 服务器）：`product_name`，
+///   例如 `Radxa Orion O6N`。实测那台 CIX 的机器**整个 `/sys/firmware/devicetree`
+///   都不存在**，只有 DMI。
+///
+/// 之所以需要这一级：`/proc/cpuinfo` 在 arm64 上**未必**有型号——Rockchip 那台一行
+/// 都没有，而 CIX 那台厂商内核又报 `model name`。内核之间不一致，就得有兜底。
+/// x86 上这个函数根本不会被调用（cpuinfo 总有 `model name`）。
+fn machine_model(root: &Path) -> Option<String> {
     read_dt_property(&root.join("sys/firmware/devicetree/base/model"))
+        .or_else(|| read_dt_property(&root.join("sys/class/dmi/id/product_name")))
 }
 
 /// cpuinfo 里 `processor` 行的条数。

@@ -182,16 +182,30 @@ pub(crate) fn read_compatible(device_dir: &Path) -> Option<String> {
 /// （`RKNPU`、`rockchip,rk3588-rknpu`），子串匹配就能盖住，这张表只做补充。
 const DRM_NPU_DRIVERS: [&str; 1] = ["rknpu"];
 
-/// 判断一个 DRM 设备是 NPU 还是 GPU。
+/// 判断一个 DRM 设备到底是 NPU / GPU / 只会显示。
 ///
-/// **不能一律当 GPU。** Rockchip 的 RKNPU 走 DRM 暴露，于是一台**确实有 NPU**
-/// 的机器上，`has_npu()` 会返回 `false`——上层再也不会考虑 NPU 卸载，而且没有任何报错。
-/// 实测那台机器上它出现在 `/sys/class/drm/card0`，驱动 `RKNPU`，
-/// compatible `rockchip,rk3588-rknpu`。
+/// 两步，都不靠猜：
+///
+/// 1. **身份里有 `npu` → NPU。** Rockchip 的 RKNPU 走 DRM 暴露，于是一台**确实有
+///    NPU** 的机器上 `has_npu()` 会返回 `false`——上层再也不会考虑 NPU 卸载，
+///    而且没有任何报错。实测那台机器上它出现在 `/sys/class/drm/card0`，
+///    驱动 `RKNPU`，compatible `rockchip,rk3588-rknpu`。
+/// 2. **有没有 render 节点 → GPU / 只会显示。** DRM 的 render 节点就是给渲染/计算
+///    用的（`DRIVER_RENDER`），纯显示控制器拿不到。这样不需要任何驱动名白名单：
+///    实测的 `linlondp`（3 个）和 `rockchip-drm` 都因此被正确归为显示设备。
+///
+/// `render_nodes` 是三态，因为"没看到 render 节点"有两种原因，不能混：
+/// `Some(0)` 是**确实看到了那个目录且里面没有**（→ 显示设备），
+/// `None` 是我们**没能看到目录**（老内核？）——那就什么都不改，继续当 GPU 并注明。
+/// 把后者也当成显示设备，会在老内核上把真 GPU 静默降级。
 ///
 /// `pub(crate)`：状态采样必须用**同一套**判据，否则两份报告里第 N 个设备不是同一个
 /// （这个分歧真的发生过，被 `state_and_hardware_agree_on_which_devices_exist` 抓到）。
-pub(crate) fn classify_drm_device(driver: Option<&str>, compatible: Option<&str>) -> AcceleratorKind {
+pub(crate) fn classify_drm_device(
+    driver: Option<&str>,
+    compatible: Option<&str>,
+    render_nodes: Option<usize>,
+) -> AcceleratorKind {
     let identity = format!(
         "{} {}",
         driver.unwrap_or_default(),
@@ -201,7 +215,10 @@ pub(crate) fn classify_drm_device(driver: Option<&str>, compatible: Option<&str>
     if identity.contains("npu") || DRM_NPU_DRIVERS.iter().any(|name| identity.contains(name)) {
         return AcceleratorKind::Npu;
     }
-    AcceleratorKind::Gpu
+    match render_nodes {
+        Some(0) => AcceleratorKind::Display,
+        _ => AcceleratorKind::Gpu,
+    }
 }
 
 /// 一台 DRM 设备**自己**的 render 节点名（`renderD128` 这类）。
@@ -212,7 +229,7 @@ pub(crate) fn classify_drm_device(driver: Option<&str>, compatible: Option<&str>
 /// 而配对给了 card1——就算排序之后碰巧对了，规则本身也不成立。
 ///
 /// 也刻意不去解 `sys/class/drm/renderD*` 的软链：软链在夹具里存不下来。
-fn render_nodes_of(device_dir: &Path) -> Vec<String> {
+pub(crate) fn render_nodes_of(device_dir: &Path) -> Vec<String> {
     let mut found: Vec<String> = fs::read_dir(device_dir.join("drm"))
         .into_iter()
         .flatten()
@@ -298,8 +315,14 @@ pub(crate) fn probe_gpus(
         let compatible = read_compatible(&device_dir);
         let raw_id = read_trimmed(&device_dir.join("device")).unwrap_or_else(|| "未知".into());
 
+        // render 节点的**归属**由 `<device>/drm/` 的目录项给出。
+        // 三态：看到了(Some) / 看不到那个目录(None)——理由见 classify_drm_device。
+        let drm_dir = device_dir.join("drm");
+        let nodes = render_nodes_of(&device_dir);
+        let render_nodes = drm_dir.is_dir().then_some(nodes.len());
+
         // 一个 DRM card 未必是 GPU：见 classify_drm_device
-        let kind = classify_drm_device(driver.as_deref(), compatible.as_deref());
+        let kind = classify_drm_device(driver.as_deref(), compatible.as_deref(), render_nodes);
         let runtime = runtime::probe(kind, vendor.as_deref(), libraries);
         let name = name_from_pci(root, &vendor, &pci_id, || match (&compatible, &vendor) {
             // 非 PCI 平台：设备树 compatible 是唯一有信息量的标识
@@ -311,19 +334,23 @@ pub(crate) fn probe_gpus(
             (None, None) => format!("{} ({node})", kind_label_for_name(kind)),
         });
 
-        let nodes = render_nodes_of(&device_dir);
         let device_path = nodes.first().map(|name| root.join("dev/dri").join(name));
         // 字面量里字段是按书写顺序求值的：先把借 vendor 的算完再 move 它
-        let memory = gpu_memory(&device_dir, vendor.as_deref());
+        let memory = match kind {
+            // 显示控制器拿系统内存做 framebuffer，没有"独立显存"这回事
+            AcceleratorKind::Display => AcceleratorMemory::SharedWithSystem,
+            _ => gpu_memory(&device_dir, vendor.as_deref()),
+        };
         let max_freq_mhz = gpu_max_freq_mhz(&device_dir);
 
         let mut notes = Vec::new();
         if driver.is_none() {
             notes.push("未绑定内核驱动，硬件加速不可用".into());
         }
-        if nodes.is_empty() {
-            // DRM 的 render 节点就是给渲染/计算用的；没有它基本只做显示输出
-            notes.push("没有 render 节点，可能只做显示输出，不能用于计算".into());
+        if render_nodes.is_none() {
+            // 没有这个目录，就判不出是不是只做显示输出。宁可继续当 GPU 并注明，
+            // 也不要在老内核上把真 GPU 静默降级。
+            notes.push("看不到 <device>/drm/，无法判断是否只做显示输出".into());
         } else if let Some(path) = &device_path {
             if !path.exists() {
                 notes.push(format!("{} 不存在", path.display()));
@@ -375,6 +402,7 @@ pub(crate) fn probe_gpus(
 fn kind_label_for_name(kind: AcceleratorKind) -> &'static str {
     match kind {
         AcceleratorKind::Npu => "NPU",
+        AcceleratorKind::Display => "display",
         _ => "GPU",
     }
 }
@@ -646,18 +674,72 @@ mod tests {
         let mut warnings = Vec::new();
         let found = probe_gpus(&root, &empty_libraries(&root), &mut warnings);
         let card0 = found.iter().find(|a| a.name == "GPU (card0)").unwrap();
-        let card1 = found.iter().find(|a| a.name == "GPU (card1)").unwrap();
+        let card1 = found.iter().find(|a| a.name == "display (card1)").unwrap();
+        assert_eq!(card0.kind, AcceleratorKind::Gpu);
         assert_eq!(
             card0.device_path.as_deref(),
             Some(root.join("dev/dri/renderD128").as_path())
         );
+        // 有 `drm/` 目录但里面只有 control 节点 → 只能显示输出，不是 GPU
+        assert_eq!(card1.kind, AcceleratorKind::Display);
         assert!(card1.device_path.is_none(), "card1 没有 render 节点");
         assert!(
-            card1.notes.iter().any(|note| note.contains("render 节点")),
-            "没有 render 节点这件事得说出来: {:#?}",
-            card1.notes
+            matches!(card1.runtime, crate::RuntimeStatus::NotApplicable { .. }),
+            "显示设备不涉及推理运行时: {:#?}",
+            card1.runtime
         );
         assert!(warnings.is_empty(), "{warnings:?}");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// **只有显示控制器的机器，`has_gpu()` 必须是 false。** 这是加 `Display` 类别的全部理由。
+    #[test]
+    fn a_machine_with_only_display_controllers_has_no_gpu() {
+        let root = fake_root("display-only");
+        fs::create_dir_all(root.join("proc")).unwrap();
+        fs::write(root.join("proc/meminfo"), "MemTotal: 1000 kB\n").unwrap();
+        fs::write(root.join("proc/cpuinfo"), "processor\t: 0\nmodel name\t: x\n").unwrap();
+        fs::create_dir_all(root.join("sys/devices/system/cpu/smt")).unwrap();
+        fs::write(root.join("sys/devices/system/cpu/smt/active"), "0\n").unwrap();
+        let cpu0 = root.join("sys/devices/system/cpu/cpu0/topology");
+        fs::create_dir_all(&cpu0).unwrap();
+        fs::write(cpu0.join("core_cpus_list"), "0\n").unwrap();
+        for card in ["card0", "card1"] {
+            let device = root.join(format!("sys/class/drm/{card}/device"));
+            fs::create_dir_all(device.join("drm")).unwrap();
+            fs::create_dir_all(device.join("of_node")).unwrap();
+            fs::write(device.join("of_node/compatible"), b"rockchip,display-subsystem\0")
+                .unwrap();
+            fs::create_dir_all(device.join("drm/controlD65")).unwrap();
+        }
+
+        let report = crate::probe_with(&root, "aarch64");
+        assert_eq!(report.accelerators.len(), 2);
+        assert!(
+            !report.has_gpu(),
+            "两个显示控制器不该让 has_gpu() 为真: {:#?}",
+            report.accelerators
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// 看不到 `<device>/drm/` 时**不能**下"只会显示"的结论——那会把老内核上的真 GPU
+    /// 静默降级。宁可继续当 GPU 并注明。
+    #[test]
+    fn a_missing_drm_directory_does_not_demote_a_gpu() {
+        let root = fake_root("no-drm-dir");
+        fs::create_dir_all(root.join("sys/class/drm/card0/device")).unwrap();
+
+        let mut warnings = Vec::new();
+        let found = probe_gpus(&root, &empty_libraries(&root), &mut warnings);
+        assert_eq!(found[0].kind, AcceleratorKind::Gpu);
+        assert!(
+            found[0].notes.iter().any(|note| note.contains("看不到")),
+            "{:#?}",
+            found[0].notes
+        );
 
         fs::remove_dir_all(&root).ok();
     }

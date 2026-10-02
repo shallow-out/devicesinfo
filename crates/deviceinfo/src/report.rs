@@ -14,6 +14,16 @@ pub enum AcceleratorKind {
     Cpu,
     Gpu,
     Npu,
+    /// 只能做显示输出的 DRM 设备。
+    ///
+    /// 判据是**结构性的**：DRM 的 render 节点就是给渲染/计算用的（`DRIVER_RENDER`），
+    /// 纯显示控制器拿不到。实测两台 ARM 机器上都有（`linlondp` ×3、`rockchip-drm`）——
+    /// 以前它们被报成 GPU，于是 [`HardwareReport::has_gpu`] 在一台只有显示控制器的
+    /// 机器上也会返回 `true`。
+    ///
+    /// 它们仍然留在 [`HardwareReport::accelerators`] 里："这台机器有几个 DRM 设备、
+    /// 分别是什么"本身是值得知道的事实。只是**不参与"能不能跑模型"的判断**。
+    Display,
 }
 
 /// PCI 标识。
@@ -85,6 +95,11 @@ pub enum RuntimeStatus {
     },
     /// 已知栈缺件。`missing` 是可以照抄去装的东西。
     Incomplete { stack: String, missing: Vec<String> },
+    /// 这个设备根本不涉及推理运行时（例如只能显示输出的 DRM 设备）。
+    ///
+    /// 和 [`RuntimeStatus::Unknown`] 分开：那是"不知道该找什么"，这是**知道不用找**。
+    /// 混成一个值就丢了"这个设备能不能用来算"与"能不能判断"的区别。
+    NotApplicable { reason: String },
     /// 认不出这个组合该找什么——不猜。
     Unknown { reason: String },
 }
@@ -149,6 +164,9 @@ pub struct CpuInfo {
     pub arch: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    // 语义提醒：x86 上这是**处理器**型号（cpuinfo 的 `model name`）；
+    // ARM 上通常是**整机**型号（平台只给得出这个：设备树 `model` 或 DMI `product_name`）。
+    // 拆成两个字段更干净，见 README 的"已知未做"。
     pub logical_cores: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub physical_cores: Option<usize>,
@@ -253,6 +271,9 @@ impl HardwareReport {
     }
 
     /// 是否存在 GPU 设备。语义边界同 [`Self::has_npu`]。
+    ///
+    /// **只有 [`AcceleratorKind::Gpu`] 算数。** 只能做显示输出的 DRM 设备是
+    /// [`AcceleratorKind::Display`]，它们跑不了模型。
     pub fn has_gpu(&self) -> bool {
         self.accelerators
             .iter()

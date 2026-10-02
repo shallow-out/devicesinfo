@@ -11,7 +11,8 @@ use deviceinfo::{
     HardwareReport, LIBRARY_DIRS, PciId, RuntimeStatus, SampleOptions, probe_with, render,
     sample_state_with,
 };
-use source::{EntryKind, Source};
+use source::{Entry, EntryKind, Source};
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -211,9 +212,12 @@ fn mirror(source: &Source, stage: &Path) -> io::Result<()> {
         let _ = fs::remove_file(&to);
         std::os::unix::fs::symlink(target, &to)?;
     }
-    for dir in LIBRARY_DIRS {
-        for name in source.list_files(dir) {
-            write_file(&stage.join(dir).join(name), b"")?;
+    // 库目录一次列完。**目录名要滤掉**：`usr/lib` 的列表里含 `aarch64-linux-gnu`
+    // 这样的目录，把它当库文件写成普通文件，下一步往它里面写就会 `EEXIST`。
+    let library_dirs: Vec<String> = LIBRARY_DIRS.iter().map(|dir| dir.to_string()).collect();
+    for (dir, entries) in source.list_many(&library_dirs) {
+        for entry in entries.into_iter().filter(|entry| !entry.is_dir) {
+            write_file(&stage.join(&dir).join(entry.name), b"")?;
         }
     }
     Ok(())
@@ -347,25 +351,41 @@ fn capture_plan(source: &Source) -> CapturePlan {
         "proc/cpuinfo".to_string(),
         "proc/meminfo".to_string(),
         "sys/devices/system/cpu/smt/active".to_string(),
-        // arm64 唯一的型号来源（/proc/cpuinfo 在 arm64 上不报型号）
+        // arm64 的型号来源之一（`/proc/cpuinfo` 在 arm64 上**未必**有型号，
+        // 取决于内核；这台 CIX 的有，那台 Rockchip 的没有）
         "sys/firmware/devicetree/base/model".to_string(),
+        // ACPI 平台没有设备树，DMI 才是对应物
+        "sys/class/dmi/id/product_name".to_string(),
     ];
     let mut symlinks = Vec::new();
+    let mut lists = ListCache::new(source);
 
-    for cpu in numeric_entries(source, "sys/devices/system/cpu", "cpu") {
+    // 阶段一：固定目录一次列完（远端每次调用都要在那边起一个 shell，很贵）
+    const CPU_DIR: &str = "sys/devices/system/cpu";
+    const ACCEL_DIR: &str = "dev/accel";
+    const DRM_DIR: &str = "sys/class/drm";
+    const DRI_DIR: &str = "dev/dri";
+    lists.ensure(&[
+        CPU_DIR.to_string(),
+        ACCEL_DIR.to_string(),
+        DRM_DIR.to_string(),
+        DRI_DIR.to_string(),
+    ]);
+
+    for cpu in lists.numeric(CPU_DIR, "cpu") {
         for rel in [
             "cpu_capacity",
             "cpufreq/cpuinfo_max_freq",
             "topology/core_cpus_list",
         ] {
-            files.push(format!("sys/devices/system/cpu/{cpu}/{rel}"));
+            files.push(format!("{CPU_DIR}/{cpu}/{rel}"));
         }
     }
 
     // 加速器：设备事实 + 驱动软链 + 软链指向的模块版本
     let mut device_dirs = Vec::new();
-    for node in numeric_entries(source, "dev/accel", "accel") {
-        files.push(format!("dev/accel/{node}"));
+    for node in lists.numeric(ACCEL_DIR, "accel") {
+        files.push(format!("{ACCEL_DIR}/{node}"));
         let device = format!("sys/class/accel/{node}/device");
         for rel in [
             "vendor",
@@ -383,8 +403,19 @@ fn capture_plan(source: &Source) -> CapturePlan {
         }
         device_dirs.push(device);
     }
-    for card in numeric_entries(source, "sys/class/drm", "card") {
-        let device = format!("sys/class/drm/{card}/device");
+
+    let cards: Vec<String> = lists
+        .numeric(DRM_DIR, "card")
+        .iter()
+        .map(|card| format!("{DRM_DIR}/{card}/device"))
+        .collect();
+    // 阶段二：所有 card 的 device 目录 + 各自的 drm/ 一次列完
+    let drm_subdirs: Vec<String> = cards.iter().map(|d| format!("{d}/drm")).collect();
+    lists.ensure(&cards);
+    lists.ensure(&drm_subdirs);
+
+    let mut tile_dirs = Vec::new();
+    for device in &cards {
         for rel in [
             "vendor",
             "device",
@@ -398,56 +429,115 @@ fn capture_plan(source: &Source) -> CapturePlan {
         ] {
             files.push(format!("{device}/{rel}"));
         }
-        // render 节点的**归属**靠 `<device>/drm/` 的目录项表达，
-        // 而不是靠 sys/class/drm 的软链（软链存不进夹具）
-        for node in numeric_entries(source, &format!("{device}/drm"), "renderD") {
-            files.push(format!("{device}/drm/{node}"));
+        // render 节点的**归属**靠 `<device>/drm/` 的目录项表达，而不是靠
+        // sys/class/drm 的软链（软链存不进夹具）。
+        //
+        // **必须把该目录的条目全部记下来**，不能只取 `renderD*`：一个只有
+        // `controlD*` 的 card 说明它只会显示输出，而"目录里没有 render 节点"和
+        // "这个目录压根不存在"是两件事——前者是显示设备，后者是判不出来。
+        // 只记 renderD* 会让夹具里连目录都没有，于是分类结果和真机不一样。
+        let drm_subdir = format!("{device}/drm");
+        for entry in lists.entries(&drm_subdir) {
+            files.push(format!("{drm_subdir}/{}", entry.name));
         }
         // xe 的 tile*/gt*/freq0/{max,cur}_freq
-        for tile in numeric_entries(source, &device, "tile") {
-            for gt in numeric_entries(source, &format!("{device}/{tile}"), "gt") {
-                for leaf in ["max_freq", "cur_freq"] {
-                    files.push(format!("{device}/{tile}/{gt}/freq0/{leaf}"));
-                }
+        for tile in lists.numeric(device, "tile") {
+            tile_dirs.push(format!("{device}/{tile}"));
+        }
+        device_dirs.push(device.clone());
+    }
+    // 阶段三：tile 下面的 gt 目录
+    lists.ensure(&tile_dirs);
+    for tile_dir in &tile_dirs {
+        for gt in lists.numeric(tile_dir, "gt") {
+            for leaf in ["max_freq", "cur_freq"] {
+                files.push(format!("{tile_dir}/{gt}/freq0/{leaf}"));
             }
         }
-        device_dirs.push(device);
-    }
-    for node in numeric_entries(source, "dev/dri", "renderD") {
-        files.push(format!("dev/dri/{node}"));
     }
 
-    for device in device_dirs {
-        let Some(target) = source.read_link(&format!("{device}/driver")) else {
-            continue;
-        };
-        let Some(name) = Path::new(&target).file_name().and_then(|name| name.to_str()) else {
+    for node in lists.numeric(DRI_DIR, "renderD") {
+        files.push(format!("{DRI_DIR}/{node}"));
+    }
+
+    // 阶段四：所有驱动软链一次读完
+    let link_paths: Vec<String> = device_dirs
+        .iter()
+        .map(|device| format!("{device}/driver"))
+        .collect();
+    let links = source.link_many(&link_paths);
+    for (path, target) in links {
+        let Some(name) = target
+            .as_deref()
+            .and_then(|target| Path::new(target).file_name())
+            .and_then(|name| name.to_str())
+        else {
             continue;
         };
         // 指向哪儿无所谓，探测只读软链的末段；用 module/<名字> 便于人看
-        symlinks.push((format!("{device}/driver"), format!("module/{name}")));
+        symlinks.push((path.clone(), format!("module/{name}")));
         files.push(format!("sys/module/{name}/version"));
     }
 
     CapturePlan { files, symlinks }
 }
 
-/// `<前缀><纯数字>` 形式的条目名，字典序排序。
+/// 目录列表的缓存。
 ///
-/// 要求"数字"而不是"以数字开头"：`card0-DP-1` 是显示连接器不是 GPU，
-/// 而 `cpufreq` / `cpuidle` 会和 `cpu0` 一起混进 `cpu` 前缀里。
-fn numeric_entries(source: &Source, rel_dir: &str, prefix: &str) -> Vec<String> {
-    let mut names: Vec<String> = source
-        .list(rel_dir)
-        .into_iter()
-        .filter(|name| {
-            name.strip_prefix(prefix).is_some_and(|rest| {
-                !rest.is_empty() && rest.bytes().all(|byte| byte.is_ascii_digit())
+/// 采集要列十来个目录，而远端每次调用都要在那边起一个 shell（实测 ~190ms）。
+/// 把"还缺哪些目录"攒起来一次性问，是把采集时间降下来的唯一办法。
+struct ListCache<'a> {
+    source: &'a Source,
+    dirs: BTreeMap<String, Vec<Entry>>,
+}
+
+impl<'a> ListCache<'a> {
+    fn new(source: &'a Source) -> Self {
+        Self {
+            source,
+            dirs: BTreeMap::new(),
+        }
+    }
+
+    /// 确保这些目录都列过了。没列过的**合并成一次往返**。
+    fn ensure(&mut self, dirs: &[String]) {
+        let missing: Vec<String> = dirs
+            .iter()
+            .filter(|dir| !self.dirs.contains_key(*dir))
+            .cloned()
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        self.dirs.extend(self.source.list_many(&missing));
+        // 远端没返回的（目录不存在）也要记下来，免得反复问
+        for dir in missing {
+            self.dirs.entry(dir).or_default();
+        }
+    }
+
+    fn entries(&self, dir: &str) -> &[Entry] {
+        self.dirs.get(dir).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// `<前缀><纯数字>` 形式的条目名，字典序排序。
+    ///
+    /// 要求"全是数字"而不是"以数字开头"：`card0-DP-1` 是显示连接器不是 GPU，
+    /// 而 `cpufreq` / `cpuidle` 会和 `cpu0` 一起混进 `cpu` 前缀里。
+    fn numeric(&self, dir: &str, prefix: &str) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .entries(dir)
+            .iter()
+            .filter(|entry| {
+                entry.name.strip_prefix(prefix).is_some_and(|rest| {
+                    !rest.is_empty() && rest.bytes().all(|byte| byte.is_ascii_digit())
+                })
             })
-        })
-        .collect();
-    names.sort();
-    names
+            .map(|entry| entry.name.clone())
+            .collect();
+        names.sort();
+        names
+    }
 }
 
 /// 把报告里的绝对路径统一成"相对于探测根"的形式（`/dev/accel/accel0`）。

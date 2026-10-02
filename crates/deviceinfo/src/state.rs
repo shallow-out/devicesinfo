@@ -199,6 +199,11 @@ fn accelerator_devices(root: &Path) -> Vec<(AcceleratorKind, PathBuf)> {
                 let kind = crate::accelerator::classify_drm_device(
                     crate::accelerator::driver_of(&device).as_deref(),
                     crate::accelerator::read_compatible(&device).as_deref(),
+                    // 和硬件探测用同一个三态判据；这里也要求"看到了 drm 目录"
+                    device
+                        .join("drm")
+                        .is_dir()
+                        .then(|| crate::accelerator::render_nodes_of(&device).len()),
                 );
                 entries.push((format!("1drm/{node}"), kind, device));
             }

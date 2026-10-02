@@ -11,12 +11,18 @@
 //! 刻意保持"路径进、内容出"的形状，和 `std::fs` 一一对应——这样本地与远端两条路
 //! 走的是**同一份采集逻辑**（`capture_plan`），不会各自漂移。
 //!
-//! # 为什么有 `prefetch`
+//! # 为什么一切都围着"批量"设计
 //!
-//! 采集在动手之前就有完整的文件清单，所以远端实现可以**一次 ssh 把所有内容取回来**，
-//! 而不是每个文件开一次连接（那会变成上百次握手）。
+//! 实测同一局域网内**单次 ssh 往返要 770ms**（握手 + 认证 + 远端起 shell），而一次
+//! 采集原本有二十来次往返。所以三个操作都提供批量版本，远端各自把一轮压成一次往返：
 //!
-//! stdout 上跑的是字节协议（`@@F <字节数> <路径>` 后面跟原始内容），不用 base64：
+//! | 操作 | 单次 | 批量 |
+//! |---|---|---|
+//! | 列目录 | —— | [`Source::list_many`] |
+//! | 读软链 | —— | [`Source::link_many`] |
+//! | 读文件 | —— | [`Source::prefetch`] |
+//!
+//! stdout 上跑的是行协议（`@@F <字节数> <路径>` 后面跟原始内容），不用 base64：
 //! `ssh` 传二进制是安全的，而**按字节数截断**比找分隔符可靠——文件内容里什么都可能有。
 
 use std::cell::RefCell;
@@ -24,6 +30,15 @@ use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+
+/// 目录里的一个条目。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Entry {
+    pub name: String,
+    /// 是不是目录。**必须带上这个信息**：`usr/lib` 的列表里含有
+    /// `aarch64-linux-gnu` 这样的目录名，把它当库文件会一路错下去。
+    pub is_dir: bool,
+}
 
 /// 一个路径在来源里的状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,58 +84,51 @@ impl Source {
         }
     }
 
-    /// 列一个目录下的条目名（不递归）。
-    pub(crate) fn list(&self, dir: &str) -> Vec<String> {
+    /// 一次取回多个目录的条目名。不存在的目录返回空列表。
+    pub(crate) fn list_many(&self, dirs: &[String]) -> BTreeMap<String, Vec<Entry>> {
         match self {
-            Self::Local(root) => list_local(root, dir),
-            Self::Remote(remote) => remote.run(&format!("ls -1 -- {} 2>/dev/null", quoted(dir)))
-                .map(|out| lines_of(&out))
-                .unwrap_or_default(),
-        }
-    }
-
-    /// 列一个目录下的**非目录**条目名。
-    ///
-    /// 用 `ls -1p`（`-p` 给目录名加 `/`）而不是 `find -type f`：库文件大多是软链，
-    /// `-type f` 会把它们全漏掉；`-printf` 又是 GNU 专有，busybox 上没有。
-    ///
-    /// 需要"只要非目录"是有原因的：`LIBRARY_DIRS` 里既有 `usr/lib` 又有
-    /// `usr/lib/aarch64-linux-gnu`，而 `usr/lib` 的列表里就包含 `aarch64-linux-gnu`
-    /// 这个**目录名**——把它当库文件写成普通文件，下一步往它里面写就会 `EEXIST`。
-    pub(crate) fn list_files(&self, dir: &str) -> Vec<String> {
-        match self {
-            Self::Local(root) => std::fs::read_dir(root.join(dir))
-                .into_iter()
-                .flatten()
-                .flatten()
-                .filter(|entry| !entry.path().is_dir())
-                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            Self::Local(root) => dirs
+                .iter()
+                .map(|dir| (dir.clone(), list_local(root, dir)))
                 .collect(),
-            Self::Remote(remote) => remote
-                .run(&format!("ls -1p -- {} 2>/dev/null", quoted(dir)))
-                .map(|out| {
-                    lines_of(&out)
-                        .into_iter()
-                        .filter(|line| !line.ends_with('/'))
-                        .collect()
-                })
-                .unwrap_or_default(),
+            Self::Remote(remote) => {
+                let script = "\
+while IFS= read -r d; do
+  printf '@@L %s\\n' \"$d\"
+  ls -1p -- \"$d\" 2>/dev/null
+  printf '@@E\\n'
+done";
+                remote
+                    .run_with_stdin(script, &stdin_lines(dirs))
+                    .map(|out| parse_listing(&out))
+                    .unwrap_or_default()
+            }
         }
     }
 
-    /// 软链的目标字符串（不解析成绝对路径）。
-    pub(crate) fn read_link(&self, path: &str) -> Option<String> {
+    /// 一次取回多个路径的软链目标。不是软链、或读不到，对应 `None`。
+    pub(crate) fn link_many(&self, paths: &[String]) -> BTreeMap<String, Option<String>> {
         match self {
-            Self::Local(root) => std::fs::read_link(root.join(path))
-                .ok()?
-                .to_str()
-                .map(str::to_string),
+            Self::Local(root) => paths
+                .iter()
+                .map(|path| {
+                    let target = std::fs::read_link(root.join(path))
+                        .ok()
+                        .and_then(|target| target.to_str().map(str::to_string));
+                    (path.clone(), target)
+                })
+                .collect(),
             Self::Remote(remote) => {
-                let out = remote
-                    .run(&format!("readlink -- {} 2>/dev/null", quoted(path)))
-                    .ok()?;
-                let text = String::from_utf8_lossy(&out).trim().to_string();
-                (!text.is_empty()).then_some(text)
+                let script = "\
+while IFS= read -r p; do
+  printf '@@K %s\\n' \"$p\"
+  t=$(readlink -- \"$p\" 2>/dev/null)
+  if [ -n \"$t\" ]; then printf '@@T %s\\n' \"$t\"; else printf '@@N\\n'; fi
+done";
+                remote
+                    .run_with_stdin(script, &stdin_lines(paths))
+                    .map(|out| parse_links(&out))
+                    .unwrap_or_default()
             }
         }
     }
@@ -132,7 +140,33 @@ impl Source {
     /// `vendor`/`device` 读成空字符串，于是报告里出现 `GPU (card0, id )` 和
     /// `(:)` 这种垃圾——这个 bug 真的发生过一次。
     pub(crate) fn kind(&self, path: &str) -> EntryKind {
-        self.lookup(path)
+        match self {
+            Self::Local(root) => match std::fs::metadata(root.join(path)) {
+                Ok(meta) if meta.is_file() => EntryKind::File,
+                Ok(_) => EntryKind::Other,
+                Err(_) => EntryKind::Missing,
+            },
+            Self::Remote(remote) => remote
+                .kinds
+                .borrow()
+                .get(path)
+                .copied()
+                // 没 prefetch 过就现问一次，慢但正确
+                .unwrap_or_else(|| {
+                    let answer = remote
+                        .run(&format!(
+                            "if [ -f {0} ]; then echo F; elif [ -e {0} ]; then echo D; else echo M; fi",
+                            quoted(path)
+                        ))
+                        .map(|out| String::from_utf8_lossy(&out).trim().to_string())
+                        .unwrap_or_else(|_| "M".into());
+                    match answer.as_str() {
+                        "F" => EntryKind::File,
+                        "D" => EntryKind::Other,
+                        _ => EntryKind::Missing,
+                    }
+                }),
+        }
     }
 
     /// 读文件内容。读不到返回 `None`。
@@ -168,41 +202,14 @@ while IFS= read -r p; do
     printf '@@M %s\\n' \"$p\"
   fi
 done";
-        let input = paths.join("\n");
-        let Ok(out) = remote.run_with_stdin(script, input.as_bytes()) else {
+        let Ok(out) = remote.run_with_stdin(script, &stdin_lines(paths)) else {
             return;
         };
-        parse_batch(&out, &mut remote.contents.borrow_mut(), &mut remote.kinds.borrow_mut());
-    }
-
-    fn lookup(&self, path: &str) -> EntryKind {
-        match self {
-            Self::Local(root) => match std::fs::metadata(root.join(path)) {
-                Ok(meta) if meta.is_file() => EntryKind::File,
-                Ok(_) => EntryKind::Other,
-                Err(_) => EntryKind::Missing,
-            },
-            Self::Remote(remote) => remote
-                .kinds
-                .borrow()
-                .get(path)
-                .copied()
-                // 没 prefetch 过就现问一次，慢但正确
-                .unwrap_or_else(|| {
-                    let answer = remote
-                        .run(&format!(
-                            "if [ -f {0} ]; then echo F; elif [ -e {0} ]; then echo D; else echo M; fi",
-                            quoted(path)
-                        ))
-                        .map(|out| String::from_utf8_lossy(&out).trim().to_string())
-                        .unwrap_or_else(|_| "M".into());
-                    match answer.as_str() {
-                        "F" => EntryKind::File,
-                        "D" => EntryKind::Other,
-                        _ => EntryKind::Missing,
-                    }
-                }),
-        }
+        parse_batch(
+            &out,
+            &mut remote.contents.borrow_mut(),
+            &mut remote.kinds.borrow_mut(),
+        );
     }
 }
 
@@ -218,7 +225,7 @@ impl RemoteSource {
         // 采集会"成功"，只是内容全是空的。这个 bug 真的发生过一次。
         let script = format!("cd / || exit 1\n{script}");
 
-        // 连接复用。实测单次 ssh 往返要 770ms（握手 + 认证 + 远端 shell 启动），
+        // 连接复用。实测单次 ssh 往返要 770ms（握手 + 认证 + 远端起 shell），
         // 一次采集有二十来次往返，不复用就是十几秒。`%h` 由 ssh 展开成主机名，
         // 所以不同主机不会共用同一条 master 连接。
         let control_path = format!(
@@ -240,12 +247,12 @@ impl RemoteSource {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
+
         if !input.is_empty() {
             let mut stdin = child.stdin.take().expect("刚设了 piped");
             stdin.write_all(input)?;
+            // stdin 在这里 drop，远端 `while read` 才会看到 EOF
         }
-        // 显式丢掉 stdin，让远端 `while read` 看到 EOF
-        drop(child.stdin.take());
         let output = child.wait_with_output()?;
         if !output.status.success() {
             return Err(io::Error::other(format!(
@@ -257,6 +264,18 @@ impl RemoteSource {
         }
         Ok(output.stdout)
     }
+}
+
+/// 拼成喂给远端 `while read` 的输入。
+///
+/// **末尾必须有换行。** `read` 在遇到 EOF 且没有换行时返回非零，于是 `while` 的循环体
+/// 不会执行——**最后一行会被静默丢掉**。这个 bug 让每台机器**最后一个 DRM 设备**的
+/// `drm/` 目录列表凭空消失（现象只是"夹具里少一个条目"），而 `prefetch` 上的同一处
+/// 漏掉则表现为"每次采集都多花一次往返"，因为那条路会退化成逐个现问。
+fn stdin_lines(items: &[String]) -> Vec<u8> {
+    let mut text = items.join("\n");
+    text.push('\n');
+    text.into_bytes()
 }
 
 /// 把路径安全地放进远端 shell 的单引号里。
@@ -271,13 +290,16 @@ fn quoted(path: &str) -> String {
     format!("'{path}'")
 }
 
-fn list_local(root: &Path, dir: &str) -> Vec<String> {
+fn list_local(root: &Path, dir: &str) -> Vec<Entry> {
     let Ok(entries) = std::fs::read_dir(root.join(dir)) else {
         return Vec::new();
     };
     entries
         .flatten()
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .map(|entry| Entry {
+            is_dir: entry.path().is_dir(),
+            name: entry.file_name().to_string_lossy().into_owned(),
+        })
         .collect()
 }
 
@@ -286,6 +308,54 @@ fn lines_of(bytes: &[u8]) -> Vec<String> {
         .lines()
         .map(str::to_string)
         .collect()
+}
+
+/// 解析 `@@L <目录>` … `@@E` 分节组成的列目录响应。
+///
+/// 条目用 `ls -1p` 取，目录名带尾 `/`——这个标记必须保留，见 [`Entry::is_dir`]。
+fn parse_listing(out: &[u8]) -> BTreeMap<String, Vec<Entry>> {
+    let mut result: BTreeMap<String, Vec<Entry>> = BTreeMap::new();
+    let mut current: Option<String> = None;
+    for line in lines_of(out) {
+        if let Some(dir) = line.strip_prefix("@@L ") {
+            current = Some(dir.to_string());
+            result.entry(dir.to_string()).or_default();
+            continue;
+        }
+        if line == "@@E" {
+            current = None;
+            continue;
+        }
+        if let Some(dir) = &current {
+            let (name, is_dir) = match line.strip_suffix('/') {
+                Some(name) => (name.to_string(), true),
+                None => (line, false),
+            };
+            result.entry(dir.clone()).or_default().push(Entry { name, is_dir });
+        }
+    }
+    result
+}
+
+/// 解析 `@@K <路径>` 后面跟 `@@T <目标>` 或 `@@N` 的读软链响应。
+fn parse_links(out: &[u8]) -> BTreeMap<String, Option<String>> {
+    let mut result = BTreeMap::new();
+    let mut current: Option<String> = None;
+    for line in lines_of(out) {
+        if let Some(path) = line.strip_prefix("@@K ") {
+            current = Some(path.to_string());
+            result.insert(path.to_string(), None);
+            continue;
+        }
+        if let Some(target) = line.strip_prefix("@@T ") {
+            if let Some(path) = current.take() {
+                result.insert(path, Some(target.to_string()));
+            }
+        } else if line == "@@N" {
+            current = None;
+        }
+    }
+    result
 }
 
 /// 解析 `@@F <字节数> <路径>` / `@@D <路径>` / `@@M <路径>` 的批量响应。
@@ -374,28 +444,90 @@ mod tests {
     }
 
     #[test]
-    fn local_source_reads_files_links_and_absence() {
+    fn listing_markers_label_directories() {
+        // `ls -1p` 给目录加尾 `/`；这个标记决定哪些名字能当库文件用
+        let out = b"@@L usr/lib\naarch64-linux-gnu/\nlibz.so.1\n@@E\n@@L absent\n@@E\n";
+        let listing = parse_listing(out);
+        assert_eq!(
+            listing["usr/lib"],
+            vec![
+                Entry {
+                    name: "aarch64-linux-gnu".into(),
+                    is_dir: true
+                },
+                Entry {
+                    name: "libz.so.1".into(),
+                    is_dir: false
+                },
+            ]
+        );
+        assert!(listing["absent"].is_empty());
+    }
+
+    #[test]
+    fn link_markers_separate_targets_from_absence() {
+        let out = b"@@K a/driver\n@@T ../../../bus/platform/drivers/panthor\n@@K a/notalink\n@@N\n";
+        let links = parse_links(out);
+        assert_eq!(
+            links["a/driver"].as_deref(),
+            Some("../../../bus/platform/drivers/panthor")
+        );
+        assert_eq!(links["a/notalink"], None);
+    }
+
+    #[test]
+    fn local_listing_marks_directories_and_absent_dirs() {
         let root = std::env::temp_dir().join(format!("deviceinfo-src-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(root.join("d/sub")).unwrap();
+        std::fs::write(root.join("d/plain"), b"x").unwrap();
+
+        let source = Source::local(&root);
+        let dirs = vec!["d".to_string(), "d/absent".to_string()];
+        let listing = source.list_many(&dirs);
+
+        let mut names: Vec<(String, bool)> = listing["d"]
+            .iter()
+            .map(|entry| (entry.name.clone(), entry.is_dir))
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![("plain".to_string(), false), ("sub".to_string(), true)]
+        );
+        assert!(listing["d/absent"].is_empty());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn local_source_reads_links_and_files_and_absence() {
+        let root = std::env::temp_dir().join(format!("deviceinfo-src2-{}", std::process::id()));
         std::fs::remove_dir_all(&root).ok();
         std::fs::create_dir_all(root.join("d/inner")).unwrap();
         std::fs::write(root.join("d/one.txt"), b"hello").unwrap();
-        std::fs::create_dir_all(root.join("d/other")).unwrap();
         std::os::unix::fs::symlink("inner", root.join("d/link")).unwrap();
 
         let source = Source::local(&root);
         assert_eq!(source.read("d/one.txt").as_deref(), Some(&b"hello"[..]));
         assert_eq!(source.kind("d/one.txt"), EntryKind::File);
-        assert_eq!(source.kind("d/other"), EntryKind::Other, "目录不是普通文件");
+        assert_eq!(source.kind("d/inner"), EntryKind::Other, "目录不是普通文件");
         assert_eq!(source.kind("d/nope"), EntryKind::Missing);
-        assert_eq!(source.read_link("d/link").as_deref(), Some("inner"));
         assert_eq!(source.read("d/nope"), None);
 
-        let mut listed = source.list("d");
-        listed.sort();
-        assert_eq!(listed, vec!["inner", "link", "one.txt", "other"]);
-        assert!(source.list("d/absent").is_empty());
+        let links = source.link_many(&["d/link".to_string(), "d/one.txt".to_string()]);
+        assert_eq!(links["d/link"].as_deref(), Some("inner"));
+        assert_eq!(links["d/one.txt"], None, "普通文件不是软链");
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn stdin_input_always_ends_with_a_newline() {
+        // 少了这个换行，远端 `while read` 会把最后一行丢掉
+        assert_eq!(stdin_lines(&["a".into(), "b".into()]), b"a\nb\n");
+        assert_eq!(stdin_lines(&["only".into()]), b"only\n");
+        assert_eq!(stdin_lines(&[]), b"\n");
     }
 
     #[test]

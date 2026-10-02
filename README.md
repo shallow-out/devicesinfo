@@ -115,8 +115,16 @@ git add fixtures/<名字>
 读成空字符串，报告里就冒出 `GPU (card0, id )` 和 `(:)` 这种垃圾。
 
 性能：单次 ssh 往返在同一局域网实测 **770ms**（握手 + 认证 + 远端起 shell），
-而一次采集有二十来次往返，所以默认开了连接复用（`ControlMaster`）。
-即使如此，`o6n` 那台仍要 4s——进一步的办法是把多次 `ls` 合并成一次往返。
+而一次采集有二十来次往返。两步优化之后 `o6n` 那台从 **18s → 2.2s**：
+
+1. **连接复用**（`ControlMaster`）：18s → 4.1s
+2. **把列目录 / 读软链 / 读内容各自合并成一次往返**：4.1s → 2.2s
+
+还剩的固定开销是"每个阶段一次往返"（四个阶段）加上第一次握手，已经接近下限了。
+
+**采集期间踩过的第三个坑**：喂给远端 `while read` 的清单**末尾必须有换行**。
+`read` 遇到 EOF 且没有换行时返回非零，`while` 的循环体就不执行——**最后一行被静默丢掉**。
+现象是"每台机器最后一个 DRM 设备的 `drm/` 目录列表凭空消失"，只是夹具里少一个条目。
 
 采集是幂等的（`/proc` 里的瞬时字段会被剔掉；只被状态采样读的瞬时值文件——
 `npu_busy_time_us`、`*_cur_freq`、`npu_memory_utilization`——读数归一化成 `0`，
@@ -156,8 +164,16 @@ git add fixtures/<名字>
 - **`renderD*` 的归属由 `<device 目录>/drm/` 给出**，不按下标猜。实测那台 ARM 机器上
   `renderD128` 属于 card0，而"第 N 个 render 配第 N 个 card"把它给了 card1。
   也刻意不解 `sys/class/drm/renderD*` 的软链：软链存不进夹具。
-- **没有 render 节点 = 可能只做显示输出**，会写进 `notes`。DRM 的 render 节点就是给
-  渲染/计算用的，缺它基本只能接显示器。
+- **有没有 render 节点决定它是 GPU 还是只会显示。** DRM 的 render 节点就是给渲染/计算
+  用的（`DRIVER_RENDER`），纯显示控制器拿不到——这是**结构性判据，不需要任何驱动名
+  白名单**。实测 `linlondp`（3 个）和 `rockchip-drm` 都因此被正确归为
+  [`AcceleratorKind::Display`]，于是只有显示控制器的机器上 `has_gpu()` 是 `false`。
+  它们仍在 `accelerators` 里，因为"有几个 DRM 设备、分别是什么"是值得知道的事实，
+  只是不参与"能不能跑模型"的判断。`runtime` 对它们是 `NotApplicable`——
+  那是"知道不用找"，和 `Unknown`（"不知道该找什么"）分开。
+- **"没看到 render 节点"有两种原因，不能混。** `Some(0)` 是确实看到了那个目录、
+  里面没有（→ 显示设备）；`None` 是我们**没能看到目录**（老内核？）——那就什么都不改，
+  继续当 GPU 并注明。把后者也当显示设备，会在老内核上把真 GPU 静默降级。
 - **`compatible` 是非 PCI 平台上设备的权威标识。** ARM／嵌入式上既没有 PCI id，
   也没有 `cardN` 以外的名字——少了它，加速器只能叫 `GPU (card0, id 未知)`，信息量为零。
 - **arm64 的机器型号只能从设备树读**（`/sys/firmware/devicetree/base/model`）：
@@ -191,13 +207,17 @@ git add fixtures/<名字>
 - **`freq/set_min_freq` / `set_max_freq` 是**可写**的**：驱动允许配置 NPU 频率上下限，
   本模块只读不写——写属于调度策略，不该由探测库做。
 - **其它厂商的运行时判据**：目前只有 Intel NPU 和 Intel GPU 两套。
-- **显示控制器被归进了 `accelerators`**：`o6n` 上有 4 个 DRM card，其中 3 个是
-  `linlondp` 显示控制器（没有 render 节点）。它们现在被报成 GPU 并附一条提示，
-  但严格说它们**不是加速器**——`has_gpu()` 会因此返回 true。可选做法：加一个
-  `Display` 类别，或者把没有 render 节点的 card 从 `accelerators` 里挪出去
-  （那片信息就丢了）。
-- **`capture --ssh` 仍然慢**：即使开了连接复用，`o6n` 那台仍要 4s——每次调用都要在
-  远端起一个 shell（约 190ms）。把多次 `ls` 合并成一次往返还能再降一个数量级。
+- **`CpuInfo.model` 一个字段担了两种含义**：x86 上是**处理器**型号（cpuinfo 的
+  `model name`），ARM 上通常是**整机**型号（设备树 `model` 或 DMI `product_name`）——
+  因为平台只给得出后者。拆成 `cpu_model` + `machine_model` 更干净，但会动到字段。
+- **加速器的身份来源在三种平台上各不相同**：PCI id（x86）、设备树 `compatible`
+  （多数 ARM）、DMI（ACPI 启动的 ARM）。`o6n` 那台**整个 `/sys/firmware/devicetree`
+  都不存在**，所以它的加速器没有 `compatible`，名字只能退回 `GPU (card0)`。
+  加了 DMI 兜底之后**整机**型号能拿到，但**单个设备**的 DMI 信息是拿不到的——
+  那台机器上设备身份就到此为止。
+- **设备树/DMI 的型号兜底没有真机验证**：`machine_model` 的 DMI 分支目前没有一台
+  "既没设备树、cpuinfo 又不报型号"的机器可以验证（`o6n` 的 cpuinfo 里有
+  `model name`，所以走的是第一条路）。单元测试覆盖了，真机没验。
 - **`libc` 依赖**：只为了 `statvfs`（标准库至今没有 `std::fs::statfs`/`statvfs`）。
   全部 `unsafe` 只出现在 `state::filesystem_usage` 一处。
 

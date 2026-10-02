@@ -121,11 +121,21 @@ fn spec_for(kind: AcceleratorKind, vendor: Option<&str>) -> Option<&'static Stac
     }
 }
 
+/// 只做显示输出的设备不涉及推理运行时——这是**知道不用找**，不是"不知道"。
+fn not_applicable(kind: AcceleratorKind) -> Option<RuntimeStatus> {
+    (kind == AcceleratorKind::Display).then(|| RuntimeStatus::NotApplicable {
+        reason: "只能做显示输出，不涉及推理运行时".into(),
+    })
+}
+
 pub(crate) fn probe(
     kind: AcceleratorKind,
     vendor: Option<&str>,
     libraries: &LibraryIndex,
 ) -> RuntimeStatus {
+    if let Some(status) = not_applicable(kind) {
+        return status;
+    }
     let Some(spec) = spec_for(kind, vendor) else {
         return RuntimeStatus::Unknown {
             reason: match vendor {

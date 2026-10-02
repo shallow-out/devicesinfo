@@ -115,6 +115,7 @@ pub fn human(report: &HardwareReport) -> String {
                     RuntimeStatus::Incomplete { stack, missing } => {
                         format!("缺件 · {stack}：缺 {}", missing.join("、"))
                     }
+                    RuntimeStatus::NotApplicable { reason } => format!("不适用 · {reason}"),
                     RuntimeStatus::Unknown { reason } => format!("未知 · {reason}"),
                 }
             );
@@ -222,6 +223,7 @@ fn kind_label(kind: AcceleratorKind) -> &'static str {
         AcceleratorKind::Cpu => "CPU",
         AcceleratorKind::Gpu => "GPU",
         AcceleratorKind::Npu => "NPU",
+        AcceleratorKind::Display => "显示",
     }
 }
 

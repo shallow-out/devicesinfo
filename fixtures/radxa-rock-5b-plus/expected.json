@@ -66,21 +66,18 @@
       "notes": []
     },
     {
-      "kind": "gpu",
+      "kind": "display",
       "name": "rockchip,display-subsystem (card1)",
       "driver": "rockchip-drm",
       "compatible": "rockchip,display-subsystem",
       "memory": {
-        "kind": "unknown",
-        "reason": "厂商未识别，无法判断显存是独立还是共享"
+        "kind": "shared-with-system"
       },
       "runtime": {
-        "state": "unknown",
-        "reason": "厂商未识别，不知道该找哪些组件"
+        "state": "not-applicable",
+        "reason": "只能做显示输出，不涉及推理运行时"
       },
-      "notes": [
-        "没有 render 节点，可能只做显示输出，不能用于计算"
-      ]
+      "notes": []
     }
   ],
   "warnings": []
