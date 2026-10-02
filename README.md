@@ -79,8 +79,14 @@ let state = deviceinfo::sample_state(&[std::path::PathBuf::from("/var/cache")]);
 ## 真机夹具（`fixtures/`）
 
 `fixtures/` 下每一棵树都是一台**真实机器**的采样，配一份 `expected.json` 快照。
-目前三台：Intel Lunar Lake（x86 混合架构，有 NPU）、Rockchip RK3588S（ARM，RKNPU 走 DRM）、
-CIX CD8180（ARM，ACPI 启动无设备树，5 个 CPU 簇，panthor GPU + 3 个显示控制器）。
+目前四台：
+
+| 夹具 | 机器 | 补上了哪种形状 |
+|---|---|---|
+| `lunar-lake-ultra7-258v` | Intel Lunar Lake | x86 hybrid 4P+4E、NPU 走 `/dev/accel` + PCI class `0x1200`、xe 驱动 |
+| `r1-venus-i9-12900h` | Intel i9-12900H（Minisforum Venus） | **`cpu_capacity` 退化**（全 1024）→ 只能靠 `highest_perf`；**SMT**（20 线程 / 14 物理核）；**i915** 的频率路径 |
+| `radxa-orion-o6n` | CIX CD8180 | ARM **5 簇**、**ACPI 无设备树**（走 DMI）、panthor + 3 个显示控制器 |
+| `radxa-rock-5b-plus` | Rockchip RK3588S | ARM 4+4、**RKNPU 走 DRM**、有设备树、内核没绑 Mali |
 `cargo test` 会拿着夹具重跑一遍探测，结果和快照不一致就失败。
 
 这解决的是一个具体问题：**手写的假 features 列表抓不到真实内核里的意外。**
@@ -161,6 +167,19 @@ diff <(deviceinfo --json hardware) \
 - **`has_npu()` / `has_gpu()` 只回答"设备在不在"**，不回答"能不能用"。设备节点存在但
   用户态栈不全（比如插着 NPU 却没装编译器）时它们同样返回 `true`。要问"能不能真的用"，
   看 `accelerator.runtime`，或者用 `has_usable_npu()` / `has_usable_gpu()`。
+- **相对性能的来源有优先级：`acpi_cppc/highest_perf` → `cpu_capacity` → 频率。**
+  `cpu_capacity` 会在**整机全同**时退化：实测那台 i9-12900H（6 P + 8 E）上它是**全 1024**，
+  只看它会把 P/E 抹平成一档"20 核 @5.00 GHz"。`highest_perf` 是它的**源头**
+  （本机 56/55/37 ↔ 1024/1005/676 完全对应），归一化到 1024 后两边一致。
+  它的绝对值是平台相关的（56 / 64 / …），**只有同机内的比率有意义**。
+  两者都区分不了时才退到频率——频率不反映 P/E 的 IPC 差异。
+- **等效算力按物理核折算，不按逻辑核。** SMT 的两个线程不等于两个核：实测那台
+  i9-12900H 按逻辑核求和给 20.0，按物理核是 **10.7**（6 P + 8 E，E 核 ≈ 0.6 P）。
+  每档各有多少物理核记在 `CoreTier::physical_cores`，渲染成"4 物理核（8 线程）"。
+- **同一个驱动族的频率节点可能在两个不同层级。** xe 在 `<device>/tileN/gtN/freq0/`，
+  i915 在 **`<card>/gt_max_freq_mhz`、`<card>/gt/gt0/rps_max_freq_mhz`**（card 目录下，
+  不在 `<card>/device` 下）。写错层级不会报错，只会永远 `None`——前两台机器都没有 i915，
+  所以这个洞是在 `r1` 上才暴露的。
 - **`AcceleratorMemory` 是三态**，不是 `Option<u64>`：`Dedicated` 有确定容量，
   `SharedWithSystem` 是"和系统内存共享，没有独立上限"（集显、NPU），`Unknown` 是"读不到"
   并附原因。合成一个 `None` 会让上层只能猜，而两个方向猜错都是错的。
