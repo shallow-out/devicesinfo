@@ -15,8 +15,12 @@
    提供的稳定接口，x86 和 ARM 都有。
 2. **不猜。** 算不出来就留 `None`，并把原因写进 `warnings`。"不知道"必须显式可见，
    而不是伪装成一个具体的数字。
-3. **不列白名单。** 指令集特征按族匹配——漏项是静默的，报告看起来正常，只是少了一行
-   （`avx_vnni` 就是这样被漏掉过，见下面「真机夹具」）。
+3. **不在数据层做筛选。** 指令集特征**原样上报内核给出的全部项**。早先按前缀挑
+   "与推理相关"的，两个方向都被打脸：x86 的 `smep`（内核安全特性）撞上 `sme` 前缀混了
+   进来；arm64 我以为叫 `dotprod` 的东西内核实际报 `asimddp`，于是列表里躺着一个永远
+   匹配不到的死项。更根本的是**筛选在架构上就是错的**——消费方问的是开放式问题
+   （"有没有 AMX"、"有没有 SVE2"、"有没有 FP8"），生产者一旦筛掉，信息就永久丢失，
+   而且丢失是无声的。好看不好看交给显示层（`render`）。
 
 ## 硬件 vs 运行时状态
 
@@ -68,17 +72,18 @@ let state = deviceinfo::sample_state(&[std::path::PathBuf::from("/var/cache")]);
 | `runtime` | 用户态加速栈是否齐备（设备在 ≠ 能用） |
 | `pci` | `8086:64a0` ↔ 人名（解析 `pci.ids`，不调 `lspci`） |
 | `render` | 给人看的文本渲染（CLI 与 GUI 共用一份） |
-| `sysfs` / `features` | 内部工具：按 root 前缀读文件、指令集特征族匹配 |
+| `sysfs` / `features` | 内部工具：按 root 前缀读文件、解析 cpuinfo 的特征行 |
 
 ## 真机夹具（`fixtures/`）
 
 `fixtures/` 下每一棵树都是一台**真实机器**的采样，配一份 `expected.json` 快照。
 `cargo test` 会拿着夹具重跑一遍探测，结果和快照不一致就失败。
 
-这解决的是一个具体问题：**手写的假 flags 列表抓不到真实内核里的意外。**
-`smep`（Supervisor Mode Execution Prevention，内核安全特性，不是指令集）
-曾经因为 `sme` 前缀被匹配进 SIMD 列表——写测试的时候根本不知道会有那个 flag。
-真机采样里那 146 个 flag 全都躺着，下次再引入同类的假阳性会立刻红。
+这解决的是一个具体问题：**手写的假 features 列表抓不到真实内核里的意外。**
+`smep`（Supervisor Mode Execution Prevention，内核安全特性，不是指令集）曾经因为
+`sme` 前缀被当成加速指令集列入报告；arm64 那边的 `dotprod` 则是个永远匹配不到的死项。
+两个都是手写列表造成的，两个都是夹具（或查内核源码）才发现的。真机采样里那 146 个
+x86 flag / 108 个 arm64 feature 全都躺着，下次再引入同类偏差会立刻红。
 
 加一台机器：
 
@@ -118,6 +123,20 @@ git add fixtures/<名字>
 - **频率 `Some(0)` 的含义是"设备空闲"**，不是"读不到"。ivpu 驱动文档：`freq/current_freq`
   "Valid only when the device is active; returns 0 when idle"。渲染成 `空闲` 而不是
   `0 MHz`——后者会让人以为读数坏了。读不到才是 `None`。
+- **一个 DRM `cardN` 未必是 GPU。** Rockchip 的 RKNPU 走 DRM 暴露（这个内核不用
+  `/dev/accel`），实测它出现在 `/sys/class/drm/card0`。一律当 GPU 的后果很重：
+  一台**确实有 NPU** 的机器上 `has_npu()` 返回 `false`，上层再也不会考虑 NPU 卸载，
+  而且没有任何报错。判据来自驱动名 / 设备树 `compatible`。
+- **`renderD*` 的归属由 `<device 目录>/drm/` 给出**，不按下标猜。实测那台 ARM 机器上
+  `renderD128` 属于 card0，而"第 N 个 render 配第 N 个 card"把它给了 card1。
+  也刻意不解 `sys/class/drm/renderD*` 的软链：软链存不进夹具。
+- **没有 render 节点 = 可能只做显示输出**，会写进 `notes`。DRM 的 render 节点就是给
+  渲染/计算用的，缺它基本只能接显示器。
+- **`compatible` 是非 PCI 平台上设备的权威标识。** ARM／嵌入式上既没有 PCI id，
+  也没有 `cardN` 以外的名字——少了它，加速器只能叫 `GPU (card0, id 未知)`，信息量为零。
+- **arm64 的机器型号只能从设备树读**（`/sys/firmware/devicetree/base/model`）：
+  `/proc/cpuinfo` 在 arm64 上**不报型号**，一行都没有。设备树属性是 NUL 结尾、
+  可能是 NUL 分隔的多个值，`trim()` 去不掉。
 - **`npu_memory_utilization` 的单位是字节**（驱动文档原话：*report in bytes a current NPU
   memory utilization*），即当前常驻的 NPU 内存总量。之前因为单位不明而不敢收，现在确定。
 - **累积计数器默认不读**（`SampleOptions::counters`）。驱动文档：
@@ -136,13 +155,21 @@ git add fixtures/<名字>
   暴露该节点），但**没有 Intel 独显可以验证**。
 - **`sched_mode` 未收**：驱动文档已经说明它是 `HW` / `OS` 调度模式（属于**硬件事实**，
   不是瞬时值），但当前判断它对"能不能跑 / 跑多快"没有直接影响，所以没进报告。
+- **DRM 上的 NPU 靠名字识别**：`classify_drm_device` 用驱动名 / `compatible` 里是否含
+  `npu`，再加一张极短的表（目前只有 `rknpu`）。DRM 层面 NPU 和 GPU 长得一样，
+  没有结构性判据；认不出来就保守地当 GPU 并在 `notes` 里说明。
+- **ARM 上加速器的运行时判据仍然缺失**：`runtime::spec_for` 只有 Intel 的两套，
+  所以那台 Rockchip 机器上 NPU 报"运行时 未知"。这是诚实的——没有验证过的栈就不编判据。
 - **NPU 的其它频率档位未收**：`freq/hw_min_freq`（650）、`freq/hw_efficient_freq`（950）
   是驱动暴露的硬件事实，对能效调度有用，暂未收。
 - **`freq/set_min_freq` / `set_max_freq` 是**可写**的**：驱动允许配置 NPU 频率上下限，
   本模块只读不写——写属于调度策略，不该由探测库做。
 - **其它厂商的运行时判据**：目前只有 Intel NPU 和 Intel GPU 两套。
-- **ARM64 真机夹具**：采集机制有了，但还没从 ARM 机器上采过——`fixtures/` 里目前
-  只有一台 x86 混合架构机器。
+- **ARM64 真机夹具**：已采集（`fixtures/radxa-rock-5b-plus/`，Rockchip RK3588S，
+  big.LITTLE 4+4，RKNPU 走 DRM）。但采集是**手工跑脚本**做的——本机 Rust 是 pacman 装的
+  （只有 host target，无 rustup），**无法交叉编译 aarch64**，目标机上也没有工具链。
+  OpenWrt 上这个问题更严重。应考虑让 `capture` 直接读远端（一个 `--ssh <target>` 的
+  文件来源抽象），而不是要求目标机能跑二进制。
 - **`libc` 依赖**：只为了 `statvfs`（标准库至今没有 `std::fs::statfs`/`statvfs`）。
   全部 `unsafe` 只出现在 `state::filesystem_usage` 一处。
 

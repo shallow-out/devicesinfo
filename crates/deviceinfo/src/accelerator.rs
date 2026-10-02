@@ -8,10 +8,11 @@
 
 use crate::pci;
 use crate::report::{
-    Accelerator, AcceleratorKind, AcceleratorMemory, PciId, RuntimeStatus,
+    Accelerator, AcceleratorKind, AcceleratorMemory, PciId,
 };
 use crate::runtime::{self, LibraryIndex};
-use crate::sysfs::{read_trimmed, read_u64};
+use crate::sysfs::{read_dt_property, read_trimmed, read_u64};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -31,7 +32,10 @@ fn vendor_name(vendor_id: &str) -> String {
 ///
 /// 读软链而不是读 `uevent` 的 `DRIVER=`：前者在设备未绑定驱动时直接不存在，
 /// 后者可能残留旧值。
-fn driver_of(device_dir: &Path) -> Option<String> {
+///
+/// `pub(crate)`：状态采样要用它和 [`classify_drm_device`] 得到**同样的**类别，
+/// 否则两边报告的第 N 项会对不上。
+pub(crate) fn driver_of(device_dir: &Path) -> Option<String> {
     let link = fs::read_link(device_dir.join("driver")).ok()?;
     link.file_name().map(|s| s.to_string_lossy().into_owned())
 }
@@ -164,6 +168,62 @@ fn sorted_entries(dir: &Path, keep: impl Fn(&str) -> bool) -> Vec<(String, PathB
     found
 }
 
+/// 设备树 `compatible`：非 PCI 平台上设备的权威标识。
+///
+/// `pub(crate)`：理由同 [`driver_of`]。
+pub(crate) fn read_compatible(device_dir: &Path) -> Option<String> {
+    read_dt_property(&device_dir.join("of_node/compatible"))
+}
+
+/// 已知走 DRM 而不是 `/dev/accel` 暴露的 NPU 驱动。
+///
+/// 这是个**有界白名单**，和别处"不列白名单"的原则相反——因为这里没有结构性的替代
+/// 信号：在 DRM 层面 NPU 和 GPU 长得一模一样。好在绝大多数这类命名里就带 `npu`
+/// （`RKNPU`、`rockchip,rk3588-rknpu`），子串匹配就能盖住，这张表只做补充。
+const DRM_NPU_DRIVERS: [&str; 1] = ["rknpu"];
+
+/// 判断一个 DRM 设备是 NPU 还是 GPU。
+///
+/// **不能一律当 GPU。** Rockchip 的 RKNPU 走 DRM 暴露，于是一台**确实有 NPU**
+/// 的机器上，`has_npu()` 会返回 `false`——上层再也不会考虑 NPU 卸载，而且没有任何报错。
+/// 实测那台机器上它出现在 `/sys/class/drm/card0`，驱动 `RKNPU`，
+/// compatible `rockchip,rk3588-rknpu`。
+///
+/// `pub(crate)`：状态采样必须用**同一套**判据，否则两份报告里第 N 个设备不是同一个
+/// （这个分歧真的发生过，被 `state_and_hardware_agree_on_which_devices_exist` 抓到）。
+pub(crate) fn classify_drm_device(driver: Option<&str>, compatible: Option<&str>) -> AcceleratorKind {
+    let identity = format!(
+        "{} {}",
+        driver.unwrap_or_default(),
+        compatible.unwrap_or_default()
+    )
+    .to_ascii_lowercase();
+    if identity.contains("npu") || DRM_NPU_DRIVERS.iter().any(|name| identity.contains(name)) {
+        return AcceleratorKind::Npu;
+    }
+    AcceleratorKind::Gpu
+}
+
+/// 一台 DRM 设备**自己**的 render 节点名（`renderD128` 这类）。
+///
+/// `<device_dir>/drm/` 列的就是该设备自己的 `cardN` / `renderD*` / `controlD*` 条目，
+/// 这是 sysfs 里唯一**直接**给出归属关系的地方。旧代码按"第 N 个 render 节点配
+/// 第 N 个 card"配对，实测那台 ARM 机器上 renderD128 属于 card0，
+/// 而配对给了 card1——就算排序之后碰巧对了，规则本身也不成立。
+///
+/// 也刻意不去解 `sys/class/drm/renderD*` 的软链：软链在夹具里存不下来。
+fn render_nodes_of(device_dir: &Path) -> Vec<String> {
+    let mut found: Vec<String> = fs::read_dir(device_dir.join("drm"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name.starts_with("renderD"))
+        .collect();
+    found.sort();
+    found
+}
+
 /// NPU：现代内核把 NPU 暴露在 `/dev/accel/accelN`。
 pub(crate) fn probe_npus(
     root: &Path,
@@ -195,6 +255,8 @@ pub(crate) fn probe_npus(
             driver,
             vendor,
             pci_id,
+            // Intel 的 NPU 不在设备树上
+            compatible: read_compatible(&device_dir),
             // NPU 没有独立显存：权重和中间张量都在系统内存里。
             memory: AcceleratorMemory::SharedWithSystem,
             // `npu_max_frequency_mhz` 是 Legacy alias（驱动文档原话），先读 freq/hw_max_freq
@@ -233,13 +295,25 @@ pub(crate) fn probe_gpus(
         let vendor = read_trimmed(&device_dir.join("vendor")).map(|v| vendor_name(&v));
         let driver = driver_of(&device_dir);
         let pci_id = read_pci_id(&device_dir);
+        let compatible = read_compatible(&device_dir);
         let raw_id = read_trimmed(&device_dir.join("device")).unwrap_or_else(|| "未知".into());
-        let runtime = runtime::probe(AcceleratorKind::Gpu, vendor.as_deref(), libraries);
-        let name = name_from_pci(root, &vendor, &pci_id, || match &vendor {
-            Some(vendor) => format!("{vendor} GPU ({node}, id {raw_id})"),
-            None => format!("GPU ({node}, id {raw_id})"),
+
+        // 一个 DRM card 未必是 GPU：见 classify_drm_device
+        let kind = classify_drm_device(driver.as_deref(), compatible.as_deref());
+        let runtime = runtime::probe(kind, vendor.as_deref(), libraries);
+        let name = name_from_pci(root, &vendor, &pci_id, || match (&compatible, &vendor) {
+            // 非 PCI 平台：设备树 compatible 是唯一有信息量的标识
+            (Some(compatible), _) => format!("{compatible} ({node})"),
+            (None, Some(vendor)) => format!(
+                "{vendor} {} ({node}, id {raw_id})",
+                kind_label_for_name(kind)
+            ),
+            (None, None) => format!("{} ({node})", kind_label_for_name(kind)),
         });
-        let driver_version = driver_version_of(root, driver.as_deref());
+
+        let nodes = render_nodes_of(&device_dir);
+        let device_path = nodes.first().map(|name| root.join("dev/dri").join(name));
+        // 字面量里字段是按书写顺序求值的：先把借 vendor 的算完再 move 它
         let memory = gpu_memory(&device_dir, vendor.as_deref());
         let max_freq_mhz = gpu_max_freq_mhz(&device_dir);
 
@@ -247,14 +321,24 @@ pub(crate) fn probe_gpus(
         if driver.is_none() {
             notes.push("未绑定内核驱动，硬件加速不可用".into());
         }
+        if nodes.is_empty() {
+            // DRM 的 render 节点就是给渲染/计算用的；没有它基本只做显示输出
+            notes.push("没有 render 节点，可能只做显示输出，不能用于计算".into());
+        } else if let Some(path) = &device_path {
+            if !path.exists() {
+                notes.push(format!("{} 不存在", path.display()));
+            }
+        }
+
         found.push(Accelerator {
-            kind: AcceleratorKind::Gpu,
+            kind,
             name,
-            device_path: None,
-            driver_version,
+            device_path,
+            driver_version: driver_version_of(root, driver.as_deref()),
             driver,
             vendor,
             pci_id,
+            compatible,
             memory,
             max_freq_mhz,
             runtime,
@@ -262,50 +346,37 @@ pub(crate) fn probe_gpus(
         });
     }
 
-    // 把 /dev/dri/renderD* 关联到 cardN。
-    //
-    // 这里**只按顺序对应**，因为 sysfs 没有直接给出两者关系——但顺序现在至少是确定的
-    // （上面已按名字排序）。更可靠的做法是解 `renderD*` 软链的真实设备路径再比对，
-    // 见 README 的“已知未做”。
-    let mut render_nodes: Vec<PathBuf> = sorted_entries(&root.join("dev/dri"), |name| {
+    // 有 render 节点没被任何 card 认领：说明发现了不认识的东西，值得出声
+    let claimed: BTreeSet<String> = found
+        .iter()
+        .filter_map(|accel| Some(accel.device_path.as_ref()?.file_name()?.to_str()?.to_string()))
+        .collect();
+    let unclaimed: Vec<String> = sorted_entries(&root.join("dev/dri"), |name| {
         name.starts_with("renderD")
     })
     .into_iter()
-    .map(|(_, path)| path)
+    .map(|(name, _)| name)
+    .filter(|name| !claimed.contains(name))
     .collect();
-    render_nodes.sort();
-    for (index, node) in render_nodes.iter().enumerate() {
-        match found.get_mut(index) {
-            Some(gpu) => {
-                gpu.device_path = Some(node.clone());
-                if !node.exists() {
-                    gpu.notes.push(format!("{} 不存在", node.display()));
-                }
-            }
-            None => found.push(Accelerator {
-                kind: AcceleratorKind::Gpu,
-                name: format!("GPU ({})", node.display()),
-                device_path: Some(node.clone()),
-                driver: None,
-                driver_version: None,
-                vendor: None,
-                pci_id: None,
-                memory: AcceleratorMemory::Unknown {
-                    reason: "sysfs 中没有对应的 cardN，无从判断显存".into(),
-                },
-                max_freq_mhz: None,
-                runtime: RuntimeStatus::Unknown {
-                    reason: "sysfs 中没有对应的 cardN，认不出是什么设备".into(),
-                },
-                notes: vec!["sysfs 中没有对应的 cardN，信息不完整".into()],
-            }),
-        }
+    if !unclaimed.is_empty() {
+        warnings.push(format!(
+            "{} 没有被任何 DRM 设备认领",
+            unclaimed.join("、")
+        ));
     }
 
     if found.is_empty() && drm.exists() {
         warnings.push("存在 /sys/class/drm 但没有可用 GPU 条目".into());
     }
     found
+}
+
+/// 给名字用的类别标签（NPU / GPU）。
+fn kind_label_for_name(kind: AcceleratorKind) -> &'static str {
+    match kind {
+        AcceleratorKind::Npu => "NPU",
+        _ => "GPU",
+    }
 }
 
 #[cfg(test)]
@@ -375,6 +446,10 @@ mod tests {
         fs::write(gpu_device.join("tile0/gt0/freq0/max_freq"), "1950\n").unwrap();
         fs::create_dir_all(root.join("dev/dri")).unwrap();
         fs::write(root.join("dev/dri/renderD128"), "").unwrap();
+        // render 节点的**归属**由 `<device>/drm/` 给出，不靠下标猜。
+        // 夹具里少了这一项就会得到"renderD128 没有被任何 DRM 设备认领"——
+        // 这正是那个警告存在的意义。
+        fs::create_dir_all(gpu_device.join("drm/renderD128")).unwrap();
 
         let report = crate::probe_with(&root, "x86_64");
         assert!(report.warnings.is_empty(), "{:?}", report.warnings);
@@ -431,7 +506,7 @@ mod tests {
         assert_eq!(npus[0].vendor.as_deref(), Some("Intel"));
         // ……但"能用"是另一回事
         match &npus[0].runtime {
-            RuntimeStatus::Incomplete { missing, .. } => assert_eq!(missing.len(), 3, "{missing:?}"),
+            crate::RuntimeStatus::Incomplete { missing, .. } => assert_eq!(missing.len(), 3, "{missing:?}"),
             other => panic!("应当是 Incomplete: {other:#?}"),
         }
         assert!(warnings.is_empty(), "{warnings:?}");
@@ -525,6 +600,81 @@ mod tests {
         assert_eq!(driver_version_of(&root, Some("xe")), None);
         // 连驱动名都没有
         assert_eq!(driver_version_of(&root, None), None);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Rockchip 的 RKNPU 走 **DRM** 而不是 `/dev/accel` 暴露。
+    /// 一台**确实有 NPU** 的机器上 `has_npu()` 不能返回 false——
+    /// 那会让上层再也不会考虑 NPU 卸载，而且没有任何报错。
+    #[test]
+    fn a_drm_card_whose_identity_says_npu_is_an_npu_not_a_gpu() {
+        let root = fake_root("rknpu");
+        let device = root.join("sys/class/drm/card0/device");
+        fs::create_dir_all(device.join("of_node")).unwrap();
+        // 设备树属性是 NUL 结尾的
+        fs::write(device.join("of_node/compatible"), b"rockchip,rk3588-rknpu\0").unwrap();
+        fs::create_dir_all(device.join("drm/renderD128")).unwrap();
+        fs::create_dir_all(root.join("dev/dri")).unwrap();
+        fs::write(root.join("dev/dri/renderD128"), "").unwrap();
+
+        let mut warnings = Vec::new();
+        let found = probe_gpus(&root, &empty_libraries(&root), &mut warnings);
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].kind,
+            AcceleratorKind::Npu,
+            "驱动/compatible 说是 NPU 就不能当 GPU"
+        );
+        assert_eq!(found[0].compatible.as_deref(), Some("rockchip,rk3588-rknpu"));
+        assert_eq!(found[0].name, "rockchip,rk3588-rknpu (card0)");
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// render 节点的归属由 `<device>/drm/` 给出，不按顺序猜。
+    /// 实测那台 ARM 机器上 `renderD128` 属于 card0，而旧的"按下标配对"给了 card1。
+    #[test]
+    fn render_nodes_belong_to_the_device_that_lists_them() {
+        let root = fake_root("render-owner");
+        // card0 有自己的 render 节点，card1 只有 control 节点
+        fs::create_dir_all(root.join("sys/class/drm/card0/device/drm/renderD128")).unwrap();
+        fs::create_dir_all(root.join("sys/class/drm/card1/device/drm/controlD65")).unwrap();
+        fs::create_dir_all(root.join("dev/dri")).unwrap();
+        fs::write(root.join("dev/dri/renderD128"), "").unwrap();
+
+        let mut warnings = Vec::new();
+        let found = probe_gpus(&root, &empty_libraries(&root), &mut warnings);
+        let card0 = found.iter().find(|a| a.name == "GPU (card0)").unwrap();
+        let card1 = found.iter().find(|a| a.name == "GPU (card1)").unwrap();
+        assert_eq!(
+            card0.device_path.as_deref(),
+            Some(root.join("dev/dri/renderD128").as_path())
+        );
+        assert!(card1.device_path.is_none(), "card1 没有 render 节点");
+        assert!(
+            card1.notes.iter().any(|note| note.contains("render 节点")),
+            "没有 render 节点这件事得说出来: {:#?}",
+            card1.notes
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// 有 render 节点没被任何 card 认领——说明遇到了不认识的东西，不能默默丢掉。
+    #[test]
+    fn an_unclaimed_render_node_is_a_warning() {
+        let root = fake_root("orphan-render");
+        fs::create_dir_all(root.join("dev/dri")).unwrap();
+        fs::write(root.join("dev/dri/renderD128"), "").unwrap();
+
+        let mut warnings = Vec::new();
+        let found = probe_gpus(&root, &empty_libraries(&root), &mut warnings);
+        assert!(found.is_empty());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("renderD128"), "{warnings:?}");
+
         fs::remove_dir_all(&root).ok();
     }
 

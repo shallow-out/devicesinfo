@@ -1,6 +1,7 @@
 {
   "cpu": {
     "arch": "aarch64",
+    "model": "Radxa ROCK 5B+",
     "logical_cores": 8,
     "physical_cores": 8,
     "core_tiers": [
@@ -25,14 +26,21 @@
         "capacity": 397
       }
     ],
-    "simd": [
+    "features": [
       "aes",
       "asimd",
       "asimddp",
       "asimdhp",
       "asimdrdm",
+      "atomics",
+      "cpuid",
       "crc32",
+      "dcpop",
+      "evtstrm",
+      "fp",
       "fphp",
+      "lrcpc",
+      "pmull",
       "sha1",
       "sha2"
     ]
@@ -42,10 +50,11 @@
   },
   "accelerators": [
     {
-      "kind": "gpu",
-      "name": "GPU (card0, id 未知)",
+      "kind": "npu",
+      "name": "rockchip,rk3588-rknpu (card0)",
       "device_path": "/dev/dri/renderD128",
       "driver": "RKNPU",
+      "compatible": "rockchip,rk3588-rknpu",
       "memory": {
         "kind": "unknown",
         "reason": "厂商未识别，无法判断显存是独立还是共享"
@@ -58,8 +67,9 @@
     },
     {
       "kind": "gpu",
-      "name": "GPU (card1, id 未知)",
+      "name": "rockchip,display-subsystem (card1)",
       "driver": "rockchip-drm",
+      "compatible": "rockchip,display-subsystem",
       "memory": {
         "kind": "unknown",
         "reason": "厂商未识别，无法判断显存是独立还是共享"
@@ -68,7 +78,9 @@
         "state": "unknown",
         "reason": "厂商未识别，不知道该找哪些组件"
       },
-      "notes": []
+      "notes": [
+        "没有 render 节点，可能只做显示输出，不能用于计算"
+      ]
     }
   ],
   "warnings": []

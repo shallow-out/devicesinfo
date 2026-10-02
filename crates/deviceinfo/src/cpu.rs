@@ -3,9 +3,9 @@
 //! 这一块是整份报告里最容易出错的部分，因为"核数"这个看起来最简单的数字
 //! 在混合架构上根本回答不了"这台机器有多快"。
 
-use crate::features::is_relevant_feature;
+use crate::features;
 use crate::report::{CoreTier, CpuInfo};
-use crate::sysfs::{field, read_trimmed, read_u64};
+use crate::sysfs::{field, read_dt_property, read_trimmed, read_u64};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
@@ -32,31 +32,19 @@ pub(crate) fn probe(root: &Path, arch: &str, warnings: &mut Vec<String>) -> CpuI
         warnings.push("没有 sysfs CPU 拓扑（sys/devices/system/cpu），核分组与物理核数不可用".into());
     }
 
-    // x86 用 "model name"，arm64 用 "Processor" 或 "Hardware"，树莓派这类还可能是 "Model"。
-    let model = cpuinfo.as_deref().and_then(|text| {
-        ["model name", "Model", "Hardware", "Processor"]
-            .iter()
-            .find_map(|key| field(text, key))
-            .map(str::to_string)
-    });
-
-    // 不列白名单：漏项是静默的（`avx_vnni` 就是这么被漏掉的）
-    let simd = cpuinfo
+    // x86 用 "model name"；arm64 的 `/proc/cpuinfo` **根本不报型号**，
+    // 那边型号在设备树里（见 `devicetree_model`）。
+    let model = cpuinfo
         .as_deref()
-        .and_then(|text| field(text, "flags").or_else(|| field(text, "Features")))
-        .map(|features| {
-            let mut found: Vec<String> = features
-                .split_whitespace()
-                .filter(|feature| is_relevant_feature(feature))
+        .and_then(|text| {
+            ["model name", "Model", "Hardware", "Processor"]
+                .iter()
+                .find_map(|key| field(text, key))
                 .map(str::to_string)
-                .collect();
-            // 排序而不是保留 cpuinfo 顺序：内核那个顺序没有语义，
-            // 输出稳定才能拿两台机器的报告直接 diff
-            found.sort();
-            found.dedup();
-            found
         })
-        .unwrap_or_default();
+        .or_else(|| devicetree_model(root));
+
+    let simd = cpuinfo.as_deref().map(features::parse).unwrap_or_default();
 
     CpuInfo {
         arch: arch.to_string(),
@@ -64,8 +52,17 @@ pub(crate) fn probe(root: &Path, arch: &str, warnings: &mut Vec<String>) -> CpuI
         logical_cores,
         physical_cores: probe_physical_cores(root, &cpu_ids, cpuinfo.as_deref(), logical_cores),
         core_tiers: probe_core_tiers(root, &cpu_ids, logical_cores, warnings),
-        simd,
+        features: simd,
     }
+}
+
+/// 从设备树读机器型号。
+///
+/// **这是 arm64 上唯一的型号来源。** `/proc/cpuinfo` 在 arm64 上只有
+/// `processor` / `BogoMIPS` / `Features` / `CPU implementer` / `CPU part`，
+/// 一行型号都没有——少了这一步，每一台 ARM 机器都会显示"未知 CPU"。
+fn devicetree_model(root: &Path) -> Option<String> {
+    read_dt_property(&root.join("sys/firmware/devicetree/base/model"))
 }
 
 /// cpuinfo 里 `processor` 行的条数。
@@ -364,8 +361,9 @@ mod tests {
             "等效核数应为 6.60，实际 {effective}"
         );
 
-        assert!(reported.simd.contains(&"avx_vnni".to_string()));
-        assert!(!reported.simd.iter().any(|f| f == "tpr_shadow"));
+        // 原样上报：像 avx_vnni 这样“相关”的和 tpr_shadow 这样“无关”的都在里面
+        assert!(reported.features.contains(&"avx_vnni".to_string()));
+        assert!(reported.features.contains(&"tpr_shadow".to_string()));
         assert!(warnings.is_empty(), "{warnings:?}");
 
         fs::remove_dir_all(&root).ok();
@@ -410,7 +408,7 @@ mod tests {
         fake_meminfo(&root);
         let mut cpuinfo = String::from(
             "processor\t: 0\nBogoMIPS\t: 38.40\nCPU implementer\t: 0x41\nCPU part\t: 0xd0b\n\
-             Features\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 cpuid dotprod i8mm sve2\n\n",
+             Features\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 cpuid asimddp i8mm sve2\n\n",
         );
         for cpu in 1..8 {
             cpuinfo.push_str(&format!("processor\t: {cpu}\nBogoMIPS\t: 38.40\n\n"));
@@ -438,14 +436,16 @@ mod tests {
         // 同构 ARM：等效核数就等于核数
         assert_eq!(reported.effective_cores(), Some(8.0));
         assert_eq!(reported.core_tiers.len(), 1);
-        for feature in ["asimd", "dotprod", "i8mm", "sve2", "sha2", "crc32", "aes"] {
+        for feature in ["asimd", "asimddp", "i8mm", "sve2", "sha2", "crc32", "aes"] {
             assert!(
-                reported.simd.contains(&feature.to_string()),
+                reported.features.contains(&feature.to_string()),
                 "漏了 {feature}: {:?}",
-                reported.simd
+                reported.features
             );
         }
-        assert!(!reported.simd.iter().any(|f| f == "fp" || f == "evtstrm"));
+        // 不相关的也照样上报（完整名单），只是不会被显示层高亮
+        assert!(reported.features.contains(&"fp".to_string()));
+        assert!(reported.features.contains(&"evtstrm".to_string()));
         assert!(warnings.is_empty(), "{warnings:?}");
 
         fs::remove_dir_all(&root).ok();
@@ -497,15 +497,48 @@ mod tests {
             reported.model.as_deref(),
             Some("Intel(R) Core(TM) Ultra 7 258V")
         );
-        assert!(reported.simd.contains(&"avx512f".to_string()));
-        assert!(reported.simd.contains(&"f16c".to_string()));
-        assert!(!reported.simd.iter().any(|f| f == "vme" || f == "fpu"));
+        assert!(reported.features.contains(&"avx512f".to_string()));
+        assert!(reported.features.contains(&"f16c".to_string()));
+        // 原样上报：无关的 flag 也在，该不该露出来是显示层的事
+        assert!(reported.features.contains(&"vme".to_string()));
         // 核分组拿不到，等效核数随之消失
         assert!(reported.core_tiers.is_empty());
         assert_eq!(reported.effective_cores(), None);
         // 这件事必须说出来，否则等效算力是无声地没有的
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("sysfs"), "{warnings:?}");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// arm64 的 `/proc/cpuinfo` **不报型号**，型号在设备树里。
+    /// 少了这一步，每一台 ARM 机器都会显示"未知 CPU"。
+    #[test]
+    fn model_falls_back_to_the_device_tree() {
+        let root = fake_root("dt-model");
+        fake_meminfo(&root);
+        // 真机形状：没有 model name / Hardware / Processor 行
+        fs::write(
+            root.join("proc/cpuinfo"),
+            "processor\t: 0\nBogoMIPS\t: 48.00\nCPU implementer\t: 0x41\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("sys/devices/system/cpu/smt")).unwrap();
+        fs::write(root.join("sys/devices/system/cpu/smt/active"), "0\n").unwrap();
+        fs::create_dir_all(root.join("sys/firmware/devicetree/base")).unwrap();
+        // 设备树属性是 NUL 结尾的，trim() 去不掉 NUL
+        fs::write(
+            root.join("sys/firmware/devicetree/base/model"),
+            b"Radxa ROCK 5B+\0",
+        )
+        .unwrap();
+
+        let mut warnings = Vec::new();
+        let reported = probe(&root, "aarch64", &mut warnings);
+        assert_eq!(reported.model.as_deref(), Some("Radxa ROCK 5B+"));
+        // 顺带：空值不能冒充型号
+        fs::write(root.join("sys/firmware/devicetree/base/model"), b"\0").unwrap();
+        assert_eq!(probe(&root, "aarch64", &mut Vec::new()).model, None);
 
         fs::remove_dir_all(&root).ok();
     }

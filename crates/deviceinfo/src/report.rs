@@ -119,6 +119,13 @@ pub struct Accelerator {
     /// PCI 标识。GPU 一定有；NPU 也挂在 PCI 上，所以一般也有。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pci_id: Option<PciId>,
+    /// 设备树 `compatible` 字符串（如 `rockchip,rk3588-rknpu`）。
+    ///
+    /// **非 PCI 平台（ARM / 嵌入式）上这才是设备的权威标识**：那边既没有 PCI id，
+    /// 也没有 `cardN` 以外的名字。少了它，一台 ARM 机器上的加速器就只能叫
+    /// "GPU (card0, id 未知)"——信息量等于零。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compatible: Option<String>,
     /// 可用内存的语义（独立 / 共享 / 未知）。
     pub memory: AcceleratorMemory,
     /// 频率上限（MHz）。**这是硬件事实，不是瞬时值**——
@@ -152,9 +159,14 @@ pub struct CpuInfo {
     /// `cpu_capacity` 只有 676/1024。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub core_tiers: Vec<CoreTier>,
-    /// 观测到的加速指令集，按族过滤（见 `features::is_relevant_feature`）。
+    /// 内核报告的全部指令集特征，**原样**（排序去重）。
+    ///
+    /// 刻意不做筛选：消费方问的是开放式问题（"有没有 AMX"、"有没有 SVE2"、
+    /// "有没有 FP8"），生产者一旦筛掉信息就永久丢了，而且丢失是无声的。
+    /// 早先按前缀筛选的两个方向都错过：x86 的 `smep` 混进来（假阳性），
+    /// arm64 的 `asimddp` 因为名字猜错而落空。具体理由见 `features` 模块。
     #[serde(default)]
-    pub simd: Vec<String>,
+    pub features: Vec<String>,
 }
 
 impl CpuInfo {

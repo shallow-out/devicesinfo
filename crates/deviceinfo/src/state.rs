@@ -193,7 +193,14 @@ fn accelerator_devices(root: &Path) -> Vec<(AcceleratorKind, PathBuf)> {
             let node = entry.file_name().to_string_lossy().into_owned();
             // `cardN-DP-1` 是显示连接器，不是 GPU
             if node.starts_with("card") && !node.contains('-') {
-                entries.push((format!("1drm/{node}"), AcceleratorKind::Gpu, entry.path().join("device")));
+                let device = entry.path().join("device");
+                // 类别必须和硬件探测用**同一套**判据：ARM 上的 RKNPU 走 DRM，
+                // 硬件那边认成 NPU，这里不能认成 GPU——那样两份报告的第 N 项就不是同一个设备
+                let kind = crate::accelerator::classify_drm_device(
+                    crate::accelerator::driver_of(&device).as_deref(),
+                    crate::accelerator::read_compatible(&device).as_deref(),
+                );
+                entries.push((format!("1drm/{node}"), kind, device));
             }
         }
     }

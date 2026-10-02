@@ -26,6 +26,21 @@ pub(crate) fn field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
         .map(|(_, value)| value.trim())
 }
 
+/// 读设备树属性。
+///
+/// 这类文件是 **NUL 结尾的字节串**，而且可能是 NUL 分隔的**多个值**
+/// （`compatible` 就是这么一张按优先级排列的列表）。取第一个非空值。
+///
+/// 不能用 `read_to_string` + `trim`：`trim` 不会去掉 NUL。
+pub(crate) fn read_dt_property(path: &Path) -> Option<String> {
+    let raw = fs::read(path).ok()?;
+    String::from_utf8_lossy(&raw)
+        .split('\0')
+        .map(str::trim)
+        .find(|part| !part.is_empty())
+        .map(str::to_string)
+}
+
 /// 读 `<值> kB` 形式的字段并转成字节。
 ///
 /// `/proc/meminfo` 的所有值都以 kB 为单位。数值解析失败返回 `None`，不填 0 冒充。

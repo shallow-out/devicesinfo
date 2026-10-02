@@ -44,8 +44,25 @@ pub fn human(report: &HardwareReport) -> String {
         let _ = writeln!(out, "{line}");
     }
 
-    if !report.cpu.simd.is_empty() {
-        let _ = writeln!(out, "         指令集: {}", report.cpu.simd.join(", "));
+    if !report.cpu.features.is_empty() {
+        // 数据层**原样上报全部特征**；显示层只点出与推理相关的那些，
+        // 并说清完整列表在哪——否则看这一行会以为只有这些。
+        let highlighted: Vec<&str> = report
+            .cpu
+            .features
+            .iter()
+            .filter(|feature| crate::features::is_highlighted(feature))
+            .map(String::as_str)
+            .collect();
+        let _ = writeln!(
+            out,
+            "         指令集: {} 项（与推理相关 {} 项，完整列表用 --json）",
+            report.cpu.features.len(),
+            highlighted.len()
+        );
+        if !highlighted.is_empty() {
+            let _ = writeln!(out, "         · {}", highlighted.join(", "));
+        }
     }
 
     match report.memory.total_bytes {
@@ -296,7 +313,7 @@ mod tests {
                     max_freq_mhz: Some(4800),
                     capacity: Some(1024),
                 }],
-                simd: vec!["avx_vnni".into()],
+                features: vec!["avx_vnni".into()],
             },
             memory: MemoryInfo {
                 total_bytes: Some(33_129_861_120),
@@ -313,6 +330,7 @@ mod tests {
                         vendor: "0x10de".into(),
                         device: "0x2204".into(),
                     }),
+                    compatible: None,
                     memory: AcceleratorMemory::Unknown {
                         reason: "NVIDIA 驱动未通过 sysfs 暴露显存上限".into(),
                     },
@@ -330,6 +348,7 @@ mod tests {
                     driver_version: Some("1.0.0".into()),
                     vendor: Some("Intel".into()),
                     pci_id: None,
+                    compatible: None,
                     memory: AcceleratorMemory::SharedWithSystem,
                     max_freq_mhz: Some(1900),
                     runtime: RuntimeStatus::Incomplete {

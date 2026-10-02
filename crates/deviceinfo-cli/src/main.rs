@@ -248,6 +248,8 @@ fn capture_plan(source: &Path) -> CapturePlan {
         "proc/cpuinfo".to_string(),
         "proc/meminfo".to_string(),
         "sys/devices/system/cpu/smt/active".to_string(),
+        // arm64 唯一的型号来源（/proc/cpuinfo 在 arm64 上不报型号）
+        "sys/firmware/devicetree/base/model".to_string(),
     ];
     let mut symlinks = Vec::new();
 
@@ -276,6 +278,7 @@ fn capture_plan(source: &Path) -> CapturePlan {
             "freq/current_freq",
             "npu_memory_utilization",
             "npu_busy_time_us",
+            "of_node/compatible",
         ] {
             files.push(format!("{device}/{rel}"));
         }
@@ -292,8 +295,14 @@ fn capture_plan(source: &Path) -> CapturePlan {
             "gt/gt0/rps_cur_freq_mhz",
             "gt_max_freq_mhz",
             "gt_cur_freq_mhz",
+            "of_node/compatible",
         ] {
             files.push(format!("{device}/{rel}"));
+        }
+        // render 节点的**归属**靠 `<device>/drm/` 的目录项表达，
+        // 而不是靠 sys/class/drm 的软链（软链存不进夹具）
+        for node in numeric_entries(source, &format!("{device}/drm"), "renderD") {
+            files.push(format!("{device}/drm/{node}"));
         }
         // xe 的 tile*/gt*/freq0/{max,cur}_freq
         for tile in numeric_entries(source, &device, "tile") {
