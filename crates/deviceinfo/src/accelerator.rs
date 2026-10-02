@@ -1,11 +1,17 @@
 //! 加速器探测：GPU 与 NPU。
 //!
-//! 这里只回答**存在性与驱动绑定**，不回答"能不能用来跑模型"。
-//! 后者取决于用户态栈（OpenVINO 的 NPU 插件、CUDA/ROCm 运行时等），是能力判定的范畴，
-//! 混进来会让"设备事实"和"环境状态"纠缠在一起。
+//! 这一层填三类事实：**设备是什么**（名字、PCI id、驱动）、**内存是什么语义**、
+//! **用户态运行时是否就绪**。三者分开的原因见 [`crate::report`] 各字段的文档。
+//!
+//! 刻意不做的：不读 `cur_freq` / `busy_time` / `memory_utilization` 这类瞬时值。
+//! 它们是运行时状态，混进硬件报告会让这份报告既不能缓存也不能跨设备比较。
 
-use crate::report::{Accelerator, AcceleratorKind};
-use crate::sysfs::read_trimmed;
+use crate::pci;
+use crate::report::{
+    Accelerator, AcceleratorKind, AcceleratorMemory, PciId, RuntimeStatus,
+};
+use crate::runtime::{self, LibraryIndex};
+use crate::sysfs::{read_trimmed, read_u64};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -30,32 +36,151 @@ fn driver_of(device_dir: &Path) -> Option<String> {
     link.file_name().map(|s| s.to_string_lossy().into_owned())
 }
 
+/// 驱动版本，从 `<root>/sys/module/<驱动>/version` 读。
+///
+/// 只有部分驱动暴露这个文件：`intel_vpu` 有，`xe`/`i915`/`amdgpu` 都没有。
+/// 拿不到就是 `None`，表示"驱动没暴露"，不表示"没版本"。
+fn driver_version_of(root: &Path, driver: Option<&str>) -> Option<String> {
+    let driver = driver?;
+    read_trimmed(&root.join("sys/module").join(driver).join("version"))
+}
+
+/// 从 sysfs 读 PCI 标识。GPU 和 NPU 都有这两个文件。
+fn read_pci_id(device_dir: &Path) -> Option<PciId> {
+    Some(PciId {
+        vendor: read_trimmed(&device_dir.join("vendor"))?,
+        device: read_trimmed(&device_dir.join("device"))?,
+    })
+}
+
+/// 设备名：优先 `pci.ids` 查到的正式名，查不到才退回 id 形式。
+///
+/// 名字表可能缺失或过时，所以**原始 id 由 [`Accelerator::pci_id`] 单独承载**，
+/// 不塞进名字字符串里——那样只能显示、不能查询。
+fn name_from_pci(
+    root: &Path,
+    vendor: &Option<String>,
+    pci_id: &Option<PciId>,
+    fallback: impl FnOnce() -> String,
+) -> String {
+    let looked_up = pci_id
+        .as_ref()
+        .and_then(|id| pci::lookup(root, &id.vendor, &id.device));
+    match (vendor, looked_up) {
+        (Some(vendor), Some(device)) => format!("{vendor} {device}"),
+        (None, Some(device)) => device,
+        _ => fallback(),
+    }
+}
+
+/// 某个目录下形如 `<prefix><数字>` 的子目录，按编号排序。
+///
+/// xe 驱动把 GPU 按 `tile0/gt0`、`tile0/gt1` 组织，编号和数量都不固定，
+/// 硬编码 `tile0/gt0` 在双 tile 或换代的机器上会静默失效。
+fn numbered_dirs(dir: &Path, prefix: &str) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut found: Vec<(usize, PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let index = name.strip_prefix(prefix)?.parse::<usize>().ok()?;
+            Some((index, entry.path()))
+        })
+        .collect();
+    found.sort();
+    found.into_iter().map(|(_, path)| path).collect()
+}
+
+/// GPU 频率上限（MHz）。
+///
+/// 驱动布局不统一：xe 是 `tileN/gtN/freq0/max_freq`（本机实测 1950），
+/// i915 是 `gt/gt0/rps_max_freq_mhz`，更老的还有 `gt_max_freq_mhz`。
+/// **只取上限**：同目录下的 `cur_freq` / `act_freq` 是瞬时值。
+fn gpu_max_freq_mhz(device_dir: &Path) -> Option<u64> {
+    for tile in numbered_dirs(device_dir, "tile") {
+        for gt in numbered_dirs(&tile, "gt") {
+            if let Some(freq) = read_u64(&gt.join("freq0/max_freq")) {
+                return Some(freq);
+            }
+        }
+    }
+    [
+        "gt/gt0/rps_max_freq_mhz",
+        "gt/gt0/max_freq_mhz",
+        "gt_max_freq_mhz",
+    ]
+    .iter()
+    .find_map(|path| read_u64(&device_dir.join(path)))
+}
+
+/// GPU 可用的内存语义。
+fn gpu_memory(device_dir: &Path, vendor: Option<&str>) -> AcceleratorMemory {
+    // amdgpu 一直暴露 mem_info_vram_total；Intel 的 xe 在独显上也暴露。
+    // 有它就说明有独立显存，这是唯一能确定"独立"的证据。
+    if let Some(bytes) = read_u64(&device_dir.join("mem_info_vram_total")) {
+        if bytes > 0 {
+            return AcceleratorMemory::Dedicated { bytes };
+        }
+    }
+    match vendor {
+        // 走到这里说明驱动没暴露显存总量。Intel / AMD 在 Linux 上绝大多数是集显，
+        // 集显没有独立显存、和 CPU 共享系统内存——这是**确定的语义**，不是"不知道"。
+        Some("Intel") | Some("AMD") => AcceleratorMemory::SharedWithSystem,
+        // NVIDIA 专有驱动不通过 sysfs 暴露显存（要 NVML）。这里不猜：
+        // 编一个数会让人装上装不下的模型。
+        Some(other) => AcceleratorMemory::Unknown {
+            reason: format!("{other} 驱动未通过 sysfs 暴露显存上限"),
+        },
+        None => AcceleratorMemory::Unknown {
+            reason: "厂商未识别，无法判断显存是独立还是共享".into(),
+        },
+    }
+}
+
 /// NPU：现代内核把 NPU 暴露在 `/dev/accel/accelN`。
-pub(crate) fn probe_npus(root: &Path, warnings: &mut Vec<String>) -> Vec<Accelerator> {
+pub(crate) fn probe_npus(
+    root: &Path,
+    libraries: &LibraryIndex,
+    warnings: &mut Vec<String>,
+) -> Vec<Accelerator> {
     let dir = root.join("dev/accel");
     let Ok(entries) = fs::read_dir(&dir) else {
         return Vec::new();
     };
     let mut found = Vec::new();
     for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if !name.starts_with("accel") {
+        let node = entry.file_name().to_string_lossy().into_owned();
+        if !node.starts_with("accel") {
             continue;
         }
-        let device_path = entry.path();
-        let sys = root.join("sys/class/accel").join(&name);
-        let vendor = read_trimmed(&sys.join("device/vendor")).map(|v| vendor_name(&v));
-        let driver = driver_of(&sys.join("device"));
+        let sys = root.join("sys/class/accel").join(&node);
+        let device_dir = sys.join("device");
+        let vendor = read_trimmed(&device_dir.join("vendor")).map(|v| vendor_name(&v));
+        let driver = driver_of(&device_dir);
+        let pci_id = read_pci_id(&device_dir);
+        let runtime = runtime::probe(AcceleratorKind::Npu, vendor.as_deref(), libraries);
+        // 先算成局部变量：struct 字面量里字段是按书写顺序求值的，
+        // 把"借 vendor"和"move vendor"放在同一个字面量里会打架。
+        let name = name_from_pci(root, &vendor, &pci_id, || match &vendor {
+            Some(vendor) => format!("{vendor} NPU ({node})"),
+            None => format!("NPU ({node})"),
+        });
+        let driver_version = driver_version_of(root, driver.as_deref());
+
         let mut accel = Accelerator {
             kind: AcceleratorKind::Npu,
-            name: match &vendor {
-                Some(vendor) => format!("{vendor} NPU ({name})"),
-                None => format!("NPU ({name})"),
-            },
-            device_path: Some(device_path),
+            name,
+            device_path: Some(entry.path()),
+            driver_version,
             driver,
             vendor,
-            memory_bytes: None,
+            pci_id,
+            // NPU 没有独立显存：权重和中间张量都在系统内存里。
+            memory: AcceleratorMemory::SharedWithSystem,
+            max_freq_mhz: read_u64(&device_dir.join("npu_max_frequency_mhz")),
+            runtime,
             notes: Vec::new(),
         };
         if !sys.exists() {
@@ -71,37 +196,51 @@ pub(crate) fn probe_npus(root: &Path, warnings: &mut Vec<String>) -> Vec<Acceler
     found
 }
 
-/// GPU：以 `/sys/class/drm` 的 `cardN` 为存在性判据，名字尽量从 sysfs 取。
-pub(crate) fn probe_gpus(root: &Path, warnings: &mut Vec<String>) -> Vec<Accelerator> {
+/// GPU：以 `/sys/class/drm` 的 `cardN` 为存在性判据。
+pub(crate) fn probe_gpus(
+    root: &Path,
+    libraries: &LibraryIndex,
+    warnings: &mut Vec<String>,
+) -> Vec<Accelerator> {
     let drm = root.join("sys/class/drm");
     let mut found: Vec<Accelerator> = Vec::new();
 
     if let Ok(entries) = fs::read_dir(&drm) {
         for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
+            let node = entry.file_name().to_string_lossy().into_owned();
             // 只要 cardN，不要 cardN-DP-1 这类连接器
-            if !name.starts_with("card") || name.contains('-') {
+            if !node.starts_with("card") || node.contains('-') {
                 continue;
             }
             let device_dir = entry.path().join("device");
             let vendor = read_trimmed(&device_dir.join("vendor")).map(|v| vendor_name(&v));
-            let device_id =
-                read_trimmed(&device_dir.join("device")).unwrap_or_else(|| "未知".into());
             let driver = driver_of(&device_dir);
+            let pci_id = read_pci_id(&device_dir);
+            let raw_id = read_trimmed(&device_dir.join("device")).unwrap_or_else(|| "未知".into());
+            let runtime = runtime::probe(AcceleratorKind::Gpu, vendor.as_deref(), libraries);
+            let name = name_from_pci(root, &vendor, &pci_id, || match &vendor {
+                Some(vendor) => format!("{vendor} GPU ({node}, id {raw_id})"),
+                None => format!("GPU ({node}, id {raw_id})"),
+            });
+            let driver_version = driver_version_of(root, driver.as_deref());
+            let memory = gpu_memory(&device_dir, vendor.as_deref());
+            let max_freq_mhz = gpu_max_freq_mhz(&device_dir);
+
             let mut notes = Vec::new();
             if driver.is_none() {
                 notes.push("未绑定内核驱动，硬件加速不可用".into());
             }
             found.push(Accelerator {
                 kind: AcceleratorKind::Gpu,
-                name: match &vendor {
-                    Some(vendor) => format!("{vendor} GPU ({name}, id {device_id})"),
-                    None => format!("GPU ({name}, id {device_id})"),
-                },
+                name,
                 device_path: None,
+                driver_version,
                 driver,
                 vendor,
-                memory_bytes: None,
+                pci_id,
+                memory,
+                max_freq_mhz,
+                runtime,
                 notes,
             });
         }
@@ -131,8 +270,16 @@ pub(crate) fn probe_gpus(root: &Path, warnings: &mut Vec<String>) -> Vec<Acceler
                 name: format!("GPU ({})", node.display()),
                 device_path: Some(node.clone()),
                 driver: None,
+                driver_version: None,
                 vendor: None,
-                memory_bytes: None,
+                pci_id: None,
+                memory: AcceleratorMemory::Unknown {
+                    reason: "sysfs 中没有对应的 cardN，无从判断显存".into(),
+                },
+                max_freq_mhz: None,
+                runtime: RuntimeStatus::Unknown {
+                    reason: "sysfs 中没有对应的 cardN，认不出是什么设备".into(),
+                },
                 notes: vec!["sysfs 中没有对应的 cardN，信息不完整".into()],
             }),
         }
@@ -149,59 +296,175 @@ mod tests {
     use super::*;
 
     fn fake_root(tag: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!("deviceinfo-accel-{tag}-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("deviceinfo-accel-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         root
     }
 
+    /// 一份最小的 pci.ids，让名字查询有东西可查。
+    fn write_pci_ids(root: &Path) {
+        let dir = root.join("usr/share/hwdata");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("pci.ids"),
+            "8086  Intel Corporation\n\t64a0  Arc Graphics 130V/140V GPU\n\t643e  Core Ultra NPU\n",
+        )
+        .unwrap();
+    }
+
+    fn empty_libraries(root: &Path) -> LibraryIndex {
+        LibraryIndex::build(root)
+    }
+
     #[test]
-    fn finds_npu_and_gpu_from_sysfs() {
+    fn finds_npu_and_gpu_and_resolves_their_names() {
         let root = fake_root("both");
         fs::create_dir_all(root.join("proc")).unwrap();
         fs::write(root.join("proc/meminfo"), "MemTotal: 1000 kB\n").unwrap();
         fs::write(root.join("proc/cpuinfo"), "processor\t: 0\nmodel name\t: x\n").unwrap();
-        // 这棵假树专注测加速器，先把 CPU 侧搭全，免得混入无关警告
         fs::create_dir_all(root.join("sys/devices/system/cpu/smt")).unwrap();
         fs::write(root.join("sys/devices/system/cpu/smt/active"), "0\n").unwrap();
         let cpu0 = root.join("sys/devices/system/cpu/cpu0/topology");
         fs::create_dir_all(&cpu0).unwrap();
         fs::write(cpu0.join("core_cpus_list"), "0\n").unwrap();
+        write_pci_ids(&root);
+        // 齐全的 Intel NPU 运行时 + Level Zero GPU 驱动
+        let lib = root.join("usr/lib");
+        fs::create_dir_all(&lib).unwrap();
+        for name in [
+            "libze_loader.so",
+            "libze_intel_npu.so",
+            "libopenvino_intel_npu_compiler_loader.so",
+            "libze_intel_gpu.so",
+        ] {
+            fs::write(lib.join(name), b"").unwrap();
+        }
 
-        // NPU
+        // NPU：vendor/device/npu_max_frequency_mhz + 驱动软链
+        let npu_device = root.join("sys/class/accel/accel0/device");
+        fs::create_dir_all(&npu_device).unwrap();
+        fs::write(npu_device.join("vendor"), "0x8086\n").unwrap();
+        fs::write(npu_device.join("device"), "0x643e\n").unwrap();
+        fs::write(npu_device.join("npu_max_frequency_mhz"), "1900\n").unwrap();
         fs::create_dir_all(root.join("dev/accel")).unwrap();
         fs::write(root.join("dev/accel/accel0"), "").unwrap();
-        fs::create_dir_all(root.join("sys/class/accel/accel0/device")).unwrap();
-        fs::write(root.join("sys/class/accel/accel0/device/vendor"), "0x8086\n").unwrap();
 
-        // GPU：card0 有 vendor/device，/dev/dri 有 renderD128
-        fs::create_dir_all(root.join("sys/class/drm/card0/device")).unwrap();
-        fs::write(root.join("sys/class/drm/card0/device/vendor"), "0x8086\n").unwrap();
-        fs::write(root.join("sys/class/drm/card0/device/device"), "0x7d55\n").unwrap();
+        // GPU：xe 的 tile0/gt0/freq0/max_freq，没有 vram 节点
+        let gpu_device = root.join("sys/class/drm/card0/device");
+        fs::create_dir_all(gpu_device.join("tile0/gt0/freq0")).unwrap();
+        fs::write(gpu_device.join("vendor"), "0x8086\n").unwrap();
+        fs::write(gpu_device.join("device"), "0x64a0\n").unwrap();
+        fs::write(gpu_device.join("tile0/gt0/freq0/max_freq"), "1950\n").unwrap();
         fs::create_dir_all(root.join("dev/dri")).unwrap();
         fs::write(root.join("dev/dri/renderD128"), "").unwrap();
 
         let report = crate::probe_with(&root, "x86_64");
-        assert!(report.has_npu(), "应识别出 NPU: {report:#?}");
-        assert!(report.has_gpu(), "应识别出 GPU: {report:#?}");
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
 
         let npu = report
             .accelerators
             .iter()
             .find(|a| a.kind == AcceleratorKind::Npu)
-            .unwrap();
-        assert_eq!(npu.vendor.as_deref(), Some("Intel"));
-        assert!(npu.notes.is_empty(), "sysfs 存在时不应报缺驱动: {npu:#?}");
+            .expect("应识别出 NPU");
+        // A4：设备在 + 运行时齐 → 可用
+        assert!(npu.runtime.is_ready(), "{:#?}", npu.runtime);
+        assert!(report.has_npu() && report.has_usable_npu());
+        // B1：id 翻成了人名，id 本身也没丢
+        assert_eq!(npu.name, "Intel Core Ultra NPU");
+        assert_eq!(npu.pci_id.as_ref().unwrap().compact(), "8086:643e");
+        // B2：只收"上限"这类事实
+        assert_eq!(npu.max_freq_mhz, Some(1900));
+        // A5：NPU 共享系统内存，不是"未知"
+        assert_eq!(npu.memory, AcceleratorMemory::SharedWithSystem);
 
         let gpu = report
             .accelerators
             .iter()
             .find(|a| a.kind == AcceleratorKind::Gpu)
-            .unwrap();
+            .expect("应识别出 GPU");
+        assert!(gpu.runtime.is_ready(), "{:#?}", gpu.runtime);
+        assert_eq!(gpu.name, "Intel Arc Graphics 130V/140V GPU");
+        assert_eq!(gpu.max_freq_mhz, Some(1950));
+        assert_eq!(gpu.memory, AcceleratorMemory::SharedWithSystem);
         assert_eq!(
             gpu.device_path.as_deref(),
             Some(root.join("dev/dri/renderD128").as_path())
         );
-        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A4 的核心场景：设备在、驱动绑了，但用户态栈不全。
+    #[test]
+    fn device_present_but_runtime_incomplete_is_reported_as_such() {
+        let root = fake_root("npu-nostack");
+        // 只有驱动，没有 level-zero 和编译器
+        let npu_device = root.join("sys/class/accel/accel0/device");
+        fs::create_dir_all(&npu_device).unwrap();
+        fs::write(npu_device.join("vendor"), "0x8086\n").unwrap();
+        fs::write(npu_device.join("device"), "0x643e\n").unwrap();
+        fs::create_dir_all(root.join("dev/accel")).unwrap();
+        fs::write(root.join("dev/accel/accel0"), "").unwrap();
+
+        let mut warnings = Vec::new();
+        let npus = probe_npus(&root, &empty_libraries(&root), &mut warnings);
+        assert_eq!(npus.len(), 1);
+        // 设备确实在……
+        assert_eq!(npus[0].vendor.as_deref(), Some("Intel"));
+        // ……但"能用"是另一回事
+        match &npus[0].runtime {
+            RuntimeStatus::Incomplete { missing, .. } => assert_eq!(missing.len(), 3, "{missing:?}"),
+            other => panic!("应当是 Incomplete: {other:#?}"),
+        }
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// NVIDIA 的显存读不到时必须说"未知"，不能编一个数，也不能说"共享"。
+    #[test]
+    fn nvidia_memory_is_unknown_not_zero_and_not_shared() {
+        let root = fake_root("nvidia");
+        let device = root.join("sys/class/drm/card0/device");
+        fs::create_dir_all(&device).unwrap();
+        fs::write(device.join("vendor"), "0x10de\n").unwrap();
+        fs::write(device.join("device"), "0x2204\n").unwrap();
+
+        let mut warnings = Vec::new();
+        let gpus = probe_gpus(&root, &empty_libraries(&root), &mut warnings);
+        assert_eq!(gpus.len(), 1);
+        assert_eq!(gpus[0].vendor.as_deref(), Some("NVIDIA"));
+        match &gpus[0].memory {
+            AcceleratorMemory::Unknown { reason } => assert!(reason.contains("NVIDIA"), "{reason}"),
+            other => panic!("应当是 Unknown: {other:#?}"),
+        }
+        assert_eq!(gpus[0].memory.dedicated_bytes(), None);
+        // NVIDIA 认不出栈 → 不猜就绪
+        assert!(!gpus[0].runtime.is_ready());
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// 驱动暴露了显存总量 → 独立显存。
+    #[test]
+    fn exposed_vram_total_means_dedicated_memory() {
+        let root = fake_root("vram");
+        let device = root.join("sys/class/drm/card0/device");
+        fs::create_dir_all(&device).unwrap();
+        fs::write(device.join("vendor"), "0x1002\n").unwrap();
+        fs::write(device.join("device"), "0x744c\n").unwrap();
+        fs::write(device.join("mem_info_vram_total"), "17163091968\n").unwrap();
+
+        let mut warnings = Vec::new();
+        let gpus = probe_gpus(&root, &empty_libraries(&root), &mut warnings);
+        assert_eq!(
+            gpus[0].memory,
+            AcceleratorMemory::Dedicated {
+                bytes: 17_163_091_968
+            }
+        );
+        assert_eq!(gpus[0].memory.dedicated_bytes(), Some(17_163_091_968));
 
         fs::remove_dir_all(&root).ok();
     }
@@ -213,7 +476,7 @@ mod tests {
         fs::write(root.join("sys/class/drm/card0/device/vendor"), "0x1002\n").unwrap();
 
         let mut warnings = Vec::new();
-        let gpus = probe_gpus(&root, &mut warnings);
+        let gpus = probe_gpus(&root, &empty_libraries(&root), &mut warnings);
         assert_eq!(gpus.len(), 1);
         assert_eq!(gpus[0].vendor.as_deref(), Some("AMD"));
         assert!(
@@ -225,6 +488,29 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
+    /// 驱动版本读的是 `<root>/sys/module/<驱动>/version`——本机 `intel_vpu` 有，
+    /// `xe` 没有。两种情形都要能在报告里区分出来。
+    #[test]
+    fn driver_version_is_read_through_the_injected_root() {
+        let root = fake_root("drvver");
+        fs::create_dir_all(root.join("sys/module/intel_vpu")).unwrap();
+        fs::write(
+            root.join("sys/module/intel_vpu/version"),
+            "1.0.0 7.2.6-arch2-1\n",
+        )
+        .unwrap();
+        assert_eq!(
+            driver_version_of(&root, Some("intel_vpu")).as_deref(),
+            Some("1.0.0 7.2.6-arch2-1")
+        );
+        // 驱动没暴露 version 文件 → None，而不是空字符串
+        fs::create_dir_all(root.join("sys/module/xe")).unwrap();
+        assert_eq!(driver_version_of(&root, Some("xe")), None);
+        // 连驱动名都没有
+        assert_eq!(driver_version_of(&root, None), None);
+        fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn connector_entries_are_not_mistaken_for_gpus() {
         let root = fake_root("connector");
@@ -233,7 +519,22 @@ mod tests {
             fs::create_dir_all(root.join("sys/class/drm").join(name)).unwrap();
         }
         let mut warnings = Vec::new();
-        assert!(probe_gpus(&root, &mut warnings).is_empty());
+        assert!(probe_gpus(&root, &empty_libraries(&root), &mut warnings).is_empty());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn max_freq_prefers_the_xe_layout_then_falls_back_to_i915() {
+        let root = fake_root("freq");
+        let device = root.join("sys/class/drm/card0/device");
+        // i915 的老布局：gt_max_freq_mhz
+        fs::create_dir_all(&device).unwrap();
+        fs::write(device.join("gt_max_freq_mhz"), "1200\n").unwrap();
+        assert_eq!(gpu_max_freq_mhz(&device), Some(1200));
+        // 有 xe 布局时以它为准
+        fs::create_dir_all(device.join("tile0/gt1/freq0")).unwrap();
+        fs::write(device.join("tile0/gt1/freq0/max_freq"), "1950\n").unwrap();
+        assert_eq!(gpu_max_freq_mhz(&device), Some(1950));
         fs::remove_dir_all(&root).ok();
     }
 }

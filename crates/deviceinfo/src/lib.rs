@@ -21,8 +21,10 @@
 //! | [`report`] | 对外的数据结构，不含任何 IO |
 //! | [`cpu`] | 架构、核数、性能分层、指令集 |
 //! | [`memory`] | 总量与可用量 |
-//! | [`accelerator`] | GPU / NPU 的存在性与驱动绑定 |
+//! | [`accelerator`] | GPU / NPU 的设备事实、内存语义、运行时就绪度 |
 //! | [`render`] | 给人看的文本渲染（CLI 与 GUI 共用一份） |
+//! | `pci` | 把 `8086:64a0` 翻成人名（解析 `pci.ids`，不调 `lspci`） |
+//! | `runtime` | 用户态加速栈是否齐备（设备在 ≠ 能用） |
 //! | `sysfs` / `features` | 内部工具：按 root 前缀读文件、指令集特征族匹配 |
 //!
 //! # 可注入的 root
@@ -40,12 +42,17 @@ mod accelerator;
 mod cpu;
 mod features;
 mod memory;
+mod pci;
 mod report;
+mod runtime;
 mod sysfs;
 
 pub mod render;
 
-pub use report::{Accelerator, AcceleratorKind, CoreTier, CpuInfo, HardwareReport, MemoryInfo};
+pub use report::{
+    Accelerator, AcceleratorKind, AcceleratorMemory, CoreTier, CpuInfo, HardwareReport, MemoryInfo,
+    PciId, RuntimeStatus,
+};
 
 use std::path::Path;
 
@@ -63,8 +70,11 @@ pub fn probe_with(root: &Path, arch: &str) -> HardwareReport {
     let mut warnings = Vec::new();
     let cpu = cpu::probe(root, arch, &mut warnings);
     let memory = memory::probe(root, &mut warnings);
-    let mut accelerators = accelerator::probe_npus(root, &mut warnings);
-    accelerators.extend(accelerator::probe_gpus(root, &mut warnings));
+    // 库索引建一次，所有加速器共用——每台机器通常有好几个加速器，
+    // 各自重新遍历一遍 /usr/lib 是没必要的浪费
+    let libraries = runtime::LibraryIndex::build(root);
+    let mut accelerators = accelerator::probe_npus(root, &libraries, &mut warnings);
+    accelerators.extend(accelerator::probe_gpus(root, &libraries, &mut warnings));
     HardwareReport {
         cpu,
         memory,

@@ -3,7 +3,7 @@
 //! 放在库里而不是各个 CLI 里：一份报告只有一种正确的读法，多份渲染实现迟早会分叉——
 //! 上游加了字段，某一端的输出漏掉，而且没人会发现。
 
-use crate::report::{AcceleratorKind, HardwareReport};
+use crate::report::{AcceleratorKind, AcceleratorMemory, HardwareReport, RuntimeStatus};
 use std::fmt::Write;
 
 /// 把报告渲染成多行文本（带末尾换行）。
@@ -55,20 +55,48 @@ pub fn human(report: &HardwareReport) -> String {
     } else {
         for (index, accel) in report.accelerators.iter().enumerate() {
             let label = if index == 0 { "加速器   " } else { "         " };
-            let mut line = format!(
-                "{label}{:<3}  {}",
-                kind_label(accel.kind),
-                accel.name
-            );
-            if let Some(path) = &accel.device_path {
-                let _ = write!(line, "  ({})", path.display());
-            }
-            if let Some(driver) = &accel.driver {
-                let _ = write!(line, "  driver={driver}");
+            let mut line = format!("{label}{:<3}  {}", kind_label(accel.kind), accel.name);
+            // PCI id 不靠名字承载：名字表可能缺失或过时，id 永远可查
+            if let Some(pci_id) = &accel.pci_id {
+                let _ = write!(line, "  ({})", pci_id.compact());
             }
             let _ = writeln!(out, "{line}");
+
+            // 第二行：设备事实（是什么、绑了哪个驱动、内存什么语义、上限多少）
+            let mut facts = Vec::new();
+            if let Some(path) = &accel.device_path {
+                facts.push(format!("设备 {}", path.display()));
+            }
+            match (&accel.driver, &accel.driver_version) {
+                (Some(driver), Some(version)) => facts.push(format!("驱动 {driver} {version}")),
+                (Some(driver), None) => facts.push(format!("驱动 {driver}")),
+                (None, _) => facts.push("未绑定驱动".into()),
+            }
+            facts.push(match &accel.memory {
+                AcceleratorMemory::Dedicated { bytes } => format!("显存 {}", human_bytes(*bytes)),
+                AcceleratorMemory::SharedWithSystem => "内存 共享系统内存".into(),
+                AcceleratorMemory::Unknown { reason } => format!("内存 未知（{reason}）"),
+            });
+            if let Some(freq) = accel.max_freq_mhz {
+                facts.push(format!("频率上限 {freq} MHz"));
+            }
+            let _ = writeln!(out, "             {}", facts.join("   "));
+
+            // 第三行：设备在 ≠ 能用
+            let _ = writeln!(
+                out,
+                "             运行时 {}",
+                match &accel.runtime {
+                    RuntimeStatus::Ready { stack, .. } => format!("就绪 · {stack}"),
+                    RuntimeStatus::Incomplete { stack, missing } => {
+                        format!("缺件 · {stack}：缺 {}", missing.join("、"))
+                    }
+                    RuntimeStatus::Unknown { reason } => format!("未知 · {reason}"),
+                }
+            );
+
             if !accel.notes.is_empty() {
-                let _ = writeln!(out, "           ! {}", accel.notes.join("; "));
+                let _ = writeln!(out, "             ! {}", accel.notes.join("; "));
             }
         }
     }
@@ -147,5 +175,81 @@ mod tests {
         assert_eq!(human_bytes(1024), "1.0 KiB");
         assert_eq!(human_bytes(1024 * 1024), "1.0 MiB");
         assert_eq!(human_bytes(33_129_861_120), "30.9 GiB");
+    }
+
+    #[test]
+    fn unknown_memory_and_runtime_states_are_visible_in_the_output() {
+        let report = HardwareReport {
+            cpu: crate::CpuInfo {
+                arch: "x86_64".into(),
+                model: Some("Intel(R) Core(TM) Ultra 7 258V".into()),
+                logical_cores: 8,
+                physical_cores: Some(8),
+                core_tiers: vec![crate::CoreTier {
+                    cpus: (0..8).collect(),
+                    max_freq_mhz: Some(4800),
+                    capacity: Some(1024),
+                }],
+                simd: vec!["avx_vnni".into()],
+            },
+            memory: crate::MemoryInfo {
+                total_bytes: 33_129_861_120,
+                available_bytes: Some(9_000_000_000),
+            },
+            accelerators: vec![
+                crate::Accelerator {
+                    kind: AcceleratorKind::Gpu,
+                    name: "NVIDIA GA102 [GeForce RTX 3090]".into(),
+                    device_path: Some("/dev/dri/renderD128".into()),
+                    driver: Some("nvidia".into()),
+                    driver_version: None,
+                    vendor: Some("NVIDIA".into()),
+                    pci_id: Some(crate::PciId {
+                        vendor: "0x10de".into(),
+                        device: "0x2204".into(),
+                    }),
+                    memory: AcceleratorMemory::Unknown {
+                        reason: "NVIDIA 驱动未通过 sysfs 暴露显存上限".into(),
+                    },
+                    max_freq_mhz: None,
+                    runtime: RuntimeStatus::Unknown {
+                        reason: "还没有 NVIDIA 的用户态运行时判据".into(),
+                    },
+                    notes: Vec::new(),
+                },
+                crate::Accelerator {
+                    kind: AcceleratorKind::Npu,
+                    name: "Intel Core Ultra 200V Series Processors NPU".into(),
+                    device_path: Some("/dev/accel/accel0".into()),
+                    driver: Some("intel_vpu".into()),
+                    driver_version: Some("1.0.0".into()),
+                    vendor: Some("Intel".into()),
+                    pci_id: None,
+                    memory: AcceleratorMemory::SharedWithSystem,
+                    max_freq_mhz: Some(1900),
+                    runtime: RuntimeStatus::Incomplete {
+                        stack: "OpenVINO NPU".into(),
+                        missing: vec!["libopenvino_intel_npu_compiler_loader.so".into()],
+                    },
+                    notes: Vec::new(),
+                },
+            ],
+            warnings: Vec::new(),
+        };
+
+        let text = human(&report);
+        // 架构和等效算力在
+        assert!(text.contains("[x86_64]"), "{text}");
+        assert!(text.contains("等效算力 8.0 核"), "{text}");
+        // 显存"未知"要带原因，不能只说未知
+        assert!(text.contains("内存 未知（NVIDIA 驱动未通过 sysfs 暴露显存上限）"), "{text}");
+        // 运行时缺件要列出可以照抄去装的东西
+        assert!(
+            text.contains("运行时 缺件 · OpenVINO NPU：缺 libopenvino_intel_npu_compiler_loader.so"),
+            "{text}"
+        );
+        assert!(text.contains("(10de:2204)"), "{text}");
+        assert!(text.contains("共享系统内存"), "{text}");
+        assert!(text.contains("频率上限 1900 MHz"), "{text}");
     }
 }

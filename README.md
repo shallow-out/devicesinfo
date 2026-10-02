@@ -40,26 +40,44 @@ println!("{}", deviceinfo::render::human(&report));
 | `report` | 对外的数据结构，不含任何 IO |
 | `cpu` | 架构、核数、性能分层、指令集 |
 | `memory` | 总量与可用量 |
-| `accelerator` | GPU / NPU 的存在性与驱动绑定 |
+| `accelerator` | GPU / NPU 的设备事实、内存语义、运行时就绪度 |
 | `render` | 给人看的文本渲染（CLI 与 GUI 共用一份） |
+| `pci` | 把 `8086:64a0` 翻成人名（解析 `pci.ids`，不调 `lspci`） |
+| `runtime` | 用户态加速栈是否齐备（设备在 ≠ 能用） |
 | `sysfs` / `features` | 内部工具：按 root 前缀读文件、指令集特征族匹配 |
 
 ## 语义边界（重要）
 
-**只报设备事实，不报环境状态。** 两个已知的例子：
+**只报设备事实，不报环境状态。** 三个容易混的地方：
 
-- `has_npu()` 只回答"设备在不在"，**不回答"能不能用"**。设备节点存在但用户态编译器
-  （如 OpenVINO 的 NPU 插件）缺失时它同样返回 `true`。能力判定是另一层的事。
-- `memory.available_bytes` 是**瞬时值**，不是硬件事实。缓存这份报告、或者拿它跨设备
-  比较时会骗人。
+- **`has_npu()` / `has_gpu()` 只回答"设备在不在"**，不回答"能不能用"。设备节点存在但
+  用户态栈不全（比如插着 NPU 却没装编译器）时它们同样返回 `true`。要问"能不能真的用"，
+  看 `accelerator.runtime`，或者用 `has_usable_npu()` / `has_usable_gpu()`。
+- **`AcceleratorMemory` 是三态**，不是 `Option<u64>`：`Dedicated` 有确定容量，
+  `SharedWithSystem` 是"和系统内存共享，没有独立上限"（集显、NPU），`Unknown` 是"读不到"
+  并附原因。合成一个 `None` 会让上层只能猜，而两个方向猜错都是错的。
+- **`memory.available_bytes` 是瞬时值**，不是硬件事实。缓存或跨设备比较时会骗人。
+
+同样地，加速器只收**上限**类的频率事实（`max_freq_mhz`），不收 `cur_freq` / `act_freq` /
+`busy_time` / `memory_utilization`。
+
+`warnings` 也不含 `RuntimeStatus::Incomplete`：那是**确定的观测**（确定缺件），不是不确定。
+混在一张列表里会让"未知"失去信号。
 
 ## 已知未做
 
-- GPU 显存：目前一律 `None`，而集显的正确语义是"共享系统内存"而不是"未知"。
-- GPU 名字：只有 PCI device id（`0x64a0`），没有翻成人名（`Arc Graphics 130V/140V`）。
-- swap：`MemTotal` 之外没有交换分区信息，而 swap 耗尽时 `MemAvailable` 会系统性高估。
-- 磁盘：完全没有文件系统可用空间的探测。
-- ARM64 真实机器采样夹具：目前 ARM 路径靠手写夹具覆盖。
+- **Intel 独显的显存**：`gpu_memory` 在驱动没暴露 `mem_info_vram_total` 且厂商是 Intel/AMD
+  时判为 `SharedWithSystem`。这在 Linux 上绝大多数机器是对的（那两个厂商基本都是集显，
+  而独显会暴露该节点），但**没有 Intel 独显可以验证**。
+- **swap**：`MemTotal` 之外没有交换分区信息。swap 耗尽时 `MemAvailable` 会系统性高估——
+  实测某台机器 swap 4 GiB 已用满，而 `MemAvailable` 还报 9 GiB。
+- **磁盘**：完全没有文件系统可用空间的探测。
+- **NPU 的运行时状态**：`npu_busy_time_us` / `npu_memory_utilization` / `npu_current_frequency_mhz`
+  读得到但故意不收（瞬时值，见上面「语义边界」）。它们应该进一个单独的运行时状态端点。
+- **`sched_mode`**：语义不清楚（HW/SW 调度），对选模型没有影响，暂且不收。
+- **其它厂商的运行时判据**：目前只有 Intel NPU 和 Intel GPU 两套。NVIDIA / AMD 会返回
+  `RuntimeStatus::Unknown` 而不是猜一个「就绪」。
+- **ARM64 真实机器采样夹具**：ARM 路径靠手写夹具覆盖。
 
 ## 许可
 

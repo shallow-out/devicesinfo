@@ -1,5 +1,9 @@
 //! 对外数据结构。这一层**不做任何 IO**——凡是能从文件系统读出来的东西，
 //! 都写成"接收 root 路径的纯函数"放在各自的探测模块里，方便测试。
+//!
+//! 字段的取舍遵循一条线：**只放硬件事实，不放运行时状态**。
+//! 频率上限是事实，当前频率不是；内存总量是事实，可用内存不是（那个虽然暂时留在这里，
+//! 但已经标好了语义）。混在一起会让这份报告既不能缓存，也不能跨设备比较。
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -10,6 +14,85 @@ pub enum AcceleratorKind {
     Cpu,
     Gpu,
     Npu,
+}
+
+/// PCI 标识。
+///
+/// 名字表（`pci.ids`）可能缺失、过时，或者干脆查不到——**原始 id 永远可查**，
+/// 所以两者分开留字段，而不是把 id 拼进名字字符串里。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PciId {
+    /// 形如 `0x8086`。
+    pub vendor: String,
+    /// 形如 `0x643e`。
+    pub device: String,
+}
+
+impl PciId {
+    /// `8086:643e`——搜索和贴到 issue 里用这个写法。
+    pub fn compact(&self) -> String {
+        format!(
+            "{}:{}",
+            self.vendor.trim_start_matches("0x").trim_start_matches("0X"),
+            self.device.trim_start_matches("0x").trim_start_matches("0X")
+        )
+    }
+}
+
+/// 加速器可用的内存语义。
+///
+/// 这里曾经是个 `Option<u64>`，但 `None` 同时表示了两件完全不同的事：
+/// **"和系统内存共享，没有独立上限"**（集显、NPU）和**"读不到"**（NVIDIA 专有驱动
+/// 不通过 sysfs 暴露显存）。上层拿到 `None` 只能猜，而两个方向猜错都是错的：
+/// 保守一点会禁掉能跑的模型，乐观一点会让人装一个装不下的模型。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum AcceleratorMemory {
+    /// 独立显存，有确定容量。
+    Dedicated { bytes: u64 },
+    /// 与系统内存共享，没有独立上限（集显、NPU）。
+    SharedWithSystem,
+    /// 读不到，附上原因。
+    Unknown { reason: String },
+}
+
+impl AcceleratorMemory {
+    /// 独立显存的字节数；共享或未知时返回 `None`（**不是 0**）。
+    pub fn dedicated_bytes(&self) -> Option<u64> {
+        match self {
+            Self::Dedicated { bytes } => Some(*bytes),
+            _ => None,
+        }
+    }
+}
+
+/// 用户态运行时是否就绪。
+///
+/// **"设备在"不等于"能用"。** 驱动认了硬件，不代表应用能拿它跑推理：
+/// Intel NPU 还需要编译器（由独立的 `intel-npu-compiler` 包提供，不随驱动一起装），
+/// Intel GPU 还需要 Level Zero 或 OpenCL 运行时。缺这一层时，模型会被选中、
+/// 然后在使用时失败——这是最容易让用户踩坑的一类误报。
+///
+/// 判据是**库文件是否存在**，这是个启发式（本 crate 不链接任何推理栈，没法真的试跑一次）。
+/// 所以认不出的组合一律返回 [`RuntimeStatus::Unknown`]，而不是猜一个"就绪"。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "kebab-case")]
+pub enum RuntimeStatus {
+    /// 已知栈的组成部分齐了。`components` 是实际命中的文件名，便于核对。
+    Ready {
+        stack: String,
+        components: Vec<String>,
+    },
+    /// 已知栈缺件。`missing` 是可以照抄去装的东西。
+    Incomplete { stack: String, missing: Vec<String> },
+    /// 认不出这个组合该找什么——不猜。
+    Unknown { reason: String },
+}
+
+impl RuntimeStatus {
+    pub fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready { .. })
+    }
 }
 
 /// 一个加速设备。
@@ -24,14 +107,30 @@ pub struct Accelerator {
     pub device_path: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub driver: Option<String>,
+    /// 内核驱动版本。
+    ///
+    /// 读 `/sys/module/<驱动>/version`。**NPU 会报**（本机 `intel_vpu` → `1.0.0`），
+    /// 而 `xe`/`i915`/`amdgpu` 都没有这个文件，此时是 `None`——那表示"驱动没暴露"，
+    /// 不表示"没版本"。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub driver_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vendor: Option<String>,
+    /// PCI 标识。GPU 一定有；NPU 也挂在 PCI 上，所以一般也有。
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub memory_bytes: Option<u64>,
+    pub pci_id: Option<PciId>,
+    /// 可用内存的语义（独立 / 共享 / 未知）。
+    pub memory: AcceleratorMemory,
+    /// 频率上限（MHz）。**这是硬件事实，不是瞬时值**——
+    /// `cur_freq` / `act_freq` 那一类不进报告。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_freq_mhz: Option<u64>,
+    /// 用户态运行时是否就绪。
+    pub runtime: RuntimeStatus,
     /// 观测到的、影响可用性的备注（缺驱动、设备节点不存在等）。
     ///
-    /// 注意语义边界：**这里只记"设备本身"的问题**。"设备在但用户态栈不全"（比如插着 NPU
-    /// 但没装编译器）属于能力判定，不是设备事实，不写在这里。
+    /// 注意语义边界：**这里只记"设备本身"的问题**。"设备在但用户态栈不全"由
+    /// [`Self::runtime`] 表达；"探测不到"由 [`HardwareReport::warnings`] 表达。
     #[serde(default)]
     pub notes: Vec<String>,
 }
@@ -122,6 +221,9 @@ pub struct HardwareReport {
     ///
     /// 这份报告的用途是"避免选错"，所以**"探测不到"必须显式暴露**，
     /// 而不是假装设备不存在、或者悄悄用一个默认值把洞填上。
+    ///
+    /// 注意这不含 [`RuntimeStatus::Incomplete`]：那是**确定的观测**（确定缺件），
+    /// 不是不确定。两者混在一张列表里，会让"未知"这件事失去信号。
     pub warnings: Vec<String>,
 }
 
@@ -135,8 +237,8 @@ impl HardwareReport {
 
     /// 是否存在 NPU 设备。
     ///
-    /// **注意这只回答"设备在不在"，不回答"能不能用"**——设备节点存在但用户态编译器
-    /// 缺失时这里同样返回 `true`。能力判定是另一层的事。
+    /// **只回答"设备在不在"**。设备节点存在但用户态栈不全时它同样返回 `true`——
+    /// 要问"能不能真的用"，看那个设备的 [`Accelerator::runtime`]。
     pub fn has_npu(&self) -> bool {
         self.accelerators
             .iter()
@@ -148,5 +250,19 @@ impl HardwareReport {
         self.accelerators
             .iter()
             .any(|accel| accel.kind == AcceleratorKind::Gpu)
+    }
+
+    /// 设备在**且**用户态运行时已就绪——这才是"能拿它跑模型"。
+    pub fn has_usable_npu(&self) -> bool {
+        self.accelerators
+            .iter()
+            .any(|accel| accel.kind == AcceleratorKind::Npu && accel.runtime.is_ready())
+    }
+
+    /// 同 [`Self::has_usable_npu`]，针对 GPU。
+    pub fn has_usable_gpu(&self) -> bool {
+        self.accelerators
+            .iter()
+            .any(|accel| accel.kind == AcceleratorKind::Gpu && accel.runtime.is_ready())
     }
 }
