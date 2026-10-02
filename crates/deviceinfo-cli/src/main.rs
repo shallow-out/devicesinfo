@@ -1032,8 +1032,7 @@ fn run_with_timeout(mut command: ProcessCommand, timeout: Duration) -> io::Resul
         let last = stderr
             .lines()
             .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .next_back()
+            .rfind(|line| !line.is_empty())
             .unwrap_or("")
             .chars()
             .take(160)
