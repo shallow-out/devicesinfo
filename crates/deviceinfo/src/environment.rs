@@ -46,7 +46,7 @@ const ROOTLESS_SOCKET_SUFFIX: &str = "podman/podman.sock";
 ///
 /// 这一项的用途是**别重复部署**：机器上已经有 `llama-server` 的话，
 /// 环境助手就不该再去下一个 llama.cpp。
-const INFERENCE_TOOLS: [&str; 7] = [
+pub const INFERENCE_TOOLS: [&str; 7] = [
     "llama-server",
     "llama-cli",
     "llama-bench",
@@ -57,7 +57,7 @@ const INFERENCE_TOOLS: [&str; 7] = [
 ];
 
 /// 包管理器（只要能找到可执行文件就认）。
-const PACKAGE_MANAGERS: [&str; 8] = [
+pub const PACKAGE_MANAGERS: [&str; 8] = [
     "pacman",
     "apt-get",
     "dnf",
@@ -265,6 +265,21 @@ impl Input {
             Self::Content(path) | Self::Existence(path) => path,
         }
     }
+}
+
+/// 推理工具会被在哪几个位置找到：`(工具名, 目录)`。
+///
+/// 写的一方（部署工具）靠它确认自己装到了**会被看见**的地方。这不是"建议的安装位置"，
+/// 而是**探测方的实际判据**：装进 `/opt` 却不加软链，deviceinfo 会如实报"没有推理框架"
+/// ——那不是误报，是真的没人看得见它。判据只能有一份。
+pub fn inference_tool_search_paths() -> Vec<(String, String)> {
+    let mut paths = Vec::new();
+    for tool in INFERENCE_TOOLS {
+        for dir in BIN_DIRS {
+            paths.push((tool.to_string(), format!("/{dir}/{tool}")));
+        }
+    }
+    paths
 }
 
 /// 采集夹具时要复制/占位的输入（相对探测根）。
