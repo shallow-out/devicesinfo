@@ -5,7 +5,9 @@
 
 use clap::{Parser, Subcommand};
 use deviceinfo::pci::{PCI_DATABASE_PATHS, extract_entries};
-use deviceinfo::{HardwareReport, PciId, RuntimeStatus, probe_with, render, sample_state_with};
+use deviceinfo::{
+    HardwareReport, PciId, RuntimeStatus, SampleOptions, probe_with, render, sample_state_with,
+};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -46,7 +48,12 @@ enum Command {
         /// 要查磁盘余量的路径，可重复
         #[arg(long = "watch", value_name = "PATH", default_value = "/")]
         watch: Vec<PathBuf>,
-        /// `/proc` 的根目录（一般不用改）
+        /// 同时读取累积计数器（NPU 忙碌时间）。
+        ///
+        /// 驱动建议该值的读取间隔不低于 1 秒：频繁读会影响 NPU 作业提交性能。
+        #[arg(long)]
+        counters: bool,
+        /// `/proc` 与 `/sys` 的根目录（一般不用改）
         #[arg(long, value_name = "PATH", default_value = "/")]
         root: PathBuf,
         /// 有 warning 就以退出码 1 结束
@@ -88,10 +95,17 @@ fn main() {
         }
         Command::State {
             watch,
+            counters,
             root,
             strict,
         } => {
-            let state = sample_state_with(&root, &watch);
+            let state = sample_state_with(
+                &root,
+                &SampleOptions {
+                    watch,
+                    counters,
+                },
+            );
             if cli.json {
                 print_json(&state);
             } else {
@@ -141,6 +155,13 @@ fn capture(source: &Path, arch: &str, out: &Path) -> io::Result<()> {
     // 1) 探测会读到的文件
     for rel in &plan.files {
         let from = source.join(rel);
+        // 只有状态采样读的瞬时值：夹具只保留"读到得到"这个事实，不保留读数
+        if is_volatile_leaf(rel) {
+            if from.exists() {
+                write_file(&out.join(rel), b"0\n")?;
+            }
+            continue;
+        }
         match fs::metadata(&from) {
             // 只读普通文件：`/dev/accel/accel0` 这类字符设备直接读会阻塞
             Ok(meta) if meta.is_file() => {
@@ -245,7 +266,17 @@ fn capture_plan(source: &Path) -> CapturePlan {
     for node in numeric_entries(source, "dev/accel", "accel") {
         files.push(format!("dev/accel/{node}"));
         let device = format!("sys/class/accel/{node}/device");
-        for rel in ["vendor", "device", "npu_max_frequency_mhz"] {
+        for rel in [
+            "vendor",
+            "device",
+            // 新路径优先，npu_max_frequency_mhz 是 legacy alias
+            "freq/hw_max_freq",
+            "npu_max_frequency_mhz",
+            // 运行时状态读的（瞬时值，但夹具有了就能测"读得到"这件事本身）
+            "freq/current_freq",
+            "npu_memory_utilization",
+            "npu_busy_time_us",
+        ] {
             files.push(format!("{device}/{rel}"));
         }
         device_dirs.push(device);
@@ -256,15 +287,20 @@ fn capture_plan(source: &Path) -> CapturePlan {
             "vendor",
             "device",
             "mem_info_vram_total",
+            "mem_info_vram_used",
             "gt/gt0/rps_max_freq_mhz",
+            "gt/gt0/rps_cur_freq_mhz",
             "gt_max_freq_mhz",
+            "gt_cur_freq_mhz",
         ] {
             files.push(format!("{device}/{rel}"));
         }
-        // xe 的 tile*/gt*/freq0/max_freq
+        // xe 的 tile*/gt*/freq0/{max,cur}_freq
         for tile in numeric_entries(source, &device, "tile") {
             for gt in numeric_entries(source, &format!("{device}/{tile}"), "gt") {
-                files.push(format!("{device}/{tile}/{gt}/freq0/max_freq"));
+                for leaf in ["max_freq", "cur_freq"] {
+                    files.push(format!("{device}/{tile}/{gt}/freq0/{leaf}"));
+                }
             }
         }
         device_dirs.push(device);
@@ -338,6 +374,33 @@ const CPUINFO_KEYS: [&str; 9] = [
 /// 它们读得到但**不进任何报告字段**（见 `deviceinfo::state`），写进夹具只会让
 /// 每次采集都产生无意义的 git diff，把真正的变化淹没在噪声里。
 const MEMINFO_KEYS: [&str; 2] = ["MemTotal", "SwapTotal"];
+
+/// 只有状态采样会读、而且下一秒就变的叶子文件名。夹具里把它们的**读数**归一化成 0。
+///
+/// 保留真实读数会让**每次**重新采集都产生 diff（`npu_busy_time_us` 是单调计数器，
+/// `*_cur_freq` / `npu_memory_utilization` 每时每刻都在变），把"探测逻辑真的变了"
+/// 这个信号淹没在噪声里——而夹具的价值恰好就在那个信号。
+/// 这些文件在夹具里的**存在**才是被测的东西：采样路径能不能读到它们。
+///
+/// 注意 `freq/hw_max_freq`、`mem_info_vram_total` 这类**上限**不在名单里：
+/// 它们是硬件事实，夹具要如实保存。
+const VOLATILE_LEAVES: [&str; 8] = [
+    "current_freq",
+    "cur_freq",
+    "npu_current_frequency_mhz",
+    "npu_memory_utilization",
+    "npu_busy_time_us",
+    "mem_info_vram_used",
+    "rps_cur_freq_mhz",
+    "gt_cur_freq_mhz",
+];
+
+fn is_volatile_leaf(rel: &str) -> bool {
+    Path::new(rel)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| VOLATILE_LEAVES.contains(&name))
+}
 
 /// 把 `/proc` 文件里探测器不读的行剔掉。
 ///

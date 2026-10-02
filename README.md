@@ -25,7 +25,7 @@
 | | `probe()` → `HardwareReport` | `sample_state()` → `RuntimeState` |
 |---|---|---|
 | 描述 | 这台机器**是什么** | **此刻**怎样 |
-| 内容 | 架构、核数与性能分层、指令集、加速器与运行时就绪度、内存总量 | 可用内存、swap、磁盘余量 |
+| 内容 | 架构、核数与性能分层、指令集、加速器与运行时就绪度、内存总量 | 可用内存、swap、磁盘余量、加速器的频率/常驻内存/累积忙碌时间 |
 | 变化频率 | 装上就不变 | 每一秒都在变 |
 | 能否缓存 / 跨机器 diff | 能 | 不能 |
 
@@ -36,6 +36,7 @@
 ```bash
 cargo run -p deviceinfo-cli                       # 硬件与能力（默认子命令）
 cargo run -p deviceinfo-cli -- state --watch /var/cache
+cargo run -p deviceinfo-cli -- state --counters    # 额外读累积计数器（见下）
 cargo run -p deviceinfo-cli -- --json hardware     # 跨机器 diff 用
 cargo run -p deviceinfo-cli -- hardware --root ./fixtures/lunar-lake-ultra7-258v
 cargo test
@@ -86,7 +87,9 @@ cargo run -p deviceinfo-cli -- capture --out fixtures/<名字>
 git add fixtures/<名字>
 ```
 
-采集是幂等的（`/proc` 里的瞬时字段会被剔掉），所以重新采集只会在探测逻辑**真的**
+采集是幂等的（`/proc` 里的瞬时字段会被剔掉；只被状态采样读的瞬时值文件——
+`npu_busy_time_us`、`*_cur_freq`、`npu_memory_utilization`——读数归一化成 `0`，
+它们**存在**这件事才是被测的对象），所以重新采集只会在探测逻辑**真的**
 变了的时候产生 diff。**快照变了不一定是 bug**：先看 diff，决定是"有意改了行为"
 （重新 capture 并提交）还是"引入了回归"（修代码）。
 
@@ -112,18 +115,31 @@ git add fixtures/<名字>
   后者是当前用户实际可写的量。判断"装不装得下"要用后者（ext4 默认给 root 留 5%）。
 - **`swap_exhausted()` 是个信号，不是数字**：swap 用满时 `MemAvailable` 会系统性高估，
   实测某台机器 swap 4 GiB 已用满而 `MemAvailable` 仍报 9 GiB。
+- **频率 `Some(0)` 的含义是"设备空闲"**，不是"读不到"。ivpu 驱动文档：`freq/current_freq`
+  "Valid only when the device is active; returns 0 when idle"。渲染成 `空闲` 而不是
+  `0 MHz`——后者会让人以为读数坏了。读不到才是 `None`。
+- **`npu_memory_utilization` 的单位是字节**（驱动文档原话：*report in bytes a current NPU
+  memory utilization*），即当前常驻的 NPU 内存总量。之前因为单位不明而不敢收，现在确定。
+- **累积计数器默认不读**（`SampleOptions::counters`）。驱动文档：
+  *"shouldn't be read too often as it may have an impact on job submission performance"*，
+  推荐周期 1 秒。默认开启会让高频轮询的面板在无意中拖慢 NPU 作业提交，而这种损害
+  在数据里看不出来。
+- **`AcceleratorState` 用 PCI 标识当连接键**（不是列表下标——顺序不是契约）。
+  没有 PCI 的加速器（ARM 上的 NPU 之类）只能靠 `kind` 对应。
+- **`npu_max_frequency_mhz` / `npu_current_frequency_mhz` 读的是新路径 `freq/*`**，
+  驱动文档把前者标为 *Legacy attributes (backward compatibility)*，旧路径只当兜底。
 
 ## 已知未做
 
 - **Intel 独显的显存**：驱动没暴露 `mem_info_vram_total` 且厂商是 Intel/AMD 时判为
   `SharedWithSystem`。Linux 上这绝大多数机器是对的（那两个厂商基本都是集显，而独显会
   暴露该节点），但**没有 Intel 独显可以验证**。
-- **加速器的运行时指标**：`npu_busy_time_us` / `npu_memory_utilization` /
-  `npu_current_frequency_mhz` / GPU 的 `cur_freq` 读得到但故意不收（瞬时值）。
-  它们的归宿是新开的 `state` 模块，还没做。
-- **`npu_memory_utilization` 的单位未确认**，所以连"原样带出来"都没做——
-  一个单位不明的数字比没有数字更糟。
-- **`sched_mode`**：语义不清楚（HW/SW 调度），对选模型没有影响，暂且不收。
+- **`sched_mode` 未收**：驱动文档已经说明它是 `HW` / `OS` 调度模式（属于**硬件事实**，
+  不是瞬时值），但当前判断它对"能不能跑 / 跑多快"没有直接影响，所以没进报告。
+- **NPU 的其它频率档位未收**：`freq/hw_min_freq`（650）、`freq/hw_efficient_freq`（950）
+  是驱动暴露的硬件事实，对能效调度有用，暂未收。
+- **`freq/set_min_freq` / `set_max_freq` 是**可写**的**：驱动允许配置 NPU 频率上下限，
+  本模块只读不写——写属于调度策略，不该由探测库做。
 - **其它厂商的运行时判据**：目前只有 Intel NPU 和 Intel GPU 两套。
 - **ARM64 真机夹具**：采集机制有了，但还没从 ARM 机器上采过——`fixtures/` 里目前
   只有一台 x86 混合架构机器。

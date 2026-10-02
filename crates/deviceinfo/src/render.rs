@@ -171,6 +171,28 @@ pub fn human_state(state: &RuntimeState) -> String {
         let _ = writeln!(out, "磁盘     （未指定要查的路径）");
     }
 
+    for (index, accel) in state.accelerators.iter().enumerate() {
+        let label = if index == 0 { "加速器   " } else { "         " };
+        let mut line = format!("{label}{:<3} ", kind_label(accel.kind));
+        if let Some(pci_id) = &accel.pci_id {
+            let _ = write!(line, "{}   ", pci_id.compact());
+        }
+        line.push_str(&match accel.current_freq_mhz {
+            // 0 的含义是**设备空闲**，不是没读到——驱动文档：freq/current_freq
+            // 只在设备活跃时有效。印成 "0 MHz" 会让人以为读数坏了。
+            Some(0) => "空闲".to_string(),
+            Some(freq) => format!("{freq} MHz"),
+            None => "频率未知".to_string(),
+        });
+        if let Some(bytes) = accel.resident_memory_bytes {
+            let _ = write!(line, "   常驻内存 {}", human_bytes(bytes));
+        }
+        if let Some(micros) = accel.busy_time_us {
+            let _ = write!(line, "   累积忙碌 {}", human_duration_us(micros));
+        }
+        let _ = writeln!(out, "{line}");
+    }
+
     for warning in &state.warnings {
         let _ = writeln!(out, "警告     {warning}");
     }
@@ -183,6 +205,19 @@ fn kind_label(kind: AcceleratorKind) -> &'static str {
         AcceleratorKind::Cpu => "CPU",
         AcceleratorKind::Gpu => "GPU",
         AcceleratorKind::Npu => "NPU",
+    }
+}
+
+/// 微秒 → 人可读时长。累积忙碌时间动辄上亿微秒，直接印数字没人看得懂。
+fn human_duration_us(micros: u64) -> String {
+    let seconds = micros / 1_000_000;
+    let (hours, minutes, secs) = (seconds / 3600, (seconds % 3600) / 60, seconds % 60);
+    if hours > 0 {
+        format!("{hours}h{minutes}m")
+    } else if minutes > 0 {
+        format!("{minutes}m{secs}s")
+    } else {
+        format!("{secs}s")
     }
 }
 
@@ -338,6 +373,7 @@ mod tests {
                 swap_free_bytes: Some(1_552_384),
             },
             disks: Vec::new(),
+            accelerators: Vec::new(),
             warnings: Vec::new(),
         };
         let text = human_state(&state);
@@ -353,10 +389,60 @@ mod tests {
                 ..state.memory
             },
             disks: Vec::new(),
+            accelerators: Vec::new(),
             warnings: Vec::new(),
         };
         let text = human_state(&no_swap);
         assert!(text.contains("交换     无"), "{text}");
         assert!(!text.contains("用满"), "{text}");
+    }
+
+    #[test]
+    fn a_zero_frequency_renders_as_idle_not_as_a_broken_reading() {
+        let state = RuntimeState {
+            memory: crate::MemoryState {
+                total_bytes: None,
+                available_bytes: None,
+                swap_total_bytes: None,
+                swap_free_bytes: None,
+            },
+            disks: Vec::new(),
+            accelerators: vec![
+                crate::AcceleratorState {
+                    kind: AcceleratorKind::Npu,
+                    pci_id: Some(PciId {
+                        vendor: "0x8086".into(),
+                        device: "0x643e".into(),
+                    }),
+                    // 驱动在设备空闲时报 0，而不是不报
+                    current_freq_mhz: Some(0),
+                    resident_memory_bytes: Some(68_714_496),
+                    busy_time_us: Some(88_694_865),
+                },
+                crate::AcceleratorState {
+                    kind: AcceleratorKind::Gpu,
+                    pci_id: None,
+                    current_freq_mhz: Some(967),
+                    resident_memory_bytes: None,
+                    busy_time_us: None,
+                },
+            ],
+            warnings: Vec::new(),
+        };
+
+        let text = human_state(&state);
+        assert!(text.contains("空闲"), "0 频率应当显示为空闲: {text}");
+        assert!(!text.contains("0 MHz"), "不能把空闲印成一个读数: {text}");
+        assert!(text.contains("967 MHz"), "{text}");
+        assert!(text.contains("常驻内存 65.5 MiB"), "{text}");
+        assert!(text.contains("累积忙碌 1m28s"), "{text}");
+    }
+
+    #[test]
+    fn durations_are_human_readable() {
+        assert_eq!(human_duration_us(0), "0s");
+        assert_eq!(human_duration_us(88_694_865), "1m28s");
+        assert_eq!(human_duration_us(3_600_000_000), "1h0m");
+        assert_eq!(human_duration_us(90_000_000_000), "25h0m");
     }
 }

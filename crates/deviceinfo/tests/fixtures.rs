@@ -70,3 +70,56 @@ fn captured_machines_still_probe_the_same() {
         dir.display()
     );
 }
+
+/// 硬件探测和状态采样各自实现了一遍设备发现（两份都需要不同上下文，拆出来反而难读），
+/// 所以这里盯住它们别走偏：同一棵夹具上必须发现同样数量的同一批设备。
+#[test]
+fn state_and_hardware_agree_on_which_devices_exist() {
+    let dir = fixtures_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let fixture = entry.path();
+        if !fixture.is_dir() {
+            continue;
+        }
+        let arch = "x86_64";
+        let hardware = probe_with(&fixture, arch);
+        let options = deviceinfo::SampleOptions {
+            watch: Vec::new(),
+            // 夹具里也有计数器文件，打开才能验证那条路径真的读得到
+            counters: true,
+        };
+        let state = deviceinfo::sample_state_with(&fixture, &options);
+
+        assert_eq!(
+            state.accelerators.len(),
+            hardware.accelerators.len(),
+            "{}: 状态采样与硬件探测发现的设备数不一致——两份发现逻辑走偏了",
+            fixture.display()
+        );
+
+        // 每一台都要能用 PCI 标识对上，且状态里至少读到了一个瞬时值
+        for accel in &hardware.accelerators {
+            let matched = state.accelerators.iter().find(|candidate| {
+                candidate.kind == accel.kind && candidate.pci_id == accel.pci_id
+            });
+            let matched = matched.unwrap_or_else(|| {
+                panic!(
+                    "{}: 硬件里有 {:?} {:?}，状态里找不到",
+                    fixture.display(),
+                    accel.kind,
+                    accel.pci_id
+                )
+            });
+            assert!(
+                matched.current_freq_mhz.is_some() || matched.resident_memory_bytes.is_some(),
+                "{}: {:?} 一个瞬时值都没读到，说明夹具里的路径和采样逻辑不一致",
+                fixture.display(),
+                accel.kind
+            );
+        }
+    }
+}

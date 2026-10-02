@@ -63,9 +63,9 @@ pub use report::{
     Accelerator, AcceleratorKind, AcceleratorMemory, CoreTier, CpuInfo, HardwareReport, MemoryInfo,
     PciId, RuntimeStatus,
 };
-pub use state::{DiskUsage, MemoryState, RuntimeState};
+pub use state::{AcceleratorState, DiskUsage, MemoryState, RuntimeState, SampleOptions};
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// 探测真实系统。`root` 传 `/`。
 pub fn probe(root: &Path) -> HardwareReport {
@@ -94,17 +94,18 @@ pub fn probe_with(root: &Path, arch: &str) -> HardwareReport {
     }
 }
 
-/// 采样一次运行时状态。`watch` 是要查磁盘余量的路径（通常是模型缓存目录）。
+/// 采样一次运行时状态。
 ///
-/// 与 [`probe`] 分开的理由见 [`state`] 的模块文档：这里的每个数字下一秒就不一样。
-pub fn sample_state(watch: &[PathBuf]) -> RuntimeState {
-    state::sample(Path::new("/"), watch)
+/// 注意 [`SampleOptions::counters`] **默认关**：NPU 的累积忙碌时间不宜频繁读取，
+/// 驱动文档建议间隔不低于 1 秒。理由见那个字段的文档。
+pub fn sample_state(options: &SampleOptions) -> RuntimeState {
+    state::sample(Path::new("/"), options)
 }
 
-/// 与 [`sample_state`] 相同，但 `/proc` 部分可注入（测试用）。
+/// 与 [`sample_state`] 相同，但 `/proc` 与 `/sys` 部分可注入（测试用）。
 ///
-/// `watch` 里的路径**不经过 `root`**：`statvfs` 查的是真实挂载的文件系统，
+/// `options.watch` 里的路径**不经过 `root`**：`statvfs` 查的是真实挂载的文件系统，
 /// 对着假文件树问"这块盘还剩多少"没有意义。
-pub fn sample_state_with(root: &Path, watch: &[PathBuf]) -> RuntimeState {
-    state::sample(root, watch)
+pub fn sample_state_with(root: &Path, options: &SampleOptions) -> RuntimeState {
+    state::sample(root, options)
 }

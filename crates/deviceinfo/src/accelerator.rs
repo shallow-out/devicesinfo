@@ -46,7 +46,9 @@ fn driver_version_of(root: &Path, driver: Option<&str>) -> Option<String> {
 }
 
 /// 从 sysfs 读 PCI 标识。GPU 和 NPU 都有这两个文件。
-fn read_pci_id(device_dir: &Path) -> Option<PciId> {
+///
+/// `pub(crate)`：状态采样要用它当连接键，把两边报告的同一个设备对起来。
+pub(crate) fn read_pci_id(device_dir: &Path) -> Option<PciId> {
     Some(PciId {
         vendor: read_trimmed(&device_dir.join("vendor"))?,
         device: read_trimmed(&device_dir.join("device"))?,
@@ -77,7 +79,9 @@ fn name_from_pci(
 ///
 /// xe 驱动把 GPU 按 `tile0/gt0`、`tile0/gt1` 组织，编号和数量都不固定，
 /// 硬编码 `tile0/gt0` 在双 tile 或换代的机器上会静默失效。
-fn numbered_dirs(dir: &Path, prefix: &str) -> Vec<PathBuf> {
+///
+/// `pub(crate)`：状态采样读当前频率时要走同一套布局。
+pub(crate) fn numbered_dirs(dir: &Path, prefix: &str) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -179,7 +183,9 @@ pub(crate) fn probe_npus(
             pci_id,
             // NPU 没有独立显存：权重和中间张量都在系统内存里。
             memory: AcceleratorMemory::SharedWithSystem,
-            max_freq_mhz: read_u64(&device_dir.join("npu_max_frequency_mhz")),
+            // `npu_max_frequency_mhz` 是 Legacy alias（驱动文档原话），先读 freq/hw_max_freq
+            max_freq_mhz: read_u64(&device_dir.join("freq/hw_max_freq"))
+                .or_else(|| read_u64(&device_dir.join("npu_max_frequency_mhz"))),
             runtime,
             notes: Vec::new(),
         };

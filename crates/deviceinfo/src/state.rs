@@ -21,6 +21,7 @@
 //! [`MemoryState::swap_exhausted`] 就是为这个场景准备的信号。
 
 use crate::sysfs::kib_field;
+use crate::report::AcceleratorKind;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
@@ -73,6 +74,54 @@ pub struct DiskUsage {
     pub available_bytes: u64,
 }
 
+/// 采样选项。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SampleOptions {
+    /// 要查磁盘余量的路径。
+    pub watch: Vec<PathBuf>,
+    /// 是否读取**累积计数器**（目前只有 NPU 的 `npu_busy_time_us`）。
+    ///
+    /// **默认关**，这是有意为之：ivpu 驱动文档写着它
+    /// > shouldn't be read too often as it may have an impact on job submission
+    /// > performance，推荐周期 _1 second_
+    ///
+    /// 一个默认开启的 API 会让高频轮询的面板在无意中拖慢 NPU 作业提交，
+    /// 而且这种损害在数据里看不出来。要拿这个值就先把轮询周期调到 ≥1 秒。
+    pub counters: bool,
+}
+
+/// 一台加速器的瞬时指标。
+///
+/// 与 [`crate::Accelerator`] 的分工：那边是"这设备是什么"，这里是"它现在在什么状态"。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceleratorState {
+    pub kind: AcceleratorKind,
+    /// 与硬件报告里同一台设备的连接键。
+    ///
+    /// 用 PCI 标识而不是下标：列表顺序不是契约，而 `8086:643e` 是。
+    /// 没有 PCI 的加速器（ARM 上的 NPU 之类）这里是 `None`，只能靠 [`Self::kind`] 对应。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pci_id: Option<crate::report::PciId>,
+    /// 当前频率（MHz）。
+    ///
+    /// ⚠️ **`Some(0)` 的含义是"设备空闲"，不是"读不到"**。ivpu 驱动文档：
+    /// `freq/current_freq` 只在设备活跃时有效，空闲时返回 0。
+    /// 把它当成未知是个真实的错误：空闲的 NPU 频率确实就是 0。
+    /// 读不到才是 `None`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_freq_mhz: Option<u64>,
+    /// 常驻内存（字节）。
+    ///
+    /// NPU 上是 `npu_memory_utilization`（驱动文档确认**单位就是字节**，
+    /// 指当前常驻的 NPU 内存总量）；GPU 上是已用显存（驱动暴露 `mem_info_vram_used` 时）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resident_memory_bytes: Option<u64>,
+    /// 累积忙碌时间（微秒）。只有 [`SampleOptions::counters`] 打开时才读，
+    /// 理由见那个字段的文档。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub busy_time_us: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeState {
     pub memory: MemoryState,
@@ -83,6 +132,9 @@ pub struct RuntimeState {
     /// 这个本来想问的问题失去答案。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disks: Vec<DiskUsage>,
+    /// 加速器的瞬时指标。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accelerators: Vec<AcceleratorState>,
     /// 采样过程中的不确定之处。
     #[serde(default)]
     pub warnings: Vec<String>,
@@ -90,14 +142,16 @@ pub struct RuntimeState {
 
 /// 采样一次运行时状态。
 ///
-/// `root` 是 `/proc` 的注入前缀（测试用假文件树）；`watch` 里的路径**不经过它**——
-/// `statvfs` 查的是真实挂载的文件系统，对着假文件树问"这块盘还剩多少"没有意义。
-pub(crate) fn sample(root: &Path, watch: &[PathBuf]) -> RuntimeState {
+/// `root` 是 `/proc` 与 `/sys` 的注入前缀（测试用假文件树）；`options.watch` 里的路径
+/// **不经过它**——`statvfs` 查的是真实挂载的文件系统，对着假文件树问"这块盘还剩多少"
+/// 没有意义。
+pub(crate) fn sample(root: &Path, options: &SampleOptions) -> RuntimeState {
     let mut warnings = Vec::new();
     let memory = sample_memory(root, &mut warnings);
+    let accelerators = sample_accelerators(root, options, &mut warnings);
 
     let mut disks = Vec::new();
-    for path in watch {
+    for path in &options.watch {
         match filesystem_usage(path) {
             Ok(usage) => disks.push(DiskUsage {
                 path: path.clone(),
@@ -110,8 +164,92 @@ pub(crate) fn sample(root: &Path, watch: &[PathBuf]) -> RuntimeState {
     RuntimeState {
         memory,
         disks,
+        accelerators,
         warnings,
     }
+}
+
+/// 枚举加速器的 sysfs 设备目录。
+///
+/// 这份发现逻辑和 [`crate::accelerator`] 里的是两份实现（那边需要更多上下文，
+/// 拆出来反而难读），靠 `state_and_hardware_agree_on_which_devices_exist`
+/// 这个测试保证两边不会走偏。
+fn accelerator_devices(root: &Path) -> Vec<(AcceleratorKind, PathBuf)> {
+    let mut found = Vec::new();
+    if let Ok(entries) = fs::read_dir(root.join("dev/accel")) {
+        for entry in entries.flatten() {
+            let node = entry.file_name().to_string_lossy().into_owned();
+            if node.starts_with("accel") {
+                found.push((
+                    AcceleratorKind::Npu,
+                    root.join("sys/class/accel").join(node).join("device"),
+                ));
+            }
+        }
+    }
+    if let Ok(entries) = fs::read_dir(root.join("sys/class/drm")) {
+        for entry in entries.flatten() {
+            let node = entry.file_name().to_string_lossy().into_owned();
+            // `cardN-DP-1` 是显示连接器，不是 GPU
+            if node.starts_with("card") && !node.contains('-') {
+                found.push((AcceleratorKind::Gpu, entry.path().join("device")));
+            }
+        }
+    }
+    found
+}
+
+fn sample_accelerators(
+    root: &Path,
+    options: &SampleOptions,
+    _warnings: &mut Vec<String>,
+) -> Vec<AcceleratorState> {
+    let mut found = Vec::new();
+    for (kind, device_dir) in accelerator_devices(root) {
+        let mut state = AcceleratorState {
+            kind,
+            pci_id: crate::accelerator::read_pci_id(&device_dir),
+            current_freq_mhz: current_freq_mhz(&device_dir, kind),
+            resident_memory_bytes: resident_memory_bytes(&device_dir),
+            busy_time_us: None,
+        };
+        if options.counters {
+            // 驱动建议间隔 ≥1 秒，见 SampleOptions::counters
+            state.busy_time_us = crate::sysfs::read_u64(&device_dir.join("npu_busy_time_us"));
+        }
+        found.push(state);
+    }
+    found
+}
+
+/// 当前频率（MHz）。
+///
+/// NPU 优先读 `freq/current_freq`：驱动文档把 `npu_*_frequency_mhz` 明确标为
+/// **Legacy attributes (backward compatibility)**，先读新路径、旧路径当兜底。
+fn current_freq_mhz(device_dir: &Path, kind: AcceleratorKind) -> Option<u64> {
+    if kind == AcceleratorKind::Npu {
+        return crate::sysfs::read_u64(&device_dir.join("freq/current_freq"))
+            .or_else(|| crate::sysfs::read_u64(&device_dir.join("npu_current_frequency_mhz")));
+    }
+    // xe 把 GPU 按 tileN/gtN 组织；i915 的布局不一样
+    for tile in crate::accelerator::numbered_dirs(device_dir, "tile") {
+        for gt in crate::accelerator::numbered_dirs(&tile, "gt") {
+            if let Some(freq) = crate::sysfs::read_u64(&gt.join("freq0/cur_freq")) {
+                return Some(freq);
+            }
+        }
+    }
+    ["gt/gt0/rps_cur_freq_mhz", "gt_cur_freq_mhz"]
+        .iter()
+        .find_map(|path| crate::sysfs::read_u64(&device_dir.join(path)))
+}
+
+/// 常驻内存（字节）。
+fn resident_memory_bytes(device_dir: &Path) -> Option<u64> {
+    // NPU 的 npu_memory_utilization 单位就是字节（驱动文档原话：report in bytes）
+    crate::sysfs::read_u64(&device_dir.join("npu_memory_utilization"))
+        // amdgpu 的已用显存
+        .or_else(|| crate::sysfs::read_u64(&device_dir.join("mem_info_vram_used")))
 }
 
 fn sample_memory(root: &Path, warnings: &mut Vec<String>) -> MemoryState {
@@ -265,10 +403,75 @@ mod tests {
         let root = fake_root("nowatch");
         fs::write(root.join("proc/meminfo"), "MemTotal: 1000 kB\n").unwrap();
 
-        let state = sample(&root, &[PathBuf::from("/definitely/not/here")]);
+        let state = sample(
+            &root,
+            &SampleOptions {
+                watch: vec![PathBuf::from("/definitely/not/here")],
+                counters: false,
+            },
+        );
         assert!(state.disks.is_empty());
         assert_eq!(state.warnings.len(), 1, "{:#?}", state.warnings);
         assert!(state.warnings[0].contains("not/here"), "{:#?}", state.warnings);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// 手动搭一台只有 NPU 的假机器，值取自真机实测。
+    fn fake_npu(root: &Path) {
+        fs::create_dir_all(root.join("dev/accel")).unwrap();
+        fs::write(root.join("dev/accel/accel0"), "").unwrap();
+        let device = root.join("sys/class/accel/accel0/device");
+        fs::create_dir_all(device.join("freq")).unwrap();
+        fs::write(device.join("freq/current_freq"), "0\n").unwrap();
+        fs::write(device.join("npu_memory_utilization"), "68714496\n").unwrap();
+        fs::write(device.join("npu_busy_time_us"), "88694865\n").unwrap();
+        fs::write(device.join("vendor"), "0x8086\n").unwrap();
+        fs::write(device.join("device"), "0x643e\n").unwrap();
+    }
+
+    /// 驱动在设备空闲时报 0（文档：`freq/current_freq` 只在设备活跃时有效）。
+    /// 把它当成"读不到"是个真实的错误：空闲的 NPU 频率确实就是 0。
+    #[test]
+    fn npu_idle_reports_zero_not_unknown() {
+        let root = fake_root("npu-idle");
+        fs::write(root.join("proc/meminfo"), "MemTotal: 1000 kB\n").unwrap();
+        fake_npu(&root);
+
+        let state = sample(&root, &SampleOptions::default());
+        assert_eq!(state.accelerators.len(), 1);
+        let npu = &state.accelerators[0];
+        assert_eq!(npu.current_freq_mhz, Some(0), "0 是空闲，不是未知");
+        // npu_memory_utilization 的单位是字节（驱动文档原话：report in bytes）
+        assert_eq!(npu.resident_memory_bytes, Some(68_714_496));
+        // 用 PCI 标识当连接键，而不是靠列表下标
+        assert_eq!(npu.pci_id.as_ref().unwrap().compact(), "8086:643e");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// 累积计数器默认**不读**：驱动文档说它不宜频繁读取（会影响作业提交性能）。
+    /// 一个默认开启的 API 会让高频轮询的面板在无意中拖慢 NPU。
+    #[test]
+    fn cumulative_counters_need_an_explicit_opt_in() {
+        let root = fake_root("counters");
+        fs::write(root.join("proc/meminfo"), "MemTotal: 1000 kB\n").unwrap();
+        fake_npu(&root);
+
+        let quiet = sample(&root, &SampleOptions::default());
+        assert_eq!(
+            quiet.accelerators[0].busy_time_us, None,
+            "默认就不该读它，即使文件明明存在"
+        );
+
+        let verbose = sample(
+            &root,
+            &SampleOptions {
+                watch: Vec::new(),
+                counters: true,
+            },
+        );
+        assert_eq!(verbose.accelerators[0].busy_time_us, Some(88_694_865));
 
         fs::remove_dir_all(&root).ok();
     }
