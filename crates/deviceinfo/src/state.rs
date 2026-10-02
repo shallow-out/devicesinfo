@@ -96,6 +96,13 @@ pub struct SampleOptions {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AcceleratorState {
     pub kind: AcceleratorKind,
+    /// 设备在 sysfs 里的名字：`accel0` / `card1`。
+    ///
+    /// 为什么需要它：平台设备（SoC 上集成的显示/图形单元）**没有 PCI 标识**，
+    /// 于是一台有 3 个显示控制器的机器会给出 3 条一模一样的记录，只有按列表位置
+    /// 才能区分——而"按位置对应"正是本模块在别处刻意避开的做法（见 `renderD` 的归属）。
+    /// 这个名字是**每个设备唯一**的，而且人也能在 sysfs 里对上。
+    pub node: String,
     /// 与硬件报告里同一台设备的连接键。
     ///
     /// 用 PCI 标识而不是下标：列表顺序不是契约，而 `8086:643e` 是。
@@ -175,16 +182,21 @@ pub(crate) fn sample(root: &Path, options: &SampleOptions) -> RuntimeState {
 /// 拆出来反而难读），靠 `state_and_hardware_agree_on_which_devices_exist`
 /// 这个测试保证两边不会走偏——**包括顺序**：两边都按设备名排序，
 /// 所以第 N 个状态对应第 N 个设备。
-fn accelerator_devices(root: &Path) -> Vec<(AcceleratorKind, PathBuf)> {
+fn accelerator_devices(root: &Path) -> Vec<(AcceleratorKind, String, PathBuf)> {
     // 顺序必须由名字决定，不能由目录项顺序决定：否则状态列表和硬件列表对不上，
     // 而两份都声称自己在描述同一批设备
-    let mut entries: Vec<(String, AcceleratorKind, PathBuf)> = Vec::new();
+    let mut entries: Vec<(String, AcceleratorKind, String, PathBuf)> = Vec::new();
     if let Ok(dir) = fs::read_dir(root.join("dev/accel")) {
         for entry in dir.flatten() {
             let node = entry.file_name().to_string_lossy().into_owned();
             if node.starts_with("accel") {
                 let device = root.join("sys/class/accel").join(&node).join("device");
-                entries.push((format!("0accel/{node}"), AcceleratorKind::Npu, device));
+                entries.push((
+                    format!("0accel/{node}"),
+                    AcceleratorKind::Npu,
+                    node.clone(),
+                    device,
+                ));
             }
         }
     }
@@ -205,23 +217,40 @@ fn accelerator_devices(root: &Path) -> Vec<(AcceleratorKind, PathBuf)> {
                         .is_dir()
                         .then(|| crate::accelerator::render_nodes_of(&device).len()),
                 );
-                entries.push((format!("1drm/{node}"), kind, device));
+                entries.push((
+                    format!("1drm/{node}"),
+                    kind,
+                    node.clone(),
+                    device,
+                ));
             }
         }
     }
     entries.sort_by(|a, b| a.0.cmp(&b.0));
-    entries.into_iter().map(|(_, kind, dir)| (kind, dir)).collect()
+    entries
+        .into_iter()
+        .map(|(_, kind, node, dir)| (kind, node, dir))
+        .collect()
 }
 
 fn sample_accelerators(
     root: &Path,
     options: &SampleOptions,
-    _warnings: &mut Vec<String>,
+    warnings: &mut Vec<String>,
 ) -> Vec<AcceleratorState> {
     let mut found = Vec::new();
-    for (kind, device_dir) in accelerator_devices(root) {
+    for (kind, node, device_dir) in accelerator_devices(root) {
+        // 设备节点在、但 sysfs 目录读不到：实例指标会全是 None，而"全是 None"
+        // 与"设备真的没有这些指标"看起来一样，得说出来
+        if !device_dir.exists() {
+            warnings.push(format!(
+                "加速器 {kind:?} 的 sysfs 目录 {} 不存在，瞬时指标不可用",
+                device_dir.display()
+            ));
+        }
         let mut state = AcceleratorState {
             kind,
+            node,
             pci_id: crate::accelerator::read_pci_id(&device_dir),
             current_freq_mhz: current_freq_mhz(&device_dir, kind),
             resident_memory_bytes: resident_memory_bytes(&device_dir),
@@ -427,6 +456,49 @@ mod tests {
         assert!(state.disks.is_empty());
         assert_eq!(state.warnings.len(), 1, "{:#?}", state.warnings);
         assert!(state.warnings[0].contains("not/here"), "{:#?}", state.warnings);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// 同类设备（比如三个显示控制器）必须能靠 `node` 区分开，不能只有列表位置——
+    /// 平台设备没有 PCI 标识，否则三条记录看起来一模一样。
+    #[test]
+    fn same_kind_devices_are_distinguishable_by_node() {
+        let root = fake_root("node-identity");
+        fs::write(root.join("proc/meminfo"), "MemTotal: 1000 kB\n").unwrap();
+        for card in ["card0", "card1", "card2"] {
+            fs::create_dir_all(root.join(format!("sys/class/drm/{card}/device/drm"))).unwrap();
+        }
+
+        let state = sample(&root, &SampleOptions::default());
+        let nodes: Vec<&str> = state
+            .accelerators
+            .iter()
+            .map(|accel| accel.node.as_str())
+            .collect();
+        assert_eq!(nodes, vec!["card0", "card1", "card2"]);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// 设备节点在、sysfs 目录却读不到时要说出来：否则瞬时指标全是 `None`，
+    /// 而那和"这台设备真的没有这些指标"看起来一样。
+    #[test]
+    fn a_missing_sysfs_dir_is_reported_not_silently_empty() {
+        let root = fake_root("missing-sysfs");
+        fs::write(root.join("proc/meminfo"), "MemTotal: 1000 kB\n").unwrap();
+        // 有设备节点，但没有对应的 sys/class 条目
+        fs::create_dir_all(root.join("dev/accel")).unwrap();
+        fs::write(root.join("dev/accel/accel0"), "").unwrap();
+
+        let state = sample(&root, &SampleOptions::default());
+        assert_eq!(state.accelerators.len(), 1);
+        assert_eq!(state.accelerators[0].current_freq_mhz, None);
+        assert!(
+            state.warnings.iter().any(|w| w.contains("sysfs")),
+            "{:#?}",
+            state.warnings
+        );
 
         fs::remove_dir_all(&root).ok();
     }

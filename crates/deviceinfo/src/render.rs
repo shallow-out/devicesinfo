@@ -195,7 +195,8 @@ pub fn human_state(state: &RuntimeState) -> String {
 
     for (index, accel) in state.accelerators.iter().enumerate() {
         let label = if index == 0 { "加速器   " } else { "         " };
-        let mut line = format!("{label}{:<3} ", kind_label(accel.kind));
+        // 设备名放前面：平台设备没有 PCI 标识，只有这个名字能区分同类设备
+        let mut line = format!("{label}{:<3} {:<8}", kind_label(accel.kind), accel.node);
         if let Some(pci_id) = &accel.pci_id {
             let _ = write!(line, "{}   ", pci_id.compact());
         }
@@ -437,6 +438,7 @@ mod tests {
             accelerators: vec![
                 crate::AcceleratorState {
                     kind: AcceleratorKind::Npu,
+                    node: "accel0".into(),
                     pci_id: Some(PciId {
                         vendor: "0x8086".into(),
                         device: "0x643e".into(),
@@ -448,6 +450,7 @@ mod tests {
                 },
                 crate::AcceleratorState {
                     kind: AcceleratorKind::Gpu,
+                    node: "card0".into(),
                     pci_id: None,
                     current_freq_mhz: Some(967),
                     resident_memory_bytes: None,
