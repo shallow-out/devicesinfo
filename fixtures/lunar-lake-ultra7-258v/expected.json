@@ -1,7 +1,8 @@
 {
   "cpu": {
     "arch": "x86_64",
-    "model": "Intel(R) Core(TM) Ultra 7 258V",
+    "cpu_model": "Intel(R) Core(TM) Ultra 7 258V",
+    "machine_model": "83LC",
     "logical_cores": 8,
     "physical_cores": 8,
     "core_tiers": [

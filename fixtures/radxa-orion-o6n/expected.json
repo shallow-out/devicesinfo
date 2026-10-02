@@ -1,7 +1,8 @@
 {
   "cpu": {
     "arch": "aarch64",
-    "model": "CIX P1 CD8180",
+    "cpu_model": "CIX P1 CD8180",
+    "machine_model": "Radxa Orion O6N",
     "logical_cores": 12,
     "physical_cores": 12,
     "core_tiers": [

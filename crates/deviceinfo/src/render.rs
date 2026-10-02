@@ -16,11 +16,15 @@ pub fn human(report: &HardwareReport) -> String {
 
     let cpu_model = report
         .cpu
-        .model
+        .cpu_model
         .clone()
-        .unwrap_or_else(|| "未知 CPU".into());
+        .unwrap_or_else(|| "未知处理器".into());
     // 架构放在标题行：它是"这个模型能不能跑"的第一道闸
     let _ = writeln!(out, "CPU      {cpu_model}  [{}]", report.cpu.arch);
+    // 整机型号单独一行：它是另一件事实，而且 ARM 上往往是唯一的标识
+    if let Some(machine) = &report.cpu.machine_model {
+        let _ = writeln!(out, "整机     {machine}");
+    }
 
     let mut core_line = format!("         {} 逻辑核", report.cpu.logical_cores);
     if let Some(physical) = report.cpu.physical_cores {
@@ -307,7 +311,8 @@ mod tests {
         let report = HardwareReport {
             cpu: CpuInfo {
                 arch: "x86_64".into(),
-                model: Some("Intel(R) Core(TM) Ultra 7 258V".into()),
+                cpu_model: Some("Intel(R) Core(TM) Ultra 7 258V".into()),
+                machine_model: Some("83LC".into()),
                 logical_cores: 8,
                 physical_cores: Some(8),
                 core_tiers: vec![CoreTier {
@@ -366,6 +371,7 @@ mod tests {
         let text = human(&report);
         // 架构和等效算力在
         assert!(text.contains("[x86_64]"), "{text}");
+        assert!(text.contains("整机     83LC"), "整机型号要单独一行: {text}");
         assert!(text.contains("等效算力 8.0 核"), "{text}");
         // 显存"未知"要带原因，不能只说未知
         assert!(

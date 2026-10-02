@@ -162,11 +162,18 @@ pub struct CpuInfo {
     /// 目标架构（`x86_64` / `aarch64`）。这是"能不能跑"最硬的过滤条件：
     /// 一段带 AVX-512 kernel 的 GGUF 在 ARM 上根本跑不了。
     pub arch: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    // 语义提醒：x86 上这是**处理器**型号（cpuinfo 的 `model name`）；
-    // ARM 上通常是**整机**型号（平台只给得出这个：设备树 `model` 或 DMI `product_name`）。
-    // 拆成两个字段更干净，见 README 的"已知未做"。
+    /// **处理器**型号（cpuinfo 的 `model name`）。
+    ///
+    /// arm64 上内核未必报它——取决于厂商内核，实测 Rockchip 那台一行都没有。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_model: Option<String>,
+    /// **整机**型号。来源按固件接口：设备树 `model`，或 DMI `product_name`。
+    ///
+    /// 和 [`Self::cpu_model`] 分开，因为它们是**两件不同的事实**：x86 上两者都有
+    /// （`Intel(R) Core(TM) Ultra 7 258V` vs `83LC`），而以前挤在一个字段里、
+    /// 含义还随架构变化——ARM 上那个字段装的其实是整机型号，上层根本没法统一处理。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_model: Option<String>,
     pub logical_cores: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub physical_cores: Option<usize>,

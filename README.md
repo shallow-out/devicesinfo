@@ -66,7 +66,7 @@ let state = deviceinfo::sample_state(&[std::path::PathBuf::from("/var/cache")]);
 | 模块 | 职责 |
 |---|---|
 | `report` | 硬件报告的对外结构，不含任何 IO |
-| `cpu` | 架构、核数、性能分层、指令集 |
+| `cpu` | 架构、处理器/整机型号、核数、性能分层、指令集 |
 | `memory` | 内存**总量**（事实） |
 | `accelerator` | GPU / NPU 的设备事实、内存语义、运行时就绪度 |
 | `state` | 运行时状态：可用内存、swap、磁盘余量（瞬时值） |
@@ -220,9 +220,6 @@ git add fixtures/<名字>
 - **`freq/set_min_freq` / `set_max_freq` 是**可写**的**：驱动允许配置 NPU 频率上下限，
   本模块只读不写——写属于调度策略，不该由探测库做。
 - **其它厂商的运行时判据**：目前只有 Intel NPU 和 Intel GPU 两套。
-- **`CpuInfo.model` 一个字段担了两种含义**：x86 上是**处理器**型号（cpuinfo 的
-  `model name`），ARM 上通常是**整机**型号（设备树 `model` 或 DMI `product_name`）——
-  因为平台只给得出后者。拆成 `cpu_model` + `machine_model` 更干净，但会动到字段。
 - **加速器的身份来源有三种，按设备挑**：PCI 标识、设备树 `compatible`、以及什么都没有。
   `o6n` 那台**整个 `/sys/firmware/devicetree` 都不存在**，它的 DRM 设备又是平台设备
   （没有 PCI 标识），所以名字只能退回 `GPU (card0)`。（整机型号走了 DMI 兜底，
@@ -239,9 +236,10 @@ git add fixtures/<名字>
   accelerators [1200]" 分开标。
   **这套逻辑没有真机验证过**：手上没有任何一块这类卡，只有单元测试 + 本机那颗
   已被 `/dev/accel` 覆盖的 Intel NPU（用它验证去重是对的）。
-- **设备树/DMI 的型号兜底没有真机验证**：`machine_model` 的 DMI 分支目前没有一台
-  "既没设备树、cpuinfo 又不报型号"的机器可以验证（`o6n` 的 cpuinfo 里有
-  `model name`，所以走的是第一条路）。单元测试覆盖了，真机没验。
+- **处理器型号在 arm64 上往往拿不到**：`cpu_model` 只有内核报 `model name` 时才有值
+  （Rockchip 那台就没有）。设备树里其实有 `cpus/cpu@0/compatible`（形如
+  `arm,cortex-a76`）可以补，但那是另一条路径，暂未收。
+
 - **`libc` 依赖**：只为了 `statvfs`（标准库至今没有 `std::fs::statfs`/`statvfs`）。
   全部 `unsafe` 只出现在 `state::filesystem_usage` 一处。
 

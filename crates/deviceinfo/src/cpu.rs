@@ -32,23 +32,20 @@ pub(crate) fn probe(root: &Path, arch: &str, warnings: &mut Vec<String>) -> CpuI
         warnings.push("没有 sysfs CPU 拓扑（sys/devices/system/cpu），核分组与物理核数不可用".into());
     }
 
-    // x86 用 "model name"；arm64 的 `/proc/cpuinfo` **根本不报型号**，
-    // 那边型号在设备树里（见 `devicetree_model`）。
-    let model = cpuinfo
-        .as_deref()
-        .and_then(|text| {
-            ["model name", "Model", "Hardware", "Processor"]
-                .iter()
-                .find_map(|key| field(text, key))
-                .map(str::to_string)
-        })
-        .or_else(|| machine_model(root));
+    // x86 用 "model name"；arm64 未必有（见 CpuInfo::cpu_model 的文档）
+    let cpu_model = cpuinfo.as_deref().and_then(|text| {
+        ["model name", "Model", "Hardware", "Processor"]
+            .iter()
+            .find_map(|key| field(text, key))
+            .map(str::to_string)
+    });
 
     let simd = cpuinfo.as_deref().map(features::parse).unwrap_or_default();
 
     CpuInfo {
         arch: arch.to_string(),
-        model,
+        cpu_model,
+        machine_model: machine_model(root),
         logical_cores,
         physical_cores: probe_physical_cores(root, &cpu_ids, cpuinfo.as_deref(), logical_cores),
         core_tiers: probe_core_tiers(root, &cpu_ids, logical_cores, warnings),
@@ -439,7 +436,10 @@ mod tests {
             Some(8),
             "ARM64 没有 physical id，必须靠 sysfs 拓扑"
         );
-        assert_eq!(reported.model.as_deref(), Some("Radxa Orion O6N"));
+        // 这台 CIX 的厂商内核在 arm64 上也报 `model name` → 处理器型号有值
+        assert_eq!(reported.cpu_model.as_deref(), Some("Radxa Orion O6N"));
+        // 而它是 ACPI 机器，设备树整个不存在 → 整机型号只能靠 DMI
+        assert_eq!(reported.machine_model, None);
         // 同构 ARM：等效核数就等于核数
         assert_eq!(reported.effective_cores(), Some(8.0));
         assert_eq!(reported.core_tiers.len(), 1);
@@ -501,7 +501,7 @@ mod tests {
         // 没有 sysfs 时退回 cpuinfo 的 physical id / core id
         assert_eq!(reported.physical_cores, Some(2));
         assert_eq!(
-            reported.model.as_deref(),
+            reported.cpu_model.as_deref(),
             Some("Intel(R) Core(TM) Ultra 7 258V")
         );
         assert!(reported.features.contains(&"avx512f".to_string()));
@@ -542,10 +542,52 @@ mod tests {
 
         let mut warnings = Vec::new();
         let reported = probe(&root, "aarch64", &mut warnings);
-        assert_eq!(reported.model.as_deref(), Some("Radxa ROCK 5B+"));
+        // 这台 Rockchip 的 cpuinfo 里**没有**型号 → 处理器型号为空，整机型号来自设备树
+        assert_eq!(reported.cpu_model, None);
+        assert_eq!(reported.machine_model.as_deref(), Some("Radxa ROCK 5B+"));
         // 顺带：空值不能冒充型号
         fs::write(root.join("sys/firmware/devicetree/base/model"), b"\0").unwrap();
-        assert_eq!(probe(&root, "aarch64", &mut Vec::new()).model, None);
+        assert_eq!(
+            probe(&root, "aarch64", &mut Vec::new()).machine_model,
+            None
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// ACPI 平台没有设备树，整机型号在 DMI 里。实测那台 CIX 的机器**整个
+    /// `/sys/firmware/devicetree` 都不存在**，只有 `/sys/class/dmi/id/product_name`。
+    #[test]
+    fn machine_model_falls_back_to_dmi() {
+        let root = fake_root("dmi-model");
+        fake_meminfo(&root);
+        fs::write(
+            root.join("proc/cpuinfo"),
+            "processor\t: 0\nBogoMIPS\t: 48.00\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("sys/devices/system/cpu/smt")).unwrap();
+        fs::write(root.join("sys/devices/system/cpu/smt/active"), "0\n").unwrap();
+        fs::create_dir_all(root.join("sys/class/dmi/id")).unwrap();
+        // DMI 文件是普通文本，带尾换行——不是 NUL 结尾的
+        fs::write(root.join("sys/class/dmi/id/product_name"), "Radxa Orion O6N\n").unwrap();
+
+        let mut warnings = Vec::new();
+        let reported = probe(&root, "aarch64", &mut warnings);
+        assert_eq!(reported.machine_model.as_deref(), Some("Radxa Orion O6N"));
+        // 设备树优先：两者都在时用设备树
+        fs::create_dir_all(root.join("sys/firmware/devicetree/base")).unwrap();
+        fs::write(
+            root.join("sys/firmware/devicetree/base/model"),
+            b"Radxa ROCK 5B+\0",
+        )
+        .unwrap();
+        assert_eq!(
+            probe(&root, "aarch64", &mut Vec::new())
+                .machine_model
+                .as_deref(),
+            Some("Radxa ROCK 5B+")
+        );
 
         fs::remove_dir_all(&root).ok();
     }

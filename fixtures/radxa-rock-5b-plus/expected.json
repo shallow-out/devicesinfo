@@ -1,7 +1,7 @@
 {
   "cpu": {
     "arch": "aarch64",
-    "model": "Radxa ROCK 5B+",
+    "machine_model": "Radxa ROCK 5B+",
     "logical_cores": 8,
     "physical_cores": 8,
     "core_tiers": [
