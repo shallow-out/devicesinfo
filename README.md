@@ -130,7 +130,16 @@ git add fixtures/<名字>
 采集是幂等的（`/proc` 里的瞬时字段会被剔掉；只被状态采样读的瞬时值文件——
 `npu_busy_time_us`、`*_cur_freq`、`npu_memory_utilization`——读数归一化成 `0`，
 它们**存在**这件事才是被测的对象），所以重新采集只会在探测逻辑**真的**
-变了的时候产生 diff。**快照变了不一定是 bug**：先看 diff，决定是"有意改了行为"
+变了的时候产生 diff。改完探测逻辑或采集清单，**必须重采夹具**：夹具只冻结"它里面有的东西"，忘了重采不会
+让测试变红，只会让覆盖静默缩水。一个便宜的核对办法是拿真机对着夹具比（**除根前缀外
+应当逐字节相同**）：
+
+```bash
+diff <(deviceinfo --json hardware) \
+     <(deviceinfo --json hardware --root fixtures/<本机那份> | sed 's|fixtures/<本机那份>||')
+```
+
+**快照变了不一定是 bug**：先看 diff，决定是"有意改了行为"
 （重新 capture 并提交）还是"引入了回归"（修代码）。
 
 **远端夹具没法在本地独立验证，本地夹具可以。** 差别在于 `expected.json` 是从哪儿算的：
