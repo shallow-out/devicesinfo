@@ -1,0 +1,75 @@
+{
+  "cpu": {
+    "arch": "aarch64",
+    "logical_cores": 8,
+    "physical_cores": 8,
+    "core_tiers": [
+      {
+        "cpus": [
+          4,
+          5,
+          6,
+          7
+        ],
+        "max_freq_mhz": 2400,
+        "capacity": 1024
+      },
+      {
+        "cpus": [
+          0,
+          1,
+          2,
+          3
+        ],
+        "max_freq_mhz": 1800,
+        "capacity": 397
+      }
+    ],
+    "simd": [
+      "aes",
+      "asimd",
+      "asimddp",
+      "asimdhp",
+      "asimdrdm",
+      "crc32",
+      "fphp",
+      "sha1",
+      "sha2"
+    ]
+  },
+  "memory": {
+    "total_bytes": 8150945792
+  },
+  "accelerators": [
+    {
+      "kind": "gpu",
+      "name": "GPU (card0, id 未知)",
+      "device_path": "/dev/dri/renderD128",
+      "driver": "RKNPU",
+      "memory": {
+        "kind": "unknown",
+        "reason": "厂商未识别，无法判断显存是独立还是共享"
+      },
+      "runtime": {
+        "state": "unknown",
+        "reason": "厂商未识别，不知道该找哪些组件"
+      },
+      "notes": []
+    },
+    {
+      "kind": "gpu",
+      "name": "GPU (card1, id 未知)",
+      "driver": "rockchip-drm",
+      "memory": {
+        "kind": "unknown",
+        "reason": "厂商未识别，无法判断显存是独立还是共享"
+      },
+      "runtime": {
+        "state": "unknown",
+        "reason": "厂商未识别，不知道该找哪些组件"
+      },
+      "notes": []
+    }
+  ],
+  "warnings": []
+}

@@ -143,6 +143,27 @@ fn gpu_memory(device_dir: &Path, vendor: Option<&str>) -> AcceleratorMemory {
     }
 }
 
+/// 枚举一个目录下匹配前缀的条目，**按名字排序**。
+///
+/// `read_dir` 的顺序取决于文件系统的目录项排列，不是内容的函数。实测同一份内容
+/// 用 `cp -a` 复制与逐文件重建，得到的顺序就不一样——那会让 `--json` 输出无法跨机器
+/// `diff`（本 crate 的核心用途），也会让按下标做的 `renderD` 配对随机出错。
+/// 凡是“设备列表”都必须过这里。
+fn sorted_entries(dir: &Path, keep: impl Fn(&str) -> bool) -> Vec<(String, PathBuf)> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut found: Vec<(String, PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            keep(&name).then(|| (name, entry.path()))
+        })
+        .collect();
+    found.sort();
+    found
+}
+
 /// NPU：现代内核把 NPU 暴露在 `/dev/accel/accelN`。
 pub(crate) fn probe_npus(
     root: &Path,
@@ -150,15 +171,8 @@ pub(crate) fn probe_npus(
     warnings: &mut Vec<String>,
 ) -> Vec<Accelerator> {
     let dir = root.join("dev/accel");
-    let Ok(entries) = fs::read_dir(&dir) else {
-        return Vec::new();
-    };
     let mut found = Vec::new();
-    for entry in entries.flatten() {
-        let node = entry.file_name().to_string_lossy().into_owned();
-        if !node.starts_with("accel") {
-            continue;
-        }
+    for (node, node_path) in sorted_entries(&dir, |name| name.starts_with("accel")) {
         let sys = root.join("sys/class/accel").join(&node);
         let device_dir = sys.join("device");
         let vendor = read_trimmed(&device_dir.join("vendor")).map(|v| vendor_name(&v));
@@ -176,7 +190,7 @@ pub(crate) fn probe_npus(
         let mut accel = Accelerator {
             kind: AcceleratorKind::Npu,
             name,
-            device_path: Some(entry.path()),
+            device_path: Some(node_path),
             driver_version,
             driver,
             vendor,
@@ -211,57 +225,54 @@ pub(crate) fn probe_gpus(
     let drm = root.join("sys/class/drm");
     let mut found: Vec<Accelerator> = Vec::new();
 
-    if let Ok(entries) = fs::read_dir(&drm) {
-        for entry in entries.flatten() {
-            let node = entry.file_name().to_string_lossy().into_owned();
-            // 只要 cardN，不要 cardN-DP-1 这类连接器
-            if !node.starts_with("card") || node.contains('-') {
-                continue;
-            }
-            let device_dir = entry.path().join("device");
-            let vendor = read_trimmed(&device_dir.join("vendor")).map(|v| vendor_name(&v));
-            let driver = driver_of(&device_dir);
-            let pci_id = read_pci_id(&device_dir);
-            let raw_id = read_trimmed(&device_dir.join("device")).unwrap_or_else(|| "未知".into());
-            let runtime = runtime::probe(AcceleratorKind::Gpu, vendor.as_deref(), libraries);
-            let name = name_from_pci(root, &vendor, &pci_id, || match &vendor {
-                Some(vendor) => format!("{vendor} GPU ({node}, id {raw_id})"),
-                None => format!("GPU ({node}, id {raw_id})"),
-            });
-            let driver_version = driver_version_of(root, driver.as_deref());
-            let memory = gpu_memory(&device_dir, vendor.as_deref());
-            let max_freq_mhz = gpu_max_freq_mhz(&device_dir);
+    // 只要 cardN，不要 cardN-DP-1 这类连接器；顺序必须由名字决定，不能由目录项决定
+    for (node, card_path) in sorted_entries(&drm, |name| {
+        name.starts_with("card") && !name.contains('-')
+    }) {
+        let device_dir = card_path.join("device");
+        let vendor = read_trimmed(&device_dir.join("vendor")).map(|v| vendor_name(&v));
+        let driver = driver_of(&device_dir);
+        let pci_id = read_pci_id(&device_dir);
+        let raw_id = read_trimmed(&device_dir.join("device")).unwrap_or_else(|| "未知".into());
+        let runtime = runtime::probe(AcceleratorKind::Gpu, vendor.as_deref(), libraries);
+        let name = name_from_pci(root, &vendor, &pci_id, || match &vendor {
+            Some(vendor) => format!("{vendor} GPU ({node}, id {raw_id})"),
+            None => format!("GPU ({node}, id {raw_id})"),
+        });
+        let driver_version = driver_version_of(root, driver.as_deref());
+        let memory = gpu_memory(&device_dir, vendor.as_deref());
+        let max_freq_mhz = gpu_max_freq_mhz(&device_dir);
 
-            let mut notes = Vec::new();
-            if driver.is_none() {
-                notes.push("未绑定内核驱动，硬件加速不可用".into());
-            }
-            found.push(Accelerator {
-                kind: AcceleratorKind::Gpu,
-                name,
-                device_path: None,
-                driver_version,
-                driver,
-                vendor,
-                pci_id,
-                memory,
-                max_freq_mhz,
-                runtime,
-                notes,
-            });
+        let mut notes = Vec::new();
+        if driver.is_none() {
+            notes.push("未绑定内核驱动，硬件加速不可用".into());
         }
+        found.push(Accelerator {
+            kind: AcceleratorKind::Gpu,
+            name,
+            device_path: None,
+            driver_version,
+            driver,
+            vendor,
+            pci_id,
+            memory,
+            max_freq_mhz,
+            runtime,
+            notes,
+        });
     }
 
-    // 把 /dev/dri/renderD* 关联到 cardN（顺序通常一致，但不保证，因此只做标注不硬绑）。
-    let mut render_nodes: Vec<PathBuf> = Vec::new();
-    if let Ok(entries) = fs::read_dir(root.join("dev/dri")) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with("renderD") {
-                render_nodes.push(entry.path());
-            }
-        }
-    }
+    // 把 /dev/dri/renderD* 关联到 cardN。
+    //
+    // 这里**只按顺序对应**，因为 sysfs 没有直接给出两者关系——但顺序现在至少是确定的
+    // （上面已按名字排序）。更可靠的做法是解 `renderD*` 软链的真实设备路径再比对，
+    // 见 README 的“已知未做”。
+    let mut render_nodes: Vec<PathBuf> = sorted_entries(&root.join("dev/dri"), |name| {
+        name.starts_with("renderD")
+    })
+    .into_iter()
+    .map(|(_, path)| path)
+    .collect();
     render_nodes.sort();
     for (index, node) in render_nodes.iter().enumerate() {
         match found.get_mut(index) {

@@ -114,12 +114,17 @@ fn state_and_hardware_agree_on_which_devices_exist() {
                     accel.pci_id
                 )
             });
-            assert!(
-                matched.current_freq_mhz.is_some() || matched.resident_memory_bytes.is_some(),
-                "{}: {:?} 一个瞬时值都没读到，说明夹具里的路径和采样逻辑不一致",
-                fixture.display(),
-                accel.kind
-            );
+            // 只在厂商能认出来时才要求"至少读到一个瞬时值"：
+            // 认不出的平台设备（ARM 上的 rockchip 之类）我们没有已知的指标路径，
+            // 读到空是**正确的行为**，不是回归。
+            if accel.vendor.is_some() {
+                assert!(
+                    matched.current_freq_mhz.is_some() || matched.resident_memory_bytes.is_some(),
+                    "{}: {:?} 识别出了厂商却一个瞬时值都没读到，说明夹具里的路径和采样逻辑不一致",
+                    fixture.display(),
+                    accel.kind
+                );
+            }
         }
     }
 }

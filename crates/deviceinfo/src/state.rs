@@ -173,30 +173,32 @@ pub(crate) fn sample(root: &Path, options: &SampleOptions) -> RuntimeState {
 ///
 /// 这份发现逻辑和 [`crate::accelerator`] 里的是两份实现（那边需要更多上下文，
 /// 拆出来反而难读），靠 `state_and_hardware_agree_on_which_devices_exist`
-/// 这个测试保证两边不会走偏。
+/// 这个测试保证两边不会走偏——**包括顺序**：两边都按设备名排序，
+/// 所以第 N 个状态对应第 N 个设备。
 fn accelerator_devices(root: &Path) -> Vec<(AcceleratorKind, PathBuf)> {
-    let mut found = Vec::new();
-    if let Ok(entries) = fs::read_dir(root.join("dev/accel")) {
-        for entry in entries.flatten() {
+    // 顺序必须由名字决定，不能由目录项顺序决定：否则状态列表和硬件列表对不上，
+    // 而两份都声称自己在描述同一批设备
+    let mut entries: Vec<(String, AcceleratorKind, PathBuf)> = Vec::new();
+    if let Ok(dir) = fs::read_dir(root.join("dev/accel")) {
+        for entry in dir.flatten() {
             let node = entry.file_name().to_string_lossy().into_owned();
             if node.starts_with("accel") {
-                found.push((
-                    AcceleratorKind::Npu,
-                    root.join("sys/class/accel").join(node).join("device"),
-                ));
+                let device = root.join("sys/class/accel").join(&node).join("device");
+                entries.push((format!("0accel/{node}"), AcceleratorKind::Npu, device));
             }
         }
     }
-    if let Ok(entries) = fs::read_dir(root.join("sys/class/drm")) {
-        for entry in entries.flatten() {
+    if let Ok(dir) = fs::read_dir(root.join("sys/class/drm")) {
+        for entry in dir.flatten() {
             let node = entry.file_name().to_string_lossy().into_owned();
             // `cardN-DP-1` 是显示连接器，不是 GPU
             if node.starts_with("card") && !node.contains('-') {
-                found.push((AcceleratorKind::Gpu, entry.path().join("device")));
+                entries.push((format!("1drm/{node}"), AcceleratorKind::Gpu, entry.path().join("device")));
             }
         }
     }
-    found
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries.into_iter().map(|(_, kind, dir)| (kind, dir)).collect()
 }
 
 fn sample_accelerators(
