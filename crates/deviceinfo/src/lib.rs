@@ -53,6 +53,7 @@ pub mod environment;
 mod features;
 pub mod live;
 mod memory;
+mod os;
 mod report;
 mod runtime;
 mod state;
@@ -63,14 +64,15 @@ pub mod pci;
 pub mod render;
 
 pub use report::{
-    Accelerator, AcceleratorKind, AcceleratorMemory, CoreTier, CpuInfo, HardwareReport, MemoryInfo,
+    Accelerator, AcceleratorKind, AcceleratorMemory, CoreTier, CpuFeatureGroup, CpuInfo, HardwareReport, MemoryInfo,
     PciId, RuntimeStatus,
 };
 pub use cpu::{PER_CORE_INPUTS as CPU_PER_CORE_INPUTS, SHARED_INPUTS as CPU_SHARED_INPUTS};
 pub use environment::EnvironmentReport;
 pub use live::{LiveOptions, LiveReport};
-pub use runtime::LIBRARY_DIRS;
+pub use runtime::{LIBRARY_DIRS, OPENCL_VENDOR_DIR, library_inputs as runtime_library_inputs};
 pub use state::{AcceleratorState, DiskUsage, MemoryState, RuntimeState, SampleOptions};
+pub use sysfs::resolve_path_in_root;
 
 use std::collections::BTreeSet;
 use std::path::Path;

@@ -138,7 +138,8 @@ impl Source {
     /// `(:)` 这种垃圾——这个 bug 真的发生过一次。
     pub(crate) fn kind(&self, path: &str) -> EntryKind {
         match self {
-            Self::Local(root) => match std::fs::metadata(root.join(path)) {
+            Self::Local(root) => match deviceinfo::resolve_path_in_root(root, path)
+                .and_then(std::fs::metadata) {
                 Ok(meta) if meta.is_file() => EntryKind::File,
                 Ok(_) => EntryKind::Other,
                 Err(_) => EntryKind::Missing,
@@ -169,7 +170,8 @@ impl Source {
     /// 读文件内容。读不到返回 `None`。
     pub(crate) fn read(&self, path: &str) -> Option<Vec<u8>> {
         match self {
-            Self::Local(root) => std::fs::read(root.join(path)).ok(),
+            Self::Local(root) => deviceinfo::resolve_path_in_root(root, path)
+                .and_then(std::fs::read).ok(),
             Self::Remote(remote) => remote
                 .contents
                 .borrow()

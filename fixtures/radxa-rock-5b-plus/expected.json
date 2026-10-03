@@ -32,6 +32,24 @@
   ],
   "cpu": {
     "arch": "aarch64",
+    "common_features": [
+      "aes",
+      "asimd",
+      "asimddp",
+      "asimdhp",
+      "asimdrdm",
+      "atomics",
+      "cpuid",
+      "crc32",
+      "dcpop",
+      "evtstrm",
+      "fp",
+      "fphp",
+      "lrcpc",
+      "pmull",
+      "sha1",
+      "sha2"
+    ],
     "core_tiers": [
       {
         "capacity": 1024,
@@ -54,6 +72,38 @@
         ],
         "max_freq_mhz": 1800,
         "physical_cores": 4
+      }
+    ],
+    "feature_groups": [
+      {
+        "cpus": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "features": [
+          "aes",
+          "asimd",
+          "asimddp",
+          "asimdhp",
+          "asimdrdm",
+          "atomics",
+          "cpuid",
+          "crc32",
+          "dcpop",
+          "evtstrm",
+          "fp",
+          "fphp",
+          "lrcpc",
+          "pmull",
+          "sha1",
+          "sha2"
+        ]
       }
     ],
     "features": [

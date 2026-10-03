@@ -7,6 +7,14 @@
     }
   ],
   "init": "systemd",
+  "kernel_release": "7.0.13-cix",
+  "operating_system": {
+    "id": "debian",
+    "name": "Debian GNU/Linux",
+    "pretty_name": "Debian GNU/Linux 13 (trixie)",
+    "source": "/etc/os-release",
+    "version_id": "13"
+  },
   "package_managers": [
     "apt-get"
   ],

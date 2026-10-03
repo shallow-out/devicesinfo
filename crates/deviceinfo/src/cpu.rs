@@ -45,13 +45,14 @@ pub(crate) fn probe(root: &Path, arch: &str, warnings: &mut Vec<String>) -> CpuI
         ));
     }
 
-    let cpu_ids = sysfs_cpu_ids(root);
-    let logical_cores = if cpu_ids.is_empty() {
-        cpuinfo.as_deref().map(count_processors).unwrap_or(0)
+    let sysfs_ids = sysfs_cpu_ids(root);
+    let cpu_ids = if sysfs_ids.is_empty() {
+        cpuinfo.as_deref().map(processor_ids).unwrap_or_default()
     } else {
-        cpu_ids.len()
+        sysfs_ids.clone()
     };
-    if cpu_ids.is_empty() && cpuinfo.is_some() {
+    let logical_cores = cpu_ids.len();
+    if sysfs_ids.is_empty() && cpuinfo.is_some() {
         // 有 cpuinfo 没 sysfs：型号还能报，但核分组和物理核都拿不到，
         // 等效算力随之消失——这会让上层的筛选变粗，值得出声。
         warnings.push("没有 sysfs CPU 拓扑（sys/devices/system/cpu），核分组与物理核数不可用".into());
@@ -66,16 +67,23 @@ pub(crate) fn probe(root: &Path, arch: &str, warnings: &mut Vec<String>) -> CpuI
     });
 
     let simd = cpuinfo.as_deref().map(features::parse).unwrap_or_default();
+    let feature_groups = cpuinfo.as_deref()
+        .map(|text| features::groups(text, &cpu_ids, warnings))
+        .unwrap_or_default();
 
-    CpuInfo {
+    let mut report = CpuInfo {
         arch: arch.to_string(),
         cpu_model,
         machine_model: machine_model(root),
         logical_cores,
-        physical_cores: probe_physical_cores(root, &cpu_ids, cpuinfo.as_deref(), logical_cores),
-        core_tiers: probe_core_tiers(root, &cpu_ids, logical_cores, warnings),
+        physical_cores: probe_physical_cores(root, &sysfs_ids, cpuinfo.as_deref(), logical_cores),
+        core_tiers: probe_core_tiers(root, &sysfs_ids, logical_cores, warnings),
         features: simd,
-    }
+        common_features: None,
+        feature_groups,
+    };
+    report.common_features = report.features_for_cpus(&cpu_ids);
+    report
 }
 
 /// 整机型号。两级，对应两种固件接口：
@@ -94,14 +102,19 @@ fn machine_model(root: &Path) -> Option<String> {
         .or_else(|| read_dt_property(&root.join("sys/class/dmi/id/product_name")))
 }
 
-/// cpuinfo 里 `processor` 行的条数。
-fn count_processors(text: &str) -> usize {
-    text.lines()
-        .filter(|line| line.starts_with("processor"))
-        .count()
+/// cpuinfo 里的真实逻辑核编号，不按记录数量猜连续编号。
+fn processor_ids(text: &str) -> Vec<usize> {
+    let mut ids: Vec<_> = text.lines()
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(key, _)| key.trim() == "processor")
+        .filter_map(|(_, value)| value.trim().parse::<usize>().ok())
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
 }
 
-/// sysfs 下的在线 CPU 编号（`cpuN` 目录）。
+/// sysfs 下的 CPU 编号（`cpuN` 目录），包含可能离线的核。
 fn sysfs_cpu_ids(root: &Path) -> Vec<usize> {
     let dir = root.join("sys/devices/system/cpu");
     let Ok(entries) = fs::read_dir(&dir) else {
@@ -259,10 +272,11 @@ fn probe_core_tiers(
         .iter()
         .filter(|observation| observation.core.is_some())
         .count();
-    if with_core > 0 && with_core < seen {
-        // 拓扑读不全 → 某些档的"物理核数"会退化成线程数，等效算力随之偏高
+    let smt_inactive =
+        read_trimmed(&root.join("sys/devices/system/cpu/smt/active")).as_deref() == Some("0");
+    if with_core < seen && !smt_inactive && !cpu_ids.is_empty() {
         warnings.push(format!(
-            "只有 {with_core}/{seen} 个核能读出 topology/core_cpus_list，各档的物理核数可能偏高"
+            "只有 {with_core}/{seen} 个核能读出 topology/core_cpus_list，拓扑不完整的档无法确定物理核数与等效算力"
         ));
     }
 
@@ -297,8 +311,7 @@ fn probe_core_tiers(
         .into_values()
         .map(|members| {
             let cpus: Vec<usize> = members.iter().map(|member| member.cpu).collect();
-            // 物理核数：同一 `core_cpus_list` 的线程算一个。读不到拓扑的核各自算一个
-            // ——这让数字偏大，所以上面会发一条警告。
+            // 同一 `core_cpus_list` 的线程算一个；缺拓扑时不能把线程数当物理核数。
             let mut cores: Vec<usize> = members
                 .iter()
                 .filter_map(|member| member.core)
@@ -308,7 +321,11 @@ fn probe_core_tiers(
             cores.dedup();
             CoreTier {
                 cpus,
-                physical_cores: cores.len() + unknown,
+                physical_cores: if smt_inactive {
+                    Some(members.len())
+                } else {
+                    (unknown == 0).then_some(cores.len())
+                },
                 max_freq_mhz: members.iter().filter_map(|member| member.max_freq_mhz).max(),
                 // 这一档的相对性能：取成员里的最大值。**按频率分组时也要报**
                 // ——那种情况说明整机 capacity 全同，它依然是已知事实（只是区分不了核），
@@ -438,6 +455,108 @@ mod tests {
     fn fake_meminfo(root: &Path) {
         fs::create_dir_all(root.join("proc")).unwrap();
         fs::write(root.join("proc/meminfo"), "MemTotal: 1000 kB\n").unwrap();
+    }
+
+    #[test]
+    fn heterogeneous_features_are_not_advertised_as_common() {
+        let root = fake_root("feature-groups");
+        fake_meminfo(&root);
+        fake_cpus(
+            &root,
+            &[
+                (2, Some(2_000_000), Some(1024)),
+                (7, Some(2_000_000), Some(1024)),
+            ],
+        );
+        fs::write(
+            root.join("proc/cpuinfo"),
+            "processor: 2\nflags: fpu aes avx2\nprocessor: 7\nflags: fpu aes sve2\n",
+        )
+        .unwrap();
+        let mut warnings = Vec::new();
+        let cpu = probe(&root, "x86_64", &mut warnings);
+        assert_eq!(cpu.features, ["aes", "avx2", "fpu", "sve2"]);
+        assert_eq!(cpu.common_features, Some(vec!["aes".into(), "fpu".into()]));
+        assert_eq!(cpu.feature_groups.len(), 2);
+        assert_eq!(cpu.feature_groups[0].cpus, [2]);
+        assert_eq!(cpu.feature_groups[1].cpus, [7]);
+        assert_eq!(
+            cpu.features_for_cpus(&[2]),
+            Some(vec!["aes".into(), "avx2".into(), "fpu".into()])
+        );
+        assert_eq!(cpu.features_for_cpus(&[7, 2, 7]), cpu.common_features);
+        assert_eq!(cpu.features_for_cpus(&[0]), None);
+        assert_eq!(cpu.features_for_cpus(&[]), None);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let report = crate::probe_with(&root, "x86_64");
+        let text = crate::render::human(&report);
+        assert!(text.contains("全核公共特征: 2 项"), "{text}");
+        assert!(text.contains("cpu2: 3 项"), "{text}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sparse_cpuinfo_ids_work_without_sysfs_and_old_json_stays_unknown() {
+        let root = fake_root("sparse-features");
+        fake_meminfo(&root);
+        fs::write(
+            root.join("proc/cpuinfo"),
+            "processor: 3\nflags: aes avx2\n\nprocessor: 11\nflags: aes\n",
+        )
+        .unwrap();
+        let cpu = probe(&root, "x86_64", &mut Vec::new());
+        assert_eq!(cpu.logical_cores, 2);
+        assert_eq!(cpu.common_features, Some(vec!["aes".into()]));
+        assert_eq!(cpu.feature_groups[0].cpus, [3]);
+        assert_eq!(cpu.feature_groups[1].cpus, [11]);
+        let mut json = serde_json::to_value(&cpu).unwrap();
+        json.as_object_mut().unwrap().remove("common_features");
+        json.as_object_mut().unwrap().remove("feature_groups");
+        let old: CpuInfo = serde_json::from_value(json).unwrap();
+        assert_eq!(old.common_features, None);
+        assert_eq!(old.features_for_cpus(&[3]), None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn incomplete_and_conflicting_records_cannot_claim_full_cpu_capability() {
+        let root = fake_root("incomplete-features");
+        fake_meminfo(&root);
+        fake_cpus(&root, &[(0, None, Some(1024)), (1, None, Some(1024))]);
+        for text in [
+            "processor: 0\nflags: aes avx2\nprocessor: 1\nmodel name: missing flags\n",
+            "processor: 0\nflags: aes avx2\nprocessor: 1\nflags: aes\nprocessor: 1\nflags: aes\n",
+            "processor: 0\nflags: aes avx2\nprocessor: 1\nflags: aes\nflags: aes avx2\n",
+        ] {
+            fs::write(root.join("proc/cpuinfo"), text).unwrap();
+            let mut warnings = Vec::new();
+            let cpu = probe(&root, "x86_64", &mut warnings);
+            assert_eq!(cpu.common_features, None, "{text}");
+            assert_eq!(cpu.features_for_cpus(&[1]), None, "{text}");
+            assert!(cpu.features_for_cpus(&[0]).is_some());
+            assert!(!warnings.is_empty(), "{text}");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn disjoint_or_empty_feature_lines_have_a_known_empty_intersection() {
+        let root = fake_root("empty-features");
+        fake_meminfo(&root);
+        fake_cpus(&root, &[(0, None, Some(1024)), (1, None, Some(1024))]);
+        for text in [
+            "processor: 0\nflags: aes\nprocessor: 1\nflags: avx2\n",
+            "processor: 0\nflags: \nprocessor: 1\nflags: aes\n",
+        ] {
+            fs::write(root.join("proc/cpuinfo"), text).unwrap();
+            let cpu = probe(&root, "x86_64", &mut Vec::new());
+            assert_eq!(cpu.common_features, Some(Vec::new()));
+            assert_eq!(
+                serde_json::to_value(&cpu).unwrap()["common_features"],
+                serde_json::json!([])
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -596,7 +715,11 @@ mod tests {
         // 不相关的也照样上报（完整名单），只是不会被显示层高亮
         assert!(reported.features.contains(&"fp".to_string()));
         assert!(reported.features.contains(&"evtstrm".to_string()));
-        assert!(warnings.is_empty(), "{warnings:?}");
+        // 此合成样本仅 cpu0 有 Features，不能替其它七个核承诺能力。
+        assert_eq!(reported.common_features, None);
+        assert_eq!(reported.feature_groups[0].cpus, [0]);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("1/8"), "{warnings:?}");
 
         fs::remove_dir_all(&root).ok();
     }
@@ -828,7 +951,8 @@ mod tests {
         assert_eq!(tiers[1].capacity, Some(1008));
         assert_eq!(tiers[1].cpus, vec![0, 1]);
         assert_eq!(
-            tiers[1].physical_cores, 1,
+            tiers[1].physical_cores,
+            Some(1),
             "两个线程属于同一个物理核: {tiers:#?}"
         );
         assert_eq!(tiers[2].capacity, Some(608));
@@ -863,7 +987,7 @@ mod tests {
 
         let reported = probe(&root, "x86_64", &mut Vec::new());
         assert_eq!(reported.core_tiers.len(), 1, "{:#?}", reported.core_tiers);
-        assert_eq!(reported.core_tiers[0].physical_cores, 4);
+        assert_eq!(reported.core_tiers[0].physical_cores, Some(4));
         assert_eq!(reported.effective_cores(), Some(4.0));
 
         fs::remove_dir_all(&root).ok();
@@ -908,5 +1032,62 @@ mod tests {
         assert_eq!(reported.physical_cores, None);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn missing_smt_topology_does_not_turn_threads_into_effective_cores() {
+        for partial in [false, true] {
+            let root = fake_root(if partial {
+                "partial-smt-tiers"
+            } else {
+                "no-smt-tiers"
+            });
+            fake_meminfo(&root);
+            fs::write(root.join("proc/cpuinfo"),
+                "processor: 0\nphysical id: 0\ncore id: 0\n\nprocessor: 1\nphysical id: 0\ncore id: 0\n").unwrap();
+            fake_cpus(&root, &[(0, None, Some(1024)), (1, None, Some(1024))]);
+            fs::remove_file(root.join("sys/devices/system/cpu/cpu1/topology/core_cpus_list"))
+                .unwrap();
+            let first = root.join("sys/devices/system/cpu/cpu0/topology/core_cpus_list");
+            if partial {
+                fs::write(first, "0-1\n").unwrap();
+            } else {
+                fs::remove_file(first).unwrap();
+            }
+            let mut warnings = Vec::new();
+            let report = probe(&root, "x86_64", &mut warnings);
+            assert_eq!(report.physical_cores, Some(1));
+            assert_eq!(report.core_tiers[0].physical_cores, None);
+            assert_eq!(report.effective_cores(), None);
+            assert!(
+                warnings
+                    .iter()
+                    .any(|w| w.contains("topology/core_cpus_list")),
+                "{warnings:?}"
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn inactive_smt_allows_counting_cores_without_per_cpu_topology() {
+        let root = fake_root("no-smt-no-topology");
+        fake_meminfo(&root);
+        fs::write(root.join("proc/cpuinfo"), "processor: 0\nprocessor: 1\n").unwrap();
+        fake_cpus(&root, &[(0, None, Some(1024)), (1, None, Some(1024))]);
+        for cpu in 0..2 {
+            fs::remove_file(root.join(format!(
+                "sys/devices/system/cpu/cpu{cpu}/topology/core_cpus_list"
+            )))
+            .unwrap();
+        }
+        fs::create_dir_all(root.join("sys/devices/system/cpu/smt")).unwrap();
+        fs::write(root.join("sys/devices/system/cpu/smt/active"), "0\n").unwrap();
+        let mut warnings = Vec::new();
+        let report = probe(&root, "x86_64", &mut warnings);
+        assert_eq!(report.core_tiers[0].physical_cores, Some(2));
+        assert_eq!(report.effective_cores(), Some(2.0));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        fs::remove_dir_all(root).unwrap();
     }
 }

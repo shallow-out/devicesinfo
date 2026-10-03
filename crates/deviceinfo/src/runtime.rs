@@ -21,7 +21,7 @@
 use crate::report::{AcceleratorKind, RuntimeStatus};
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// 库文件的候选目录（相对探测根）。
 ///
@@ -66,12 +66,52 @@ const INTEL_NPU: StackSpec = StackSpec {
     ],
 };
 
-/// Intel GPU：Level Zero GPU 驱动**或** OpenCL 运行时，命中一个就够
-/// （OpenVINO 的 GPU 插件两条路都支持）。
+/// Intel OpenCL 路径需要加载器、Intel 实现库以及 ICD 注册。
 const INTEL_GPU: StackSpec = StackSpec {
     stack: "Level Zero / OpenCL",
-    parts: &[&["libze_intel_gpu.so", "libOpenCL.so"]],
+    parts: &[&["libOpenCL.so"], &["libigdrcl.so"]],
 };
+
+/// OpenCL 加载器读取的 ICD 注册目录（相对探测根）。
+pub const OPENCL_VENDOR_DIR: &str = "etc/OpenCL/vendors";
+
+fn library_name_matches(name: &str, prefix: &str) -> bool {
+    name == prefix
+        || name
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_prefix('.'))
+            .is_some_and(|version| {
+                version
+                    .split('.')
+                    .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+            })
+}
+
+/// 探测使用的库文件名，包含不完整栈中已安装的组件；采集端只需为空文件占位。
+pub fn library_inputs(root: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for dir in LIBRARY_DIRS {
+        let Ok(entries) = fs::read_dir(root.join(dir)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let known = INTEL_NPU
+                .parts
+                .iter()
+                .chain(INTEL_GPU.parts.iter())
+                .flat_map(|candidates| candidates.iter().copied())
+                .chain(["libze_intel_gpu.so"])
+                .any(|prefix| library_name_matches(name, prefix));
+            if known && entry.path().is_file() {
+                found.push(Path::new(dir).join(name));
+            }
+        }
+    }
+    found.sort();
+    found
+}
 
 /// 候选目录下所有库文件名的索引。
 ///
@@ -79,22 +119,42 @@ const INTEL_GPU: StackSpec = StackSpec {
 /// 是没必要的浪费，而一台机器上通常有好几个加速器。
 pub(crate) struct LibraryIndex {
     names: BTreeSet<String>,
+    intel_opencl_registered: bool,
 }
 
 impl LibraryIndex {
     pub(crate) fn build(root: &Path) -> Self {
         let mut names = BTreeSet::new();
-        for dir in LIBRARY_DIRS {
-            let Ok(entries) = fs::read_dir(root.join(dir)) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                if let Some(name) = entry.file_name().to_str() {
-                    names.insert(name.to_string());
-                }
+        for path in library_inputs(root) {
+            if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+                names.insert(name.to_string());
             }
         }
-        Self { names }
+        let intel_opencl_registered = fs::read_dir(root.join(OPENCL_VENDOR_DIR))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "icd"))
+            .filter_map(|entry| fs::read_to_string(entry.path()).ok())
+            .any(|text| {
+                let library = Path::new(text.trim());
+                let Some(name) = library.file_name().and_then(|name| name.to_str()) else {
+                    return false;
+                };
+                if !library_name_matches(name, "libigdrcl.so") {
+                    return false;
+                }
+                if library.is_absolute() {
+                    root.join(library.strip_prefix("/").expect("绝对路径"))
+                        .is_file()
+                } else {
+                    library == Path::new(name) && names.contains(name)
+                }
+            });
+        Self {
+            names,
+            intel_opencl_registered,
+        }
     }
 
     /// 命中的第一个文件名。候选按给定顺序试，所以列候选时把更具体的放前面。
@@ -103,7 +163,7 @@ impl LibraryIndex {
             if let Some(name) = self
                 .names
                 .iter()
-                .find(|name| name.starts_with(*candidate))
+                .find(|name| library_name_matches(name, candidate))
             {
                 return Some(name.clone());
             }
@@ -136,6 +196,14 @@ pub(crate) fn probe(
     if let Some(status) = not_applicable(kind) {
         return status;
     }
+    if kind == AcceleratorKind::Gpu && vendor == Some("Intel") {
+        if let Some(driver) = libraries.hit(&["libze_intel_gpu.so"]) {
+            return RuntimeStatus::Ready {
+                stack: INTEL_GPU.stack.into(),
+                components: vec![driver],
+            };
+        }
+    }
     let Some(spec) = spec_for(kind, vendor) else {
         return RuntimeStatus::Unknown {
             reason: match vendor {
@@ -155,12 +223,22 @@ pub(crate) fn probe(
         }
     }
 
+    if kind == AcceleratorKind::Gpu && vendor == Some("Intel") && !libraries.intel_opencl_registered
+    {
+        missing.push("Intel OpenCL ICD 注册（/etc/OpenCL/vendors/*.icd）".into());
+    }
     if missing.is_empty() {
         RuntimeStatus::Ready {
             stack: spec.stack.into(),
             components,
         }
     } else {
+        if kind == AcceleratorKind::Gpu && vendor == Some("Intel") {
+            missing = vec![format!(
+                "libze_intel_gpu.so 或完整 OpenCL 栈（缺 {}）",
+                missing.join("、")
+            )];
+        }
         RuntimeStatus::Incomplete {
             stack: spec.stack.into(),
             missing,
@@ -246,9 +324,17 @@ mod tests {
     fn intel_gpu_accepts_either_runtime_path() {
         for (tag, files) in [
             ("gpu-ze", vec!["libze_intel_gpu.so"]),
-            ("gpu-cl", vec!["libOpenCL.so"]),
+            ("gpu-cl", vec!["libOpenCL.so", "libigdrcl.so"]),
         ] {
             let root = fake_libraries(tag, "", &files);
+            if tag == "gpu-cl" {
+                fs::create_dir_all(root.join(OPENCL_VENDOR_DIR)).unwrap();
+                fs::write(
+                    root.join(OPENCL_VENDOR_DIR).join("intel.icd"),
+                    "/usr/lib/libigdrcl.so\n",
+                )
+                .unwrap();
+            }
             let index = LibraryIndex::build(&root);
             assert!(
                 probe(AcceleratorKind::Gpu, Some("Intel"), &index).is_ready(),
@@ -302,5 +388,37 @@ mod tests {
             other => panic!("应当是 Incomplete: {other:#?}"),
         }
         fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn an_opencl_loader_without_an_intel_implementation_is_not_ready() {
+        let root = fake_libraries("gpu-loader-only", "", &["libOpenCL.so.1"]);
+        let status = probe(
+            AcceleratorKind::Gpu,
+            Some("Intel"),
+            &LibraryIndex::build(&root),
+        );
+        assert!(!status.is_ready(), "{status:?}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn intel_opencl_requires_a_registration_pointing_to_an_installed_library() {
+        let root = fake_libraries("gpu-icd", "", &["libOpenCL.so.1", "libigdrcl.so"]);
+        let status = || {
+            probe(
+                AcceleratorKind::Gpu,
+                Some("Intel"),
+                &LibraryIndex::build(&root),
+            )
+        };
+        assert!(!status().is_ready());
+        fs::create_dir_all(root.join(OPENCL_VENDOR_DIR)).unwrap();
+        let icd = root.join(OPENCL_VENDOR_DIR).join("intel.icd");
+        fs::write(&icd, "/missing/libigdrcl.so\n").unwrap();
+        assert!(!status().is_ready());
+        fs::write(&icd, "libigdrcl.so\n").unwrap();
+        assert!(status().is_ready());
+        fs::remove_dir_all(root).unwrap();
     }
 }

@@ -42,14 +42,14 @@ pub fn human(report: &HardwareReport) -> String {
     for tier in &report.cpu.core_tiers {
         // 物理核和线程分开写：SMT 机器上“4 核”到底是 4 个核还是 4 个线程，
         // 对"能并行几个任务"完全不是一回事
-        let mut line = if tier.physical_cores == tier.count() {
-            format!("         · {:>2} 核", tier.count())
-        } else {
-            format!(
-                "         · {:>2} 物理核（{} 线程）",
-                tier.physical_cores,
-                tier.count()
-            )
+        let mut line = match tier.physical_cores {
+            Some(physical) if physical == tier.count() => {
+                format!("         · {:>2} 核", tier.count())
+            }
+            Some(physical) => {
+                format!("         · {physical:>2} 物理核（{} 线程）", tier.count())
+            }
+            None => format!("         · {:>2} 线程（物理核数未知）", tier.count()),
         };
         if let Some(freq) = tier.max_freq_mhz {
             let _ = write!(line, " @ {:.2} GHz", freq as f64 / 1000.0);
@@ -73,13 +73,28 @@ pub fn human(report: &HardwareReport) -> String {
             .collect();
         let _ = writeln!(
             out,
-            "         指令集: {} 项（与推理相关 {} 项，完整列表用 --json）",
+            "         指令集并集: {} 项（与推理相关 {} 项，完整列表用 --json）",
             report.cpu.features.len(),
             highlighted.len()
         );
         if !highlighted.is_empty() {
             let _ = writeln!(out, "         · {}", highlighted.join(", "));
         }
+    }
+    if let Some(common) = &report.cpu.common_features {
+        let _ = writeln!(out, "         全核公共特征: {} 项", common.len());
+        if report.cpu.feature_groups.len() > 1 {
+            for group in &report.cpu.feature_groups {
+                let highlighted: Vec<_> = group.features.iter()
+                    .filter(|feature| crate::features::is_highlighted(feature))
+                    .map(String::as_str)
+                    .collect();
+                let _ = writeln!(out, "         · cpu{}: {} 项（{}）",
+                    format_cpu_ids(&group.cpus), group.features.len(), highlighted.join(", "));
+            }
+        }
+    } else if !report.cpu.features.is_empty() {
+        let _ = writeln!(out, "         全核公共特征: 未知（逐核记录不完整）");
     }
 
     match report.memory.total_bytes {
@@ -120,6 +135,15 @@ pub fn human(report: &HardwareReport) -> String {
             });
             if let Some(freq) = accel.max_freq_mhz {
                 facts.push(format!("频率上限 {freq} MHz"));
+            }
+            if let Some(freq) = accel.min_freq_mhz {
+                facts.push(format!("最低频率 {freq} MHz"));
+            }
+            if let Some(freq) = accel.efficient_freq_mhz {
+                facts.push(format!("能效频率 {freq} MHz"));
+            }
+            if let Some(mode) = &accel.scheduling_mode {
+                facts.push(format!("调度模式 {mode}"));
             }
             let _ = writeln!(out, "             {}", facts.join("   "));
 
@@ -220,6 +244,27 @@ pub fn human_live(report: &LiveReport) -> String {
 /// 以为"装了 docker"和"CPU 有几个核"是同一类事实。
 pub fn human_environment(report: &EnvironmentReport) -> String {
     let mut out = String::new();
+
+    if let Some(os) = &report.operating_system {
+        let name = os.pretty_name.as_deref()
+            .or(os.name.as_deref())
+            .or(os.id.as_deref())
+            .unwrap_or("未知发行版");
+        let mut identity = vec![name.to_string()];
+        if let Some(id) = &os.id {
+            identity.push(format!("ID {id}"));
+        }
+        if let Some(version) = &os.version_id {
+            identity.push(format!("版本 {version}"));
+        }
+        if !os.id_like.is_empty() {
+            identity.push(format!("同系 {}", os.id_like.join(" ")));
+        }
+        let _ = writeln!(out, "发行版   {}", identity.join(" · "));
+    }
+    if let Some(kernel) = &report.kernel_release {
+        let _ = writeln!(out, "内核     {kernel}");
+    }
 
     let mut platform = Vec::new();
     if !report.package_managers.is_empty() {
@@ -495,10 +540,12 @@ mod tests {
                 physical_cores: Some(8),
                 core_tiers: vec![CoreTier {
                     cpus: (0..8).collect(),
-                    physical_cores: 8,
+                    physical_cores: Some(8),
                     max_freq_mhz: Some(4800),
                     capacity: Some(1024),
                 }],
+                common_features: None,
+                feature_groups: Vec::new(),
                 features: vec!["avx_vnni".into()],
             },
             memory: MemoryInfo {
@@ -521,6 +568,9 @@ mod tests {
                         reason: "NVIDIA 驱动未通过 sysfs 暴露显存上限".into(),
                     },
                     max_freq_mhz: None,
+                    min_freq_mhz: None,
+                    efficient_freq_mhz: None,
+                    scheduling_mode: None,
                     runtime: RuntimeStatus::Unknown {
                         reason: "还没有 NVIDIA 的用户态运行时判据".into(),
                     },
@@ -537,6 +587,9 @@ mod tests {
                     compatible: None,
                     memory: AcceleratorMemory::SharedWithSystem,
                     max_freq_mhz: Some(1900),
+                    min_freq_mhz: Some(650),
+                    efficient_freq_mhz: Some(950),
+                    scheduling_mode: Some("HW".into()),
                     runtime: RuntimeStatus::Incomplete {
                         stack: "OpenVINO NPU".into(),
                         missing: vec!["libopenvino_intel_npu_compiler_loader.so".into()],
@@ -565,8 +618,19 @@ mod tests {
         assert!(text.contains("(10de:2204)"), "{text}");
         assert!(text.contains("共享系统内存"), "{text}");
         assert!(text.contains("频率上限 1900 MHz"), "{text}");
+        assert!(text.contains("最低频率 650 MHz"), "{text}");
+        assert!(text.contains("能效频率 950 MHz"), "{text}");
+        assert!(text.contains("调度模式 HW"), "{text}");
         // 硬件报告里不该再出现"可用内存"——那是运行时状态
         assert!(!text.contains("可用"), "硬件报告不该报瞬时值: {text}");
+
+        let mut report = report;
+        report.cpu.core_tiers[0].physical_cores = None;
+        let text = human(&report);
+        assert!(text.contains("8 线程（物理核数未知）"), "{text}");
+        assert!(!text.contains("等效算力"), "{text}");
+        let json = serde_json::to_value(&report).unwrap();
+        assert!(json["cpu"]["core_tiers"][0].get("physical_cores").is_none());
     }
 
     #[test]

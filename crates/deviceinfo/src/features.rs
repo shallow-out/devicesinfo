@@ -15,17 +15,18 @@
 //! 所以这里**原样上报内核给出的全部特征**；好看不好看是显示层的事
 //! （见 [`is_highlighted`]）。
 
-use crate::sysfs::field;
+use crate::report::CpuFeatureGroup;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// 解析 cpuinfo 的特征行，**原样**收集全部特征（排序去重）。
 ///
 /// x86 用 `flags`，arm64 用 `Features`。两者都没有就返回空。
 pub(crate) fn parse(cpuinfo: &str) -> Vec<String> {
-    let Some(features) = field(cpuinfo, "flags").or_else(|| field(cpuinfo, "Features")) else {
-        return Vec::new();
-    };
-    let mut found: Vec<String> = features
-        .split_whitespace()
+    let mut found: Vec<String> = cpuinfo
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(key, _)| matches!(key.trim(), "flags" | "Features"))
+        .flat_map(|(_, value)| value.split_whitespace())
         .map(str::to_string)
         .collect();
     // 排序而不是保留 cpuinfo 顺序：内核那个顺序没有语义，
@@ -33,6 +34,75 @@ pub(crate) fn parse(cpuinfo: &str) -> Vec<String> {
     found.sort();
     found.dedup();
     found
+}
+
+/// 不依赖空行分段：每条 processor 声明开始一条核记录。
+/// 缺特征行、重复 processor 或冲突的特征行都不能成为可信的核能力。
+pub(crate) fn groups(
+    cpuinfo: &str,
+    candidates: &[usize],
+    warnings: &mut Vec<String>,
+) -> Vec<CpuFeatureGroup> {
+    let mut records: BTreeMap<usize, Option<Vec<String>>> = BTreeMap::new();
+    let mut current = None;
+    let mut invalid = BTreeSet::new();
+    for line in cpuinfo.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        match key.trim() {
+            "processor" => {
+                current = value.trim().parse::<usize>().ok();
+                if let Some(cpu) = current {
+                    if records.insert(cpu, None).is_some() {
+                        invalid.insert(cpu);
+                    }
+                } else {
+                    warnings.push("/proc/cpuinfo 有无效 processor 编号，不能关联其指令集".into());
+                }
+            }
+            "flags" | "Features" => {
+                if let Some(cpu) = current {
+                    let features = parse(line);
+                    let record = records.get_mut(&cpu).expect("processor 已登记");
+                    if record
+                        .as_ref()
+                        .is_some_and(|previous| previous != &features)
+                    {
+                        invalid.insert(cpu);
+                    }
+                    *record = Some(features);
+                }
+            }
+            _ => {}
+        }
+    }
+    for cpu in &invalid {
+        warnings.push(format!(
+            "/proc/cpuinfo 的 cpu{cpu} 记录重复或特征冲突，其公共能力未知"
+        ));
+    }
+    let mut grouped: BTreeMap<Vec<String>, Vec<usize>> = BTreeMap::new();
+    for (cpu, features) in records {
+        if candidates.contains(&cpu) && !invalid.contains(&cpu) {
+            if let Some(features) = features {
+                grouped.entry(features).or_default().push(cpu);
+            }
+        }
+    }
+    let mut groups: Vec<_> = grouped
+        .into_iter()
+        .map(|(features, cpus)| CpuFeatureGroup { cpus, features })
+        .collect();
+    groups.sort_by_key(|group| group.cpus[0]);
+    let covered: usize = groups.iter().map(|group| group.cpus.len()).sum();
+    if covered > 0 && covered < candidates.len() {
+        warnings.push(format!(
+            "只有 {covered}/{} 个逻辑核有完整指令集记录，全核公共特征未知",
+            candidates.len()
+        ));
+    }
+    groups
 }
 
 /// 名字形状撞上前缀、但**不是**加速指令集的项。
@@ -93,6 +163,18 @@ f8cvt f8fma f8dp4 f8dp2 f8e4m3 f8e5m2 smelutv2 smef8f16 smef8f32 smesf8fma smesf
 poe cmpbr fprcvt f8mm8 f8mm4 svef16mm sveeltperm sveaes2 svebfscale sve2p2 sme2p2 smesbitperm \
 smeaes smesfexpa smestmop smesmop4 mtefar mtestoreonly lsfe sveb16mm sve2p3 smelut6 sme2p3 \
 f16mm f16f32dot f16f32mm svelut6";
+
+    #[test]
+    fn every_feature_line_is_kept_but_invalid_ids_are_not_associated() {
+        let text = "processor: 2\nflags: aes avx2\nprocessor: nope\nflags: sve2\nprocessor: 8\nFeatures: aes asimd\n";
+        assert_eq!(parse(text), ["aes", "asimd", "avx2", "sve2"]);
+        let mut warnings = Vec::new();
+        let groups = groups(text, &[2, 8], &mut warnings);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].cpus, [2]);
+        assert_eq!(groups[1].cpus, [8]);
+        assert_eq!(warnings.len(), 1);
+    }
 
     #[test]
     fn every_kernel_feature_is_reported() {

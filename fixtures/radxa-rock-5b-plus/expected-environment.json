@@ -17,6 +17,14 @@
     }
   ],
   "init": "systemd",
+  "kernel_release": "6.18.18.c1090-trim",
+  "operating_system": {
+    "id": "debian",
+    "name": "Debian GNU/Linux",
+    "pretty_name": "Debian GNU/Linux 12 (bookworm)",
+    "source": "/etc/os-release",
+    "version_id": "12"
+  },
   "package_managers": [
     "apt-get"
   ],

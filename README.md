@@ -27,7 +27,7 @@
 | | `probe()` → `HardwareReport` | `probe_environment()` → `EnvironmentReport` | `sample_state()` → `RuntimeState` | `live::probe()` → `LiveReport` |
 |---|---|---|---|---|
 | 描述 | 这台机器**是什么** | **装了什么、配了什么** | **此刻**怎样 | **跑一次才知道**的 |
-| 内容 | 架构、型号、核数与性能分层、指令集、加速器、内存总量 | 包管理器、init、cgroup、容器运行时与 socket、已装推理框架、镜像源、**人为声明的标签** | 可用内存、swap、磁盘余量、加速器的瞬时指标 | 工具版本、**逐个目标的连通性** |
+| 内容 | 架构、型号、核数与性能分层、指令集、加速器及 NPU 能效档位、内存总量 | 发行版、内核版本、包管理器、init、cgroup、容器运行时与 socket、已装推理框架、镜像源、**人为声明的标签** | 可用内存、swap、磁盘余量、加速器的瞬时指标 | 工具版本、**逐个目标的连通性** |
 | 怎么拿到的 | 读文件 | 读文件 | 读文件 | **执行命令 / 连网络** |
 | 变化频率 | 装上就不变 | 装了/配了才变 | 每一秒都在变 | 随时在变 |
 | 能否缓存 / 进夹具 | 能 | 能 | 不能 | **不能，也不进夹具** |
@@ -107,8 +107,28 @@ Always_On  powersave
 
 # 例：定时提醒交给"一直开着且省电"的设备
 [host for host in fleet
- if host.env.always_on() and host.env.powersave()]
+if host.env.always_on() and host.env.powersave()]
 ```
+
+CPU 任务的指令集检查要用 `cpu.common_features`：`cpu.features` 是 `/proc/cpuinfo`
+所有 `flags` / `Features` 行的并集，其中某项可能只出现在部分核上。
+`cpu.feature_groups` 按特征集合分组，保留真实 CPU 编号；它与性能分层 `core_tiers`
+是两个独立维度。指定核集合时，Rust 调用 `cpu.features_for_cpus(&[2, 7])` 获取交集，
+未记录的核返回 `None`。查询只提供事实，绑定任务亲和性由调度器负责。
+
+```python
+# 所有被探测核都报告 avx2，才按全核 AVX2 任务筛选。
+[host for host in fleet
+ if "avx2" in (host.hw.cpu.common_features or [])]
+```
+
+逐核记录完整时，`common_features` 是排序去重的交集，空数组表示确定没有公共特征；
+记录缺失、重复或冲突时，字段省略以表示未知。离线核仍可出现在 sysfs 拓扑里，
+但不一定出现在 cpuinfo 中，因此也可能导致公共特征未知。旧 JSON 缺少新增字段时仍可读取，
+不会从旧 `features` 自动推断全核能力。这些字段保留的是内核报告的特征，未逐条执行指令验证。
+数据来源与语义可对照内核的
+[x86 cpuinfo 实现](https://github.com/torvalds/linux/blob/master/arch/x86/kernel/cpu/proc.c)和
+[arm64 cpuinfo 实现](https://github.com/torvalds/linux/blob/master/arch/arm64/kernel/cpuinfo.c)。
 
 ## 用法
 
@@ -141,12 +161,27 @@ let state = deviceinfo::sample_state(&[std::path::PathBuf::from("/var/cache")]);
 
 ## 模块划分
 
+环境报告新增 `operating_system`（`id`、`id_like`、`name`、`pretty_name`、`version_id`、
+`source`）和 `kernel_release`，供部署工具选择发行版对应的包或发布物。按
+[os-release 规范](https://github.com/systemd/systemd/blob/main/man/os-release.xml)，
+优先读 `/etc/os-release`，仅当文件不存在时才读 `/usr/lib/os-release`，不合并两份内容。
+内核版本读 `/proc/sys/kernel/osrelease`。解析字符串不执行 shell；缺失值保持未知，
+旧 JSON 报告仍可反序列化。软链在被探测根内解析，来源路径始终是目标机器上的路径。
+
+NPU 档位来自 `freq/hw_min_freq`、`freq/hw_efficient_freq` 和 `freq/hw_max_freq`，
+调度模式来自 `sched_mode`；字段含义对应
+[ivpu 驱动接口](https://github.com/torvalds/linux/blob/master/drivers/accel/ivpu/ivpu_sysfs.c)。
+本机实测为最低 650 MHz、能效 950 MHz、最高 1900 MHz，调度模式 `HW`。
+能效档位是驱动提供的参考值，具体模型的耗电和吞吐仍需实测；探测库不修改频率或调度模式。
+
 | 模块 | 职责 |
 |---|---|
 | `report` | 硬件报告的对外结构，不含任何 IO |
 | `cpu` | 架构、处理器/整机型号、核数、性能分层、指令集 |
 | `memory` | 内存**总量**（事实） |
 | `accelerator` | GPU / NPU 的设备事实、内存语义、运行时就绪度 |
+| `environment` | 发行版与内核、安装的软件、配置和人为标签 |
+| `os` | 内部工具：解析 os-release 身份，不执行 shell |
 | `state` | 运行时状态：可用内存、swap、磁盘余量（瞬时值） |
 | `runtime` | 用户态加速栈是否齐备（设备在 ≠ 能用） |
 | `pci` | `8086:64a0` ↔ 人名（解析 `pci.ids`，不调 `lspci`） |
@@ -181,6 +216,9 @@ cargo run -p deviceinfo-cli -- capture --out fixtures/<名字>
 cargo run -p deviceinfo-cli -- capture --ssh <主机名> --out fixtures/<名字>
 git add fixtures/<名字>
 ```
+
+输出目录必须不存在或为空。重新采集时先写到新目录，比较快照后再替换旧夹具；
+直接覆盖非空目录会被拒绝，避免已卸载的库、设备或标签残留。
 
 `--arch` 只在**覆盖**实机自报的架构时才需要（比如 32 位用户态跑在 64 位内核上）；
 平时不用给：`--ssh` 时会问目标机一句 `uname -m`。**这个值没法从文件里读出来**——`/proc`
@@ -259,6 +297,8 @@ diff <(deviceinfo --json hardware) \
 - **等效算力按物理核折算，不按逻辑核。** SMT 的两个线程不等于两个核：实测那台
   i9-12900H 按逻辑核求和给 20.0，按物理核是 **10.7**（6 P + 8 E，E 核 ≈ 0.6 P）。
   每档各有多少物理核记在 `CoreTier::physical_cores`，渲染成"4 物理核（8 线程）"。
+  该字段是 `Option<usize>`：拓扑读不全且不能确认 SMT 已关闭时为 `None`，
+  JSON 省略该字段，等效核数也返回 `None`，文本显示"物理核数未知"并给出警告。
 - **同一个驱动族的频率节点可能在两个不同层级。** xe 在 `<device>/tileN/gtN/freq0/`，
   i915 在 **`<card>/gt_max_freq_mhz`、`<card>/gt/gt0/rps_max_freq_mhz`**（card 目录下，
   不在 `<card>/device` 下）。写错层级不会报错，只会永远 `None`——前两台机器都没有 i915，
@@ -270,10 +310,15 @@ diff <(deviceinfo --json hardware) \
   常见形态猜的，后者会附一条 `notes`。
 - **`RuntimeStatus::Unknown` 不是失败**，是"认不出这个厂商该找什么"。NVIDIA / AMD 目前
   都走这条路——编一个"就绪"会让用户装上一个跑不起来的模型。
+- **Intel GPU 的 OpenCL 路径需要完整实现**：`libOpenCL.so` 只是通用加载器，
+  还需要 `libigdrcl.so` 和指向已安装 Intel 实现库的 `/etc/OpenCL/vendors/*.icd`。
+  Level Zero GPU 驱动仍是另一条可用路径。采集会保留已安装的已知组件及 ICD 注册，
+  即使该栈仍然缺件；r1 的旧夹具没有采这些 OpenCL 输入，确认实机状态需重新采集。
 - **`warnings` 不含 `Incomplete`**：那是**确定的观测**（确定缺件），不是不确定。
   混在一张列表里会让"未知"失去信号。
-- **加速器只收"上限"类的频率事实**（`max_freq_mhz`），不收 `cur_freq` / `act_freq` /
-  `busy_time` / `memory_utilization`——那些是瞬时值，该进 `state`。
+- **加速器报告收驱动提供的频率档位**：`max_freq_mhz`，以及 NPU 的 `min_freq_mhz`、
+  `efficient_freq_mhz` 和 `scheduling_mode`。缺节点就省略字段，不从最大频率推算。
+  不收 `cur_freq` / `act_freq` / `busy_time` / `memory_utilization`——那些是瞬时值，该进 `state`。
 - **`DiskUsage` 同时给 `free_bytes` 和 `available_bytes`**：前者含 root 保留块，
   后者是当前用户实际可写的量。判断"装不装得下"要用后者（ext4 默认给 root 留 5%）。
 - **`swap_exhausted()` 是个信号，不是数字**：swap 用满时 `MemAvailable` 会系统性高估，
@@ -336,14 +381,10 @@ diff <(deviceinfo --json hardware) \
   Intel/AMD 会被**推断**为共享系统内存并附 `notes`（那是概率，不是证据），其余厂商给
   `Unknown`。想找更硬的判据但没找到：BAR 大小不行（非 ReBAR 独显也是 256 MB），
   PCI class `0x030000`/`0x030200` 也不行。**没有独显可以验证**。
-- **`sched_mode` 未收**：驱动文档已经说明它是 `HW` / `OS` 调度模式（属于**硬件事实**，
-  不是瞬时值），但当前判断它对"能不能跑 / 跑多快"没有直接影响，所以没进报告。
 - **DRM 上的 NPU 只能靠名字认**：`classify_drm_device` 先看驱动名/`compatible` 里有没有
   `npu`（再加一张只含 `rknpu` 的表），**再看有没有 render 节点**——有就是 GPU，
   有 `drm/` 目录却没有 render 节点就是显示设备。第一步没有结构性判据（DRM 层面 NPU 和
   GPU 长得一样），认不出来会当 GPU。
-- **NPU 的其它频率档位未收**：`freq/hw_min_freq`（650）、`freq/hw_efficient_freq`（950）
-  是驱动暴露的硬件事实，对能效调度有用，暂未收。
 - **`freq/set_min_freq` / `set_max_freq` 是可写的**：驱动允许配置 NPU 频率上下限，
   本模块只读不写——写属于调度策略，不该由探测库做。
 - **运行时判据只有 Intel 两套**（Intel NPU / Intel GPU）。所以 Rockchip 那台的 NPU 报

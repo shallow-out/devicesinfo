@@ -28,6 +28,13 @@
     }
   ],
   "init": "systemd",
+  "kernel_release": "7.2.8-arch1-2-xzl01",
+  "operating_system": {
+    "id": "arch",
+    "name": "Arch Linux",
+    "pretty_name": "Arch Linux",
+    "source": "/etc/os-release"
+  },
   "package_managers": [
     "pacman"
   ],

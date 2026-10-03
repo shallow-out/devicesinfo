@@ -57,7 +57,9 @@ pub struct Reachability {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "kebab-case")]
 pub enum ReachabilityOutcome {
-    /// 拿到了 HTTP 状态码。**连得上不等于拉得动**，但连不上就一定拉不动。
+    /// 有响应。**连得上不等于拉得动**，但连不上就一定拉不动。
+    ///
+    /// `http_status` 只有 curl 那条路报得出来；走 wget 兜底时是 `None`。
     Reachable { http_status: Option<String> },
     /// 明确连不上，附原因。
     Unreachable { reason: String },
@@ -183,51 +185,74 @@ fn check_targets(
 
 fn check_one(target: &str, timeout: Duration, run: Runner) -> ReachabilityOutcome {
     let seconds = timeout.as_secs().max(1).to_string();
-    // 先 curl（能给状态码），退回 wget（只报成不成）
-    let attempts: [(&str, Vec<&str>); 2] = [
-        (
-            "curl",
-            vec![
-                "-sS",
-                "-o",
-                "/dev/null",
-                "-w",
-                "%{http_code}",
-                "--max-time",
-                &seconds,
-                target,
-            ],
-        ),
-        (
-            "wget",
-            vec!["-q", "--spider", "-T", &seconds, target],
-        ),
-    ];
+    let mut notes: Vec<String> = Vec::new();
+    // 有几个检查工具**根本没装**。全都问不成时，答案是"没法查"而不是"连不上"——
+    // 这两件事对部署的含义相反。
+    let mut missing = 0;
 
-    let mut last: Option<String> = None;
-    for (program, args) in attempts {
-        match run(program, &args) {
-            Ok(output) => {
-                let status = output.trim();
-                // 401/403 是**通的**：Docker Hub 的 v2 API 未鉴权就回 401。
-                return ReachabilityOutcome::Reachable {
-                    http_status: (!status.is_empty()).then(|| status.to_string()),
-                };
+    // 1) curl：能给出 HTTP 状态码，所以先试它。
+    let curl_args = vec![
+        "-sS",
+        "-o",
+        "/dev/null",
+        "-w",
+        "%{http_code}",
+        "--max-time",
+        &seconds,
+        target,
+    ];
+    match run("curl", &curl_args) {
+        // 401/403 是**通的**：Docker Hub 的 v2 API 未鉴权就回 401，而 curl 的退出码
+        // 仍然是 0，状态码原样打出来。
+        Ok(output) => {
+            let status = output.trim();
+            return ReachabilityOutcome::Reachable {
+                http_status: (!status.is_empty()).then(|| status.to_string()),
+            };
+        }
+        Err(error) => {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                missing += 1;
             }
-            Err(error) => {
-                let note = format!("{program}: {error}");
-                // **两条都留着**：只留最后一条会丢掉 curl 那条（它通常更精确，
-                // 比如 "Could not resolve host"）。
-                last = Some(match last {
-                    Some(previous) => format!("{previous}；{note}"),
-                    None => note,
-                });
-            }
+            notes.push(format!("curl: {error}"));
         }
     }
-    let reason = last.unwrap_or_else(|| "没有可用的检查工具".into());
-    // 两个工具都不存在时，是**没法查**而不是"连不上"——这两件事对部署的含义相反
-    if reason.contains("No such file") || reason.contains("not found") {
+
+    // 2) wget 兜底。**它没有"给我状态码"的开关**，而且 401/403 会让它失败退出（退出码 6）
+    // ——实测 `wget --spider https://registry-1.docker.io/v2/` 就是 6。照退出码当成"不通"，
+    // 会把能拉镜像的机器误报成不能，正是这套检查要避免的错误结论。所以让 shell 把退出码
+    // 打出来，自己判：答过话的那些码算通。
+    let script = format!(
+        "wget -q --spider -T {seconds} {target} >/dev/null 2>&1; echo \"wget:$?\"",
+    );
+    match run("sh", &["-c", &script]) {
+        Ok(output) => match output.trim().strip_prefix("wget:") {
+            // 0 成功、6 需要鉴权、8 服务器回了错——三种都说明对面答话了
+            Some("0" | "6" | "8") => {
+                return ReachabilityOutcome::Reachable { http_status: None };
+            }
+            Some(code) => {
+                return ReachabilityOutcome::Unreachable {
+                    reason: format!("wget 退出码 {code}"),
+                };
+            }
+            // 脚本没按剧本回话（远端 shell 不在之类），别猜
+            None => notes.push(format!("wget 兜底没回话：{}", output.trim())),
+        },
+        Err(error) => {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                missing += 1;
+            }
+            notes.push(format!("sh: {error}"));
+        }
+    }
+
+    let reason = if notes.is_empty() {
+        "没有可用的检查工具".to_string()
+    } else {
+        notes.join("；")
+    };
+    if missing > 0 {
         ReachabilityOutcome::Unknown { reason }
     } else {
         ReachabilityOutcome::Unreachable { reason }
@@ -272,6 +297,8 @@ mod tests {
 
     fn environment() -> EnvironmentReport {
         EnvironmentReport {
+            operating_system: None,
+            kernel_release: None,
             package_managers: vec!["pacman".into()],
             init: None,
             cgroup: None,
@@ -398,6 +425,67 @@ mod tests {
         }
     }
 
+    /// **有 curl 时根本不该走 wget**：curl 能给状态码，wget 给不了。
+    #[test]
+    fn curl_is_preferred_and_wget_is_only_a_fallback() {
+        let calls = std::sync::Mutex::new(Vec::new());
+        let run: Runner = &|program, _args| {
+            calls.lock().unwrap().push(program.to_string());
+            Ok("200".into())
+        };
+        let report = probe(
+            &environment(),
+            &LiveOptions {
+                targets: vec!["https://example.test".into()],
+                skip_network: false,
+                ..Default::default()
+            },
+            run,
+        );
+        for entry in &report.reachability {
+            assert!(entry.outcome.is_reachable(), "{entry:?}");
+        }
+        // 探版本问到的是工具本身；网络那几次必须全是 curl（curl 在就不该退到 wget）
+        let calls = calls.lock().unwrap().clone();
+        let network: Vec<&String> = calls
+            .iter()
+            .filter(|program| program.as_str() != "/usr/bin/podman")
+            .collect();
+        assert!(!network.is_empty());
+        assert!(network.iter().all(|program| program.as_str() == "curl"), "{calls:?}");
+    }
+
+    /// wget 兜底要自己解读退出码：**401/403 让 wget 退出 6，那是"通"**。
+    ///
+    /// 实测：`wget --spider https://registry-1.docker.io/v2/` → 退出码 6。
+    /// 照退出码当成"不通"，会把能拉镜像的机器误报成不能。
+    #[test]
+    fn wget_auth_failures_are_reachable_because_the_server_answered() {
+        for (code, reachable) in [("0", true), ("6", true), ("8", true), ("4", false), ("5", false)] {
+            let run: Runner = &move |program, _args| {
+                if program == "curl" {
+                    Err(std::io::Error::other("curl 不存在"))
+                } else {
+                    Ok(format!("wget:{code}"))
+                }
+            };
+            let report = probe(
+                &environment(),
+                &LiveOptions {
+                    targets: vec!["https://registry-1.docker.io/v2/".into()],
+                    skip_network: false,
+                    ..Default::default()
+                },
+                run,
+            );
+            assert_eq!(
+                report.reachability[0].outcome.is_reachable(),
+                reachable,
+                "wget 退出码 {code} 判错了"
+            );
+        }
+    }
+
     /// 两个检查工具都没有时是**没法查**，不是"连不上"——这两件事对部署的含义相反。
     #[test]
     fn missing_check_tools_is_unknown_not_unreachable() {
@@ -437,5 +525,67 @@ mod tests {
 
     fn fs_assert_no_warnings(report: &LiveReport) {
         assert!(report.warnings.is_empty(), "{:#?}", report.warnings);
+    }
+
+        /// curl 不在时走 wget 兜底。兜底**答了话**（退出码 4 = 网络失败）就该报"不通"，
+    /// 不能因为"第一个工具没装"而含糊成"没法查"。
+    #[test]
+    fn a_missing_curl_does_not_hide_the_wget_verdict() {
+        let run: Runner = &|program, args| {
+            if program == "curl" {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "No such file or directory",
+                ))
+            } else {
+                assert!(program == "sh", "兜底应当走 shell");
+                assert!(args.iter().any(|arg| arg.contains("wget")), "{args:?}");
+                Ok("wget:4".into())
+            }
+        };
+        let outcome = check_one("https://example.invalid", DEFAULT_TIMEOUT, run);
+        assert!(
+            matches!(outcome, ReachabilityOutcome::Unreachable { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    /// 两个检查工具都问不成时是**没法查**，不是"连不上"——这两件事对部署的含义相反。
+    #[test]
+    fn when_no_check_tool_answers_the_result_is_unknown() {
+        let run: Runner = &|_program, _args| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No such file or directory",
+            ))
+        };
+        let outcome = check_one("https://example.invalid", DEFAULT_TIMEOUT, run);
+        assert!(
+            matches!(outcome, ReachabilityOutcome::Unknown { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn missing_remote_shell_commands_are_unknown() {
+        let run: Runner = &|_program, _args| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "sh: command not found",
+            ))
+        };
+        assert!(matches!(
+            check_one("https://example.invalid", DEFAULT_TIMEOUT, run),
+            ReachabilityOutcome::Unknown { .. }
+        ));
+    }
+
+    #[test]
+    fn a_dns_not_found_message_is_a_network_failure() {
+        let run: Runner = &|_program, _args| Err(std::io::Error::other("host not found"));
+        assert!(matches!(
+            check_one("https://example.invalid", DEFAULT_TIMEOUT, run),
+            ReachabilityOutcome::Unreachable { .. }
+        ));
     }
 }

@@ -8,7 +8,7 @@ mod source;
 use clap::{Parser, Subcommand};
 use deviceinfo::pci::{PCI_DATABASE_PATHS, extract_entries};
 use deviceinfo::{
-    CPU_PER_CORE_INPUTS, CPU_SHARED_INPUTS, LIBRARY_DIRS, PciId, RuntimeStatus, SampleOptions,
+    CPU_PER_CORE_INPUTS, CPU_SHARED_INPUTS, LIBRARY_DIRS, OPENCL_VENDOR_DIR, PciId, SampleOptions,
     probe_with, render, sample_state_with,
 };
 use source::{Entry, EntryKind, Source};
@@ -292,6 +292,13 @@ fn print_json<T: serde::Serialize>(value: &T) {
 /// 这样 `tests/fixtures.rs` 就能"拿真机形状跑一遍，结果必须一样"——
 /// 手写的假 flags 列表抓不到真实内核里的意外（`smep` 就是这么混进指令集列表的）。
 fn capture(source: &Source, arch: &str, extra_warnings: &[String], out: &Path) -> io::Result<()> {
+    // 不把新输入叠加到旧夹具上：源端消失的设备、库和标签必须随之消失。
+    if out.exists() && fs::read_dir(out)?.next().transpose()?.is_some() {
+        return Err(io::Error::other(format!(
+            "输出目录 {} 非空，请采集到新目录，再比较或替换旧夹具",
+            out.display()
+        )));
+    }
     // 远端先镜像成本地临时树，之后一切都按本地处理——这样本地采集的路径一字未变，
     // 远端采集只是多了一步落地。
     let staging = TempTree::new()?;
@@ -313,8 +320,6 @@ fn capture(source: &Source, arch: &str, extra_warnings: &[String], out: &Path) -
     // 一旦混进了要复制内容的大文件（可执行文件、模型、数据库），这里会拦住——
     // 实测环境探测把 `/usr/bin/podman`（45 MB）当内容复制过，夹具从 33 KB 涨到 428 MB，
     // 而且**没有任何测试会红**。
-    refuse_if_oversized(out)?;
-
     for required in ESSENTIAL_FILES {
         if !root.join(required).is_file() {
             return Err(io::Error::other(format!(
@@ -325,7 +330,8 @@ fn capture(source: &Source, arch: &str, extra_warnings: &[String], out: &Path) -
         }
     }
 
-    capture_from_root(&root, arch, extra_warnings, out)
+    capture_from_root(&root, arch, extra_warnings, out)?;
+    refuse_if_oversized(out)
 }
 
 /// "顺手带上内容"的大小门槛。
@@ -500,10 +506,22 @@ fn capture_from_root(root: &Path, arch: &str, extra_warnings: &[String], out: &P
     // 0) **只需要"存在"**的输入：夹具里放空占位。可执行文件动辄几十 MB，
     //    复制内容会让夹具爆掉（真的发生过：428 MB）。
     for rel in &plan.existence_only {
-        let from = root.join(rel);
-        if !from.exists() {
-            continue;
-        }
+        let from = match deviceinfo::resolve_path_in_root(root, rel) {
+            Ok(path) => path,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            // **这一步只要"存在"这个事实**，所以穿不过去也算数：`/run/podman/podman.sock`
+            // 就在一个 root-only 的目录里，以非 root 采本机时必然撞上。远端那边同样是
+            // 这么处理的（这类输入根本不去取内容）——两边判定必须一致，否则"本机能采、
+            // 远端也能采"这件事只对其中一边成立。
+            //
+            // 注意**只对"只要存在"这一类放宽**：下面阶段 1（要内容的文件）读不到仍然是硬错误，
+            // 否则会得到一个"少了个文件"的夹具，而它探测出来和真机不一样。
+            // 而且**不能写占位**：写下去，夹具树里就"有"它了，而真机上以同一个用户
+            // 探测是看不到的——于是夹具探测出来的和真机不一样（测试当场抓到过）。
+            // 夹具要冻结的是"探测会看到什么"，探测看不到的就不该出现在树里。
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => continue,
+            Err(error) => return Err(error),
+        };
         // 同 `mirror`：小文件带内容（壳脚本判据要读它），大文件只占位
         let content = match fs::metadata(&from) {
             Ok(meta) if meta.is_file() && meta.len() <= SMALL_FILE_BYTES => {
@@ -516,7 +534,11 @@ fn capture_from_root(root: &Path, arch: &str, extra_warnings: &[String], out: &P
 
     // 1) 探测会读到的文件
     for rel in &plan.files {
-        let from = root.join(rel);
+        let from = match deviceinfo::resolve_path_in_root(root, rel) {
+            Ok(path) => path,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
         // 只有状态采样读的瞬时值：夹具只保留"读到得到"这个事实，不保留读数
         if is_volatile_leaf(rel) {
             if from.exists() {
@@ -527,7 +549,15 @@ fn capture_from_root(root: &Path, arch: &str, extra_warnings: &[String], out: &P
         match fs::metadata(&from) {
             // 只读普通文件：`/dev/accel/accel0` 这类字符设备直接读会阻塞
             Ok(meta) if meta.is_file() => {
-                let raw = fs::read(&from)?;
+                // **错误里必须带路径**：报一句 "Permission denied (os error 13)" 而不说
+                // 是哪个文件，唯一的线索就没了（本机以非 root 采 `/` 时会撞上 root-only
+                // 的文件，而"哪个文件"决定了是"该用 sudo"还是"计划里不该有它"）。
+                let raw = fs::read(&from).map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!("读 {} 失败：{error}", from.display()),
+                    )
+                })?;
                 match String::from_utf8(raw.clone()) {
                     Ok(text) => write_file(&out.join(rel), filter_volatile(rel, &text).as_bytes())?,
                     Err(_) => write_file(&out.join(rel), &raw)?,
@@ -552,14 +582,10 @@ fn capture_from_root(root: &Path, arch: &str, extra_warnings: &[String], out: &P
         std::os::unix::fs::symlink(target, &to)?;
     }
 
-    // 2) 用户态库：只放命中的那几个**文件名**（空文件即可）。
-    //    整个 /usr/lib 显然不能进夹具，而 LibraryIndex 只关心文件名。
-    for accel in &report.accelerators {
-        if let RuntimeStatus::Ready { components, .. } = &accel.runtime {
-            for name in components {
-                write_file(&out.join("usr/lib").join(name), b"")?;
-            }
-        }
+    // 不完整栈中已有的组件也要保留，否则夹具会额外报告缺件。
+    // 保持目录位置：ICD 注册可能引用库的绝对路径。
+    for path in deviceinfo::runtime_library_inputs(root) {
+        write_file(&out.join(path), b"")?;
     }
 
     // 3) pci.ids 只留用到的条目
@@ -672,6 +698,9 @@ fn capture_plan(source: &Source) -> io::Result<CapturePlan> {
             "device",
             // 新路径优先，npu_max_frequency_mhz 是 legacy alias
             "freq/hw_max_freq",
+            "freq/hw_min_freq",
+            "freq/hw_efficient_freq",
+            "sched_mode",
             "npu_max_frequency_mhz",
             // 运行时状态读的（瞬时值，但夹具有了就能测"读得到"这件事本身）
             "freq/current_freq",
@@ -710,6 +739,11 @@ fn capture_plan(source: &Source) -> io::Result<CapturePlan> {
             "device",
             "mem_info_vram_total",
             "mem_info_vram_used",
+            "freq/hw_max_freq",
+            "npu_max_frequency_mhz",
+            "freq/hw_min_freq",
+            "freq/hw_efficient_freq",
+            "sched_mode",
             "of_node/compatible",
             // xe 的频率在 `<device>/tileN/gtN/freq0/` 下（见阶段三）
         ] {
@@ -771,7 +805,8 @@ fn capture_plan(source: &Source) -> io::Result<CapturePlan> {
 
     // 软件环境：**输入清单由库提供**（`environment::inputs`），这里不重抄一份。
     // 硬件那边因为重抄栽过一次（`acpi_cppc/highest_perf` 漏加 → 远端夹具静默少一个输入）。
-    let environment_dirs = deviceinfo::environment::input_dirs();
+    let mut environment_dirs = deviceinfo::environment::input_dirs();
+    environment_dirs.push(OPENCL_VENDOR_DIR.to_string());
     lists.ensure(&environment_dirs)?;
     for input in deviceinfo::environment::inputs(&|dir| {
         lists
@@ -783,6 +818,12 @@ fn capture_plan(source: &Source) -> io::Result<CapturePlan> {
         match input {
             deviceinfo::environment::Input::Content(path) => files.push(path),
             deviceinfo::environment::Input::Existence(path) => existence_only.push(path),
+        }
+    }
+
+    for entry in lists.entries(OPENCL_VENDOR_DIR) {
+        if !entry.is_dir && entry.name.ends_with(".icd") {
+            files.push(format!("{OPENCL_VENDOR_DIR}/{}", entry.name));
         }
     }
 
@@ -1037,11 +1078,24 @@ fn run_with_timeout(mut command: ProcessCommand, timeout: Duration) -> io::Resul
             .chars()
             .take(160)
             .collect::<String>();
-        return Err(io::Error::other(format!(
-            "退出码 {:?}{}",
-            output.status.code(),
-            if last.is_empty() { String::new() } else { format!(": {last}") }
-        )));
+        // POSIX shell 的 127 表示远端命令不存在；保留结构化错误供 live 分类。
+        let kind = if output.status.code() == Some(127) {
+            io::ErrorKind::NotFound
+        } else {
+            io::ErrorKind::Other
+        };
+        return Err(io::Error::new(
+            kind,
+            format!(
+                "退出码 {:?}{}",
+                output.status.code(),
+                if last.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {last}")
+                }
+            ),
+        ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
@@ -1216,5 +1270,171 @@ mod tests {
         let (arch, warnings) = resolve_arch(&Source::local(tree), tree, Some("aarch64".into()));
         assert_eq!(arch, "aarch64");
         assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    fn minimal_machine() -> TempTree {
+        let tree = TempTree::new().unwrap();
+        write_file(
+            &tree.path.join("proc/cpuinfo"),
+            b"processor: 0\nmodel name: x\n",
+        )
+        .unwrap();
+        write_file(&tree.path.join("proc/meminfo"), b"MemTotal: 1000 kB\n").unwrap();
+        tree
+    }
+
+    fn assert_hardware_snapshot_matches(out: &Path) {
+        let expected: deviceinfo::HardwareReport =
+            serde_json::from_slice(&fs::read(out.join("expected.json")).unwrap()).unwrap();
+        assert_eq!(probe_with(out, "x86_64"), expected);
+    }
+
+    #[test]
+    fn a_shell_command_not_found_is_reported_with_a_structured_error_kind() {
+        let mut command = ProcessCommand::new("sh");
+        command.args(["-c", "echo 'sh: curl: not found' >&2; exit 127"]);
+        let error = run_with_timeout(command, Duration::from_secs(1)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("curl: not found"));
+    }
+
+    #[test]
+    fn capture_preserves_components_of_an_incomplete_runtime() {
+        let source = minimal_machine();
+        let out = TempTree::new().unwrap();
+        for (path, content) in [
+            ("dev/accel/accel0", ""),
+            ("sys/class/accel/accel0/device/vendor", "0x8086\n"),
+            ("sys/class/accel/accel0/device/device", "0x643e\n"),
+            ("sys/class/accel/accel0/device/freq/hw_max_freq", "1900\n"),
+            ("sys/class/accel/accel0/device/freq/hw_min_freq", "650\n"),
+            ("sys/class/accel/accel0/device/freq/hw_efficient_freq", "950\n"),
+            ("sys/class/accel/accel0/device/sched_mode", "HW\n"),
+            ("usr/lib/x86_64-linux-gnu/libze_loader.so.1", ""),
+            ("usr/lib/x86_64-linux-gnu/libze_intel_npu.so", ""),
+        ] {
+            write_file(&source.path.join(path), content.as_bytes()).unwrap();
+        }
+        capture(&Source::local(&source.path), "x86_64", &[], &out.path).unwrap();
+        assert_hardware_snapshot_matches(&out.path);
+        assert!(
+            out.path
+                .join("usr/lib/x86_64-linux-gnu/libze_loader.so.1")
+                .is_file()
+        );
+        let report = probe_with(&out.path, "x86_64");
+        assert_eq!(report.accelerators[0].max_freq_mhz, Some(1900));
+        assert_eq!(report.accelerators[0].min_freq_mhz, Some(650));
+        assert_eq!(report.accelerators[0].efficient_freq_mhz, Some(950));
+        assert_eq!(report.accelerators[0].scheduling_mode.as_deref(), Some("HW"));
+        match &report.accelerators[0].runtime {
+            deviceinfo::RuntimeStatus::Incomplete { missing, .. } => assert_eq!(missing.len(), 1),
+            status => panic!("预期只缺编译器: {status:?}"),
+        }
+    }
+
+    #[test]
+    fn capture_preserves_heterogeneous_cpu_features_and_sparse_ids() {
+        let source = minimal_machine();
+        let out = TempTree::new().unwrap();
+        write_file(
+            &source.path.join("proc/cpuinfo"),
+            b"processor: 2\nflags: aes avx2\nprocessor: 7\nflags: aes\n",
+        )
+        .unwrap();
+        capture(&Source::local(&source.path), "x86_64", &[], &out.path).unwrap();
+        assert_hardware_snapshot_matches(&out.path);
+        let original = probe_with(&source.path, "x86_64");
+        let captured = probe_with(&out.path, "x86_64");
+        assert_eq!(original.cpu, captured.cpu);
+        assert_eq!(captured.cpu.common_features, Some(vec!["aes".into()]));
+        assert_eq!(captured.cpu.feature_groups[1].cpus, [7]);
+    }
+
+    #[test]
+    fn capture_preserves_os_identity_and_kernel_without_host_paths() {
+        let source = minimal_machine();
+        let out = TempTree::new().unwrap();
+        for (path, content) in [
+            ("etc/os-release", "ID=ubuntu\nID_LIKE=debian\nPRETTY_NAME=\"Ubuntu Linux\"\nVERSION_ID=24.04\n"),
+            ("usr/lib/os-release", "ID=default\n"),
+            ("proc/sys/kernel/osrelease", "6.8.0-test\n"),
+        ] {
+            write_file(&source.path.join(path), content.as_bytes()).unwrap();
+        }
+        capture(&Source::local(&source.path), "x86_64", &[], &out.path).unwrap();
+        let report = deviceinfo::probe_environment(&out.path);
+        assert_eq!(report, deviceinfo::probe_environment(&source.path));
+        let expected: serde_json::Value = serde_json::from_slice(
+            &fs::read(out.path.join("expected-environment.json")).unwrap(),
+        ).unwrap();
+        assert_eq!(serde_json::to_value(&report).unwrap(), expected);
+        let os = report.operating_system.as_ref().unwrap();
+        assert_eq!(os.id.as_deref(), Some("ubuntu"));
+        assert_eq!(os.version_id.as_deref(), Some("24.04"));
+        assert_eq!(os.id_like, ["debian"]);
+        assert_eq!(os.source, Path::new("/etc/os-release"));
+        assert_eq!(report.kernel_release.as_deref(), Some("6.8.0-test"));
+        let text = deviceinfo::render::human_environment(&report);
+        assert!(text.contains("Ubuntu Linux"), "{text}");
+        assert!(text.contains("6.8.0-test"), "{text}");
+    }
+
+    #[test]
+    fn capture_resolves_absolute_os_release_symlinks_in_the_target_root() {
+        let source = minimal_machine();
+        let out = TempTree::new().unwrap();
+        write_file(&source.path.join("usr/lib/os-release"), b"ID=fixture-only\n").unwrap();
+        fs::create_dir_all(source.path.join("etc")).unwrap();
+        std::os::unix::fs::symlink("/usr/lib/os-release", source.path.join("etc/os-release")).unwrap();
+        capture(&Source::local(&source.path), "x86_64", &[], &out.path).unwrap();
+        let report = deviceinfo::probe_environment(&out.path);
+        assert_eq!(report, deviceinfo::probe_environment(&source.path));
+        assert_eq!(report.operating_system.unwrap().id.as_deref(), Some("fixture-only"));
+    }
+
+    #[test]
+    fn capture_preserves_the_opencl_implementation_and_its_icd() {
+        let source = minimal_machine();
+        let out = TempTree::new().unwrap();
+        for (path, content) in [
+            ("sys/class/drm/card0/device/vendor", "0x8086\n"),
+            ("sys/class/drm/card0/device/device", "0x64a0\n"),
+            ("sys/class/drm/card0/device/drm/renderD128", ""),
+            ("dev/dri/renderD128", ""),
+            ("usr/lib/x86_64-linux-gnu/libOpenCL.so.1", ""),
+            ("usr/lib/x86_64-linux-gnu/libigdrcl.so", ""),
+            (
+                "etc/OpenCL/vendors/intel.icd",
+                "/usr/lib/x86_64-linux-gnu/libigdrcl.so\n",
+            ),
+        ] {
+            write_file(&source.path.join(path), content.as_bytes()).unwrap();
+        }
+        capture(&Source::local(&source.path), "x86_64", &[], &out.path).unwrap();
+        assert_hardware_snapshot_matches(&out.path);
+        assert!(probe_with(&out.path, "x86_64").has_usable_gpu());
+    }
+
+    #[test]
+    fn capture_refuses_to_mix_new_inputs_into_an_existing_fixture() {
+        let source = minimal_machine();
+        let out = TempTree::new().unwrap();
+        write_file(
+            &source.path.join("etc/deviceinfo/tags.conf"),
+            b"always-on\n",
+        )
+        .unwrap();
+        capture(&Source::local(&source.path), "x86_64", &[], &out.path).unwrap();
+        let previous = fs::read(out.path.join("expected-environment.json")).unwrap();
+        fs::remove_file(source.path.join("etc/deviceinfo/tags.conf")).unwrap();
+        let error = capture(&Source::local(&source.path), "x86_64", &[], &out.path).unwrap_err();
+        assert!(error.to_string().contains("非空"), "{error}");
+        assert_eq!(
+            fs::read(out.path.join("expected-environment.json")).unwrap(),
+            previous
+        );
+        assert!(out.path.join("etc/deviceinfo/tags.conf").is_file());
+        assert_hardware_snapshot_matches(&out.path);
     }
 }

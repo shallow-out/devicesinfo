@@ -129,6 +129,11 @@ fn gpu_max_freq_mhz(card_dir: &Path, device_dir: &Path) -> Option<u64> {
         .find_map(|path| read_u64(&card_dir.join(path)))
 }
 
+fn npu_max_freq_mhz(device_dir: &Path) -> Option<u64> {
+    read_u64(&device_dir.join("freq/hw_max_freq"))
+        .or_else(|| read_u64(&device_dir.join("npu_max_frequency_mhz")))
+}
+
 /// GPU 可用的内存语义，以及一条"这是推断"的说明（如果有）。
 ///
 /// 只有一件事是**证据**：驱动暴露了 `mem_info_vram_total` → 独立显存。
@@ -393,8 +398,11 @@ pub(crate) fn probe_npus(
             // NPU 没有独立显存：权重和中间张量都在系统内存里。
             memory: AcceleratorMemory::SharedWithSystem,
             // `npu_max_frequency_mhz` 是 Legacy alias（驱动文档原话），先读 freq/hw_max_freq
-            max_freq_mhz: read_u64(&device_dir.join("freq/hw_max_freq"))
-                .or_else(|| read_u64(&device_dir.join("npu_max_frequency_mhz"))),
+            max_freq_mhz: npu_max_freq_mhz(&device_dir),
+            min_freq_mhz: read_u64(&device_dir.join("freq/hw_min_freq")),
+            efficient_freq_mhz: read_u64(&device_dir.join("freq/hw_efficient_freq")),
+            scheduling_mode: read_trimmed(&device_dir.join("sched_mode"))
+                .filter(|mode| !mode.is_empty()),
             runtime,
             notes: Vec::new(),
         };
@@ -469,7 +477,11 @@ pub(crate) fn probe_gpus(
             AcceleratorKind::Display => (AcceleratorMemory::SharedWithSystem, None),
             _ => gpu_memory(&device_dir, vendor.as_deref(), pci_id.as_ref()),
         };
-        let max_freq_mhz = gpu_max_freq_mhz(&card_path, &device_dir);
+        let max_freq_mhz = if kind == AcceleratorKind::Npu {
+            npu_max_freq_mhz(&device_dir)
+        } else {
+            gpu_max_freq_mhz(&card_path, &device_dir)
+        };
 
         let mut notes = Vec::new();
         if let Some(note) = memory_note {
@@ -483,7 +495,10 @@ pub(crate) fn probe_gpus(
             // 也不要在老内核上把真 GPU 静默降级。
             notes.push("看不到 <device>/drm/，无法判断是否只做显示输出".into());
         } else if let Some(path) = &device_path {
-            if !path.exists() {
+            if !root
+                .join(path.strip_prefix("/").expect("设备路径是绝对路径"))
+                .exists()
+            {
                 notes.push(format!("{} 不存在", path.display()));
             }
         }
@@ -499,6 +514,16 @@ pub(crate) fn probe_gpus(
             compatible,
             memory,
             max_freq_mhz,
+            min_freq_mhz: (kind == AcceleratorKind::Npu)
+                .then(|| read_u64(&device_dir.join("freq/hw_min_freq")))
+                .flatten(),
+            efficient_freq_mhz: (kind == AcceleratorKind::Npu)
+                .then(|| read_u64(&device_dir.join("freq/hw_efficient_freq")))
+                .flatten(),
+            scheduling_mode: (kind == AcceleratorKind::Npu)
+                .then(|| read_trimmed(&device_dir.join("sched_mode")))
+                .flatten()
+                .filter(|mode| !mode.is_empty()),
             runtime,
             notes,
         });
@@ -624,8 +649,11 @@ mod tests {
         // B1：id 翻成了人名，id 本身也没丢
         assert_eq!(npu.name, "Intel Core Ultra NPU");
         assert_eq!(npu.pci_id.as_ref().unwrap().compact(), "8086:643e");
-        // B2：只收"上限"这类事实
+        // 未暴露的档位保持未知，不从最大频率推算。
         assert_eq!(npu.max_freq_mhz, Some(1900));
+        assert_eq!(npu.min_freq_mhz, None);
+        assert_eq!(npu.efficient_freq_mhz, None);
+        assert_eq!(npu.scheduling_mode, None);
         // A5：NPU 共享系统内存，不是"未知"
         assert_eq!(npu.memory, AcceleratorMemory::SharedWithSystem);
 
@@ -637,6 +665,9 @@ mod tests {
         assert!(gpu.runtime.is_ready(), "{:#?}", gpu.runtime);
         assert_eq!(gpu.name, "Intel Arc Graphics 130V/140V GPU");
         assert_eq!(gpu.max_freq_mhz, Some(1950));
+        assert_eq!(gpu.min_freq_mhz, None);
+        assert_eq!(gpu.efficient_freq_mhz, None);
+        assert_eq!(gpu.scheduling_mode, None);
         assert_eq!(gpu.memory, AcceleratorMemory::SharedWithSystem);
         assert_eq!(
             gpu.device_path.as_deref(),
@@ -953,6 +984,12 @@ mod tests {
         fs::create_dir_all(device.join("of_node")).unwrap();
         // 设备树属性是 NUL 结尾的
         fs::write(device.join("of_node/compatible"), b"rockchip,rk3588-rknpu\0").unwrap();
+        // 模拟驱动提供档位的 DRM NPU；两种设备入口采用相同的字段含义。
+        fs::create_dir_all(device.join("freq")).unwrap();
+        fs::write(device.join("freq/hw_max_freq"), "1000\n").unwrap();
+        fs::write(device.join("freq/hw_min_freq"), "200\n").unwrap();
+        fs::write(device.join("freq/hw_efficient_freq"), "600\n").unwrap();
+        fs::write(device.join("sched_mode"), "OS\n").unwrap();
         fs::create_dir_all(device.join("drm/renderD128")).unwrap();
         fs::create_dir_all(root.join("dev/dri")).unwrap();
         fs::write(root.join("dev/dri/renderD128"), "").unwrap();
@@ -967,6 +1004,10 @@ mod tests {
         );
         assert_eq!(found[0].compatible.as_deref(), Some("rockchip,rk3588-rknpu"));
         assert_eq!(found[0].name, "rockchip,rk3588-rknpu (card0)");
+        assert_eq!(found[0].max_freq_mhz, Some(1000));
+        assert_eq!(found[0].min_freq_mhz, Some(200));
+        assert_eq!(found[0].efficient_freq_mhz, Some(600));
+        assert_eq!(found[0].scheduling_mode.as_deref(), Some("OS"));
         assert!(warnings.is_empty(), "{warnings:?}");
 
         fs::remove_dir_all(&root).ok();
@@ -1120,5 +1161,31 @@ mod tests {
 
         fs::remove_dir_all(&root).ok();
         fs::remove_dir_all(&bare).ok();
+    }
+
+    #[test]
+    fn render_node_existence_is_checked_inside_the_probe_root() {
+        let root = fake_root("render-root");
+        let device = root.join("sys/class/drm/card0/device");
+        // 不依赖测试机的 /dev/dri 内容。
+        let node = format!("renderD{}", std::process::id() as u64 + 1_000_000);
+        fs::create_dir_all(device.join("drm")).unwrap();
+        fs::write(device.join("drm").join(&node), "").unwrap();
+        fs::create_dir_all(root.join("dev/dri")).unwrap();
+        let path = root.join("dev/dri").join(&node);
+        fs::write(&path, "").unwrap();
+        let probe = || {
+            probe_gpus(
+                &root,
+                &empty_libraries(&root),
+                &mut BTreeSet::new(),
+                &mut Vec::new(),
+            )
+        };
+        let missing = format!("/dev/dri/{node} 不存在");
+        assert!(!probe()[0].notes.contains(&missing));
+        fs::remove_file(path).unwrap();
+        assert!(probe()[0].notes.contains(&missing));
+        fs::remove_dir_all(root).unwrap();
     }
 }

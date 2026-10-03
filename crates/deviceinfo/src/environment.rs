@@ -27,6 +27,8 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+pub use crate::os::OperatingSystem;
+
 /// 找可执行文件的候选目录。`bin` / `sbin` 在合并了 `/usr` 的发行版上是指向 `usr/*` 的软链。
 const BIN_DIRS: [&str; 5] = ["usr/bin", "usr/local/bin", "bin", "usr/sbin", "sbin"];
 
@@ -153,6 +155,12 @@ pub struct RegistryMirror {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvironmentReport {
+    /// 发行版身份，供部署工具选择匹配的发布物或包名。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operating_system: Option<OperatingSystem>,
+    /// 当前启动的内核版本；升级或重启后可能改变，属于环境信息。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel_release: Option<String>,
     /// 找到的包管理器（按 [`BIN_DIRS`] 顺序）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub package_managers: Vec<String>,
@@ -220,6 +228,9 @@ pub(crate) fn probe(root: &Path, warnings: &mut Vec<String>) -> EnvironmentRepor
         .collect();
 
     EnvironmentReport {
+        operating_system: crate::os::probe(root, warnings),
+        kernel_release: read_trimmed(&root.join("proc/sys/kernel/osrelease"))
+            .filter(|value| !value.is_empty()),
         package_managers,
         init: probe_init(root),
         cgroup: probe_cgroup(root),
@@ -301,6 +312,7 @@ pub fn inputs(list_dir: &dyn Fn(&str) -> Vec<String>) -> Vec<Input> {
         Input::Existence("sys/fs/cgroup/cgroup.controllers".into()),
         Input::Existence("sys/fs/cgroup/memory".into()),
     ];
+    inputs.extend(crate::os::INPUTS.iter().map(|path| Input::Content((*path).to_string())));
 
     // 可执行文件候选：候选目录 × 所有要找的名字。**只放占位**。
     let tools: Vec<&str> = CONTAINER_RUNTIMES
@@ -627,7 +639,20 @@ mod tests {
         fs::write(path, contents).unwrap();
     }
 
-    /// 这台机器的形状：podman + rootless socket + systemd + cgroup v2 + 已有 llama.cpp。
+    #[test]
+    fn missing_os_identity_stays_unknown_and_old_reports_still_deserialize() {
+        let root = fake_root("no-os");
+        let report = probe(&root, &mut Vec::new());
+        assert_eq!(report.operating_system, None);
+        assert_eq!(report.kernel_release, None);
+        let old: EnvironmentReport = serde_json::from_str(r#"{"warnings":[]}"#).unwrap();
+        assert_eq!(old.operating_system, None);
+        assert_eq!(old.kernel_release, None);
+        assert!(!serde_json::to_value(old).unwrap()
+            .as_object().unwrap().contains_key("operating_system"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn finds_a_rootless_container_runtime_and_existing_tools() {
         let root = fake_root("podman");

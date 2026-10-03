@@ -147,6 +147,15 @@ pub struct Accelerator {
     /// `cur_freq` / `act_freq` 那一类不进报告。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_freq_mhz: Option<u64>,
+    /// 硬件支持的最低频率（MHz），目前由 Intel NPU 的 freq/hw_min_freq 暴露。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_freq_mhz: Option<u64>,
+    /// 硬件自报的能效频率（MHz）；不代表某个具体模型的最优频率。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub efficient_freq_mhz: Option<u64>,
+    /// 驱动自报的调度模式，如 Intel NPU 的 HW / OS，原样保留。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduling_mode: Option<String>,
     /// 用户态运行时是否就绪。
     pub runtime: RuntimeStatus,
     /// 观测到的、影响可用性的备注（缺驱动、设备节点不存在等）。
@@ -185,7 +194,8 @@ pub struct CpuInfo {
     /// 物理核、还是 6 P + 8 E。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub core_tiers: Vec<CoreTier>,
-    /// 内核报告的全部指令集特征，**原样**（排序去重）。
+    /// 内核报告的全部指令集特征的并集，**原样**（排序去重）。
+    /// 并集中的特征可能只在部分核上出现；全核任务应查 common_features。
     ///
     /// 刻意不做筛选：消费方问的是开放式问题（"有没有 AMX"、"有没有 SVE2"、
     /// "有没有 FP8"），生产者一旦筛掉信息就永久丢了，而且丢失是无声的。
@@ -193,9 +203,47 @@ pub struct CpuInfo {
     /// arm64 的 `asimddp` 因为名字猜错而落空。具体理由见 `features` 模块。
     #[serde(default)]
     pub features: Vec<String>,
+    /// 所有被探测逻辑核的公共特征。部分核缺记录时未知；Some([]) 表示交集为空。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub common_features: Option<Vec<String>>,
+    /// 按内核报告的特征集合分组，不等同于按性能分组。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub feature_groups: Vec<CpuFeatureGroup>,
+}
+
+/// 内核为这些逻辑核报告了相同的特征集合。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CpuFeatureGroup {
+    pub cpus: Vec<usize>,
+    /// 排序去重的原始特征；空列表仍是一条明确的观测。
+    pub features: Vec<String>,
 }
 
 impl CpuInfo {
+    /// 指定核集合的公共特征。任一核缺记录或归属重复时返回 None，不退回全机并集。
+    /// 空的核集合也返回 None。该查询不改变任务亲和性。
+    pub fn features_for_cpus(&self, cpus: &[usize]) -> Option<Vec<String>> {
+        let cpus: std::collections::BTreeSet<_> = cpus.iter().copied().collect();
+        if cpus.is_empty() {
+            return None;
+        }
+        let mut common: Option<std::collections::BTreeSet<String>> = None;
+        for cpu in cpus {
+            let mut matches = self.feature_groups.iter()
+                .filter(|group| group.cpus.contains(&cpu));
+            let group = matches.next()?;
+            if matches.next().is_some() {
+                return None;
+            }
+            let features = group.features.iter().cloned().collect();
+            common = Some(match common {
+                None => features,
+                Some(previous) => previous.intersection(&features).cloned().collect(),
+            });
+        }
+        common.map(|features| features.into_iter().collect())
+    }
+
     /// 等效核数：各**物理核** `cpu_capacity` 之和 ÷ 1024。
     ///
     /// 同构机器上等于物理核数；混合架构上**小于**核数（实测 8 核的 Lunar Lake ≈ 6.6）。
@@ -204,7 +252,7 @@ impl CpuInfo {
     /// i9-12900H（6 P + 8 E，20 线程）按逻辑核求和会给 20.0，而按物理核算约 10.7。
     /// 每档各有多少物理核记在 [`CoreTier::physical_cores`]。
     ///
-    /// 部分核没有 `cpu_capacity` 时返回 `None`——宁可没有数字，也不要一个偏低的数字。
+    /// 部分核缺少相对性能或物理核拓扑时返回 `None`。
     pub fn effective_cores(&self) -> Option<f64> {
         let covered: usize = self
             .core_tiers
@@ -215,11 +263,10 @@ impl CpuInfo {
         if covered == 0 || covered != self.logical_cores {
             return None;
         }
-        let total: u64 = self
-            .core_tiers
-            .iter()
-            .filter_map(|tier| tier.capacity.map(|capacity| capacity * tier.physical_cores as u64))
-            .sum();
+        let mut total = 0_u64;
+        for tier in &self.core_tiers {
+            total += tier.capacity? * tier.physical_cores? as u64;
+        }
         Some(total as f64 / 1024.0)
     }
 }
@@ -234,7 +281,9 @@ pub struct CoreTier {
     ///
     /// 与 `cpus.len()` 的区别在 SMT 机器上才看得出来：实测那台 i9-12900H 上
     /// 有两档是「2 物理核 / 4 线程」和「4 物理核 / 8 线程」。
-    pub physical_cores: usize,
+    /// 拓扑读不全且不能确认 SMT 已关闭时为 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physical_cores: Option<usize>,
     /// 组内单核最大频率（MHz）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_freq_mhz: Option<u64>,
