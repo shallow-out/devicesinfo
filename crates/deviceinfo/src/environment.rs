@@ -22,7 +22,7 @@
 //! ——这就是本模块存在的理由。
 
 use crate::sysfs::read_trimmed;
-use crate::tags::{self, parse as tags_parse, TagLine};
+use crate::tags::{self, TagLine, parse as tags_parse};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -56,6 +56,16 @@ pub const INFERENCE_TOOLS: [&str; 7] = [
     "vllm",
     "ovms",
     "text-generation-launcher",
+];
+
+/// Runtime libraries are observations of files, not proof of loadability or inference.
+const INFERENCE_LIBRARIES: [&str; 2] = ["librkllmrt.so", "librknnrt.so"];
+const LIB_DIRS: [&str; 5] = [
+    "usr/lib",
+    "usr/local/lib",
+    "lib",
+    "usr/lib/aarch64-linux-gnu",
+    "usr/lib/x86_64-linux-gnu",
 ];
 
 /// 包管理器（只要能找到可执行文件就认）。
@@ -125,10 +135,7 @@ pub struct DeclaredTag {
 ///
 /// 分层是有理由的：硬件产品随附的声明（"这台是随身超算"）装在 `usr/share`，
 /// 用户改自己的角色时不至于去动厂商的文件。
-const TAG_CONFIGS: [&str; 2] = [
-    "etc/deviceinfo/tags.conf",
-    "usr/share/deviceinfo/tags.conf",
-];
+const TAG_CONFIGS: [&str; 2] = ["etc/deviceinfo/tags.conf", "usr/share/deviceinfo/tags.conf"];
 
 /// 分片标签目录，方便按用途拆开写。
 const TAG_CONFIG_DIR: &str = "etc/deviceinfo/tags.d";
@@ -174,6 +181,9 @@ pub struct EnvironmentReport {
     pub containers: Vec<ContainerRuntime>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inference_tools: Vec<InstalledTool>,
+    /// Library presence on this target; does not imply ABI compatibility or working models.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inference_libraries: Vec<InstalledTool>,
     /// 配置好的容器镜像源。**空不等于"没有"**：没配镜像源就是真的空
     /// （这时拉镜像走默认 registry，能不能通是另一回事——那属于实时探测）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -192,7 +202,9 @@ pub struct EnvironmentReport {
 impl EnvironmentReport {
     /// 有没有某个声明标签。标签名不区分大小写（解析时已规范化）。
     pub fn has_tag(&self, tag: &str) -> bool {
-        self.declared_tags.iter().any(|declared| declared.tag == tag)
+        self.declared_tags
+            .iter()
+            .any(|declared| declared.tag == tag)
     }
 
     /// 这台机器被声明成一直开着——任务路由的第一步筛的就是它。
@@ -236,6 +248,7 @@ pub(crate) fn probe(root: &Path, warnings: &mut Vec<String>) -> EnvironmentRepor
         cgroup: probe_cgroup(root),
         containers: probe_containers(root),
         inference_tools: probe_inference_tools(root),
+        inference_libraries: probe_inference_libraries(root),
         declared_tags: probe_declared_tags(root, warnings),
         registry_mirrors: probe_registry_mirrors(root, warnings),
         // 子探测往**调用方**的 `warnings` 里写（和硬件那边同一个约定），
@@ -293,6 +306,36 @@ pub fn inference_tool_search_paths() -> Vec<(String, String)> {
     paths
 }
 
+/// Library inputs share one path list with fixture collection, keeping remote
+/// probes from accidentally checking the collector machine's libraries.
+pub fn inference_library_search_paths() -> Vec<(String, String)> {
+    INFERENCE_LIBRARIES
+        .iter()
+        .flat_map(|name| {
+            LIB_DIRS
+                .iter()
+                .map(move |dir| ((*name).to_string(), format!("/{dir}/{name}")))
+        })
+        .collect()
+}
+
+fn probe_inference_libraries(root: &Path) -> Vec<InstalledTool> {
+    let mut libraries = Vec::new();
+    for (name, path) in inference_library_search_paths() {
+        if !libraries
+            .iter()
+            .any(|item: &InstalledTool| item.name == name)
+            && root.join(path.trim_start_matches('/')).is_file()
+        {
+            libraries.push(InstalledTool {
+                name,
+                path: path.into(),
+            });
+        }
+    }
+    libraries
+}
+
 /// 采集夹具时要复制/占位的输入（相对探测根）。
 ///
 /// 传进来的 `list_dir` 用来枚举 [`input_dirs`] 里那些目录——远端采集和本地采集
@@ -312,7 +355,11 @@ pub fn inputs(list_dir: &dyn Fn(&str) -> Vec<String>) -> Vec<Input> {
         Input::Existence("sys/fs/cgroup/cgroup.controllers".into()),
         Input::Existence("sys/fs/cgroup/memory".into()),
     ];
-    inputs.extend(crate::os::INPUTS.iter().map(|path| Input::Content((*path).to_string())));
+    inputs.extend(
+        crate::os::INPUTS
+            .iter()
+            .map(|path| Input::Content((*path).to_string())),
+    );
 
     // 可执行文件候选：候选目录 × 所有要找的名字。**只放占位**。
     let tools: Vec<&str> = CONTAINER_RUNTIMES
@@ -326,6 +373,12 @@ pub fn inputs(list_dir: &dyn Fn(&str) -> Vec<String>) -> Vec<Input> {
             inputs.push(Input::Existence(format!("{dir}/{tool}")));
         }
     }
+
+    inputs.extend(
+        inference_library_search_paths()
+            .into_iter()
+            .map(|(_, path)| Input::Existence(path.trim_start_matches('/').to_string())),
+    );
 
     // 固定位置的 socket。也是占位（socket 本来就读不出内容）。
     for (_, sockets) in CONTAINER_RUNTIMES {
@@ -410,17 +463,28 @@ fn probe_containers(root: &Path) -> Vec<ContainerRuntime> {
         let mut sockets: Vec<PathBuf> = socket_candidates
             .iter()
             .map(|socket| PathBuf::from("/").join(socket))
-            .filter(|socket| root.join(socket.strip_prefix("/").unwrap_or(socket)).exists())
+            .filter(|socket| {
+                root.join(socket.strip_prefix("/").unwrap_or(socket))
+                    .exists()
+            })
             .collect();
         // rootless：`run/user/<uid>/podman/podman.sock`
         if name == "podman" {
-            for entry in fs::read_dir(root.join("run/user")).into_iter().flatten().flatten() {
+            for entry in fs::read_dir(root.join("run/user"))
+                .into_iter()
+                .flatten()
+                .flatten()
+            {
                 let socket = root
                     .join("run/user")
                     .join(entry.file_name())
                     .join(ROOTLESS_SOCKET_SUFFIX);
                 if socket.exists() {
-                    sockets.push(PathBuf::from("/run/user").join(entry.file_name()).join(ROOTLESS_SOCKET_SUFFIX));
+                    sockets.push(
+                        PathBuf::from("/run/user")
+                            .join(entry.file_name())
+                            .join(ROOTLESS_SOCKET_SUFFIX),
+                    );
                 }
             }
         }
@@ -507,7 +571,12 @@ fn probe_declared_tags(root: &Path, warnings: &mut Vec<String>) -> Vec<DeclaredT
             continue;
         };
         // 报告里记机器上的路径（`/etc/...`），读的时候才拼探测根
-        parse_tags(&text, &PathBuf::from("/").join(&config), &mut tags, warnings);
+        parse_tags(
+            &text,
+            &PathBuf::from("/").join(&config),
+            &mut tags,
+            warnings,
+        );
     }
 
     tags.sort_by(|a, b| (&a.tag, &a.source).cmp(&(&b.tag, &b.source)));
@@ -518,12 +587,7 @@ fn probe_declared_tags(root: &Path, warnings: &mut Vec<String>) -> Vec<DeclaredT
 /// 解析标签文件。`source` 会记进每条标签里，方便回头找到那一行。
 ///
 /// 行格式本身在 [`crate::tags`] 里——**写标签的是另一个程序**，格式只能有一份。
-fn parse_tags(
-    text: &str,
-    source: &Path,
-    tags: &mut Vec<DeclaredTag>,
-    warnings: &mut Vec<String>,
-) {
+fn parse_tags(text: &str, source: &Path, tags: &mut Vec<DeclaredTag>, warnings: &mut Vec<String>) {
     for entry in tags_parse(text) {
         match entry {
             TagLine::Tag { tag, .. } => tags.push(DeclaredTag {
@@ -588,7 +652,9 @@ fn probe_registry_mirrors(root: &Path, warnings: &mut Vec<String>) -> Vec<Regist
         }
     }
     for config in configs {
-        let Some(text) = fs::read_to_string(root.join(config.strip_prefix("/").unwrap_or(&config))).ok() else {
+        let Some(text) =
+            fs::read_to_string(root.join(config.strip_prefix("/").unwrap_or(&config))).ok()
+        else {
             continue;
         };
         for line in text.lines() {
@@ -627,7 +693,8 @@ mod tests {
     use super::*;
 
     fn fake_root(tag: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!("deviceinfo-env-{tag}-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("deviceinfo-env-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         root
@@ -640,6 +707,27 @@ mod tests {
     }
 
     #[test]
+    fn libraries_are_probed_on_the_target_and_survive_fixture_collection() {
+        let root = fake_root("runtime-libraries");
+        write(&root, "usr/lib/librkllmrt.so", "");
+        write(&root, "usr/local/lib/librkllmrt.so", "");
+        // A directory or absent file must not be advertised as an installed library.
+        fs::create_dir_all(root.join("usr/lib/librknnrt.so")).unwrap();
+        let report = probe(&root, &mut Vec::new());
+        assert_eq!(report.inference_libraries.len(), 1);
+        assert_eq!(
+            report.inference_libraries[0].path,
+            Path::new("/usr/lib/librkllmrt.so")
+        );
+        assert!(
+            inputs(&|_| Vec::new()).contains(&Input::Existence("usr/lib/librkllmrt.so".into()))
+        );
+        let old: EnvironmentReport = serde_json::from_str(r#"{"warnings":[]}"#).unwrap();
+        assert!(old.inference_libraries.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn missing_os_identity_stays_unknown_and_old_reports_still_deserialize() {
         let root = fake_root("no-os");
         let report = probe(&root, &mut Vec::new());
@@ -648,8 +736,13 @@ mod tests {
         let old: EnvironmentReport = serde_json::from_str(r#"{"warnings":[]}"#).unwrap();
         assert_eq!(old.operating_system, None);
         assert_eq!(old.kernel_release, None);
-        assert!(!serde_json::to_value(old).unwrap()
-            .as_object().unwrap().contains_key("operating_system"));
+        assert!(
+            !serde_json::to_value(old)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("operating_system")
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -676,9 +769,12 @@ mod tests {
         let podman = report.container("podman").expect("应当找到 podman");
         // 路径从探测根起算（本机探测就是绝对路径），和硬件报告的 device_path 同一约定
         assert_eq!(podman.path, Path::new("/usr/bin/podman"));
-        assert!(podman.sockets.iter().any(|socket| {
-            socket.ends_with("run/user/1000/podman/podman.sock")
-        }));
+        assert!(
+            podman
+                .sockets
+                .iter()
+                .any(|socket| { socket.ends_with("run/user/1000/podman/podman.sock") })
+        );
         // 已经有 llama.cpp → 别再装一个
         assert!(report.has_inference_tool());
         assert_eq!(report.inference_tools[0].name, "llama-server");
@@ -722,7 +818,11 @@ mod tests {
             "# 这台机器的角色\nAlways_On   powersave\n\n",
         );
         // 出厂那份当默认，管理员那份优先（这里两者都有，取并集）
-        write(&root, "usr/share/deviceinfo/tags.conf", "vendor-preinstalled\n");
+        write(
+            &root,
+            "usr/share/deviceinfo/tags.conf",
+            "vendor-preinstalled\n",
+        );
 
         let mut warnings = Vec::new();
         let report = probe(&root, &mut warnings);
@@ -795,7 +895,11 @@ mod tests {
 
         let mut warnings = Vec::new();
         let report = probe(&root, &mut warnings);
-        assert!(report.always_on() && report.powersave(), "{:#?}", report.declared_tags);
+        assert!(
+            report.always_on() && report.powersave(),
+            "{:#?}",
+            report.declared_tags
+        );
         assert!(warnings.is_empty(), "{warnings:?}");
 
         fs::remove_dir_all(&root).ok();
@@ -875,7 +979,10 @@ mod tests {
                 .iter()
                 .map(|mirror| mirror.url.as_str())
                 .collect::<Vec<_>>(),
-            vec!["https://docker.fnnas.com", "https://registry.hub.docker.com"]
+            vec![
+                "https://docker.fnnas.com",
+                "https://registry.hub.docker.com"
+            ]
         );
         assert_eq!(
             report.registry_mirrors[0].source,
@@ -883,7 +990,12 @@ mod tests {
             "要说清是哪份文件配的；路径是机器上的路径，不带探测根"
         );
         let docker = report.container("docker").unwrap();
-        assert!(docker.sockets.iter().any(|socket| socket.ends_with("run/docker.sock")));
+        assert!(
+            docker
+                .sockets
+                .iter()
+                .any(|socket| socket.ends_with("run/docker.sock"))
+        );
 
         fs::remove_dir_all(&root).ok();
     }
@@ -943,14 +1055,19 @@ mod tests {
             .map(|mirror| mirror.url.as_str())
             .collect();
         // 注释里的示例一个都不能进
-        assert!(!urls.iter().any(|url| url.contains("example.com")), "{urls:?}");
+        assert!(
+            !urls.iter().any(|url| url.contains("example.com")),
+            "{urls:?}"
+        );
         assert!(urls.contains(&"mirror.example.cn"), "{urls:?}");
         assert!(urls.contains(&"another.example.cn"), "{urls:?}");
         // 分片目录也要读
-        assert!(report
-            .registry_mirrors
-            .iter()
-            .any(|mirror| mirror.source.ends_with("10-mirror.conf")));
+        assert!(
+            report
+                .registry_mirrors
+                .iter()
+                .any(|mirror| mirror.source.ends_with("10-mirror.conf"))
+        );
 
         fs::remove_dir_all(&root).ok();
     }

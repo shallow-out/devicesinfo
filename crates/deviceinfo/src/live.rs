@@ -145,7 +145,10 @@ pub fn probe(environment: &EnvironmentReport, options: &LiveOptions, run: Runner
             .collect();
         // 机器自己配的镜像源也要查——**它才是那台机器实际拉镜像的通道**。
         for mirror in &environment.registry_mirrors {
-            targets.push((mirror.url.clone(), Some(mirror.source.display().to_string())));
+            targets.push((
+                mirror.url.clone(),
+                Some(mirror.source.display().to_string()),
+            ));
         }
         targets.sort_by(|a, b| a.0.cmp(&b.0));
         targets.dedup_by(|a, b| a.0 == b.0);
@@ -222,9 +225,8 @@ fn check_one(target: &str, timeout: Duration, run: Runner) -> ReachabilityOutcom
     // ——实测 `wget --spider https://registry-1.docker.io/v2/` 就是 6。照退出码当成"不通"，
     // 会把能拉镜像的机器误报成不能，正是这套检查要避免的错误结论。所以让 shell 把退出码
     // 打出来，自己判：答过话的那些码算通。
-    let script = format!(
-        "wget -q --spider -T {seconds} {target} >/dev/null 2>&1; echo \"wget:$?\"",
-    );
+    let script =
+        format!("wget -q --spider -T {seconds} {target} >/dev/null 2>&1; echo \"wget:$?\"",);
     match run("sh", &["-c", &script]) {
         Ok(output) => match output.trim().strip_prefix("wget:") {
             // 0 成功、6 需要鉴权、8 服务器回了错——三种都说明对面答话了
@@ -309,6 +311,7 @@ mod tests {
                 notes: Vec::new(),
             }],
             inference_tools: Vec::new(),
+            inference_libraries: Vec::new(),
             registry_mirrors: vec![RegistryMirror {
                 source: PathBuf::from("/etc/docker/daemon.json"),
                 url: "https://docker.fnnas.com".into(),
@@ -352,7 +355,13 @@ mod tests {
             run,
         );
         assert_eq!(report.versions[0].output, None);
-        assert!(report.versions[0].error.as_deref().unwrap().contains("超时"));
+        assert!(
+            report.versions[0]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("超时")
+        );
     }
 
     /// **连通性必须分目标看**，而且机器自己配的镜像源一定要进列表——
@@ -376,7 +385,10 @@ mod tests {
             .iter()
             .map(|entry| entry.target.as_str())
             .collect();
-        assert!(targets.contains(&"https://registry-1.docker.io/v2/"), "{targets:?}");
+        assert!(
+            targets.contains(&"https://registry-1.docker.io/v2/"),
+            "{targets:?}"
+        );
         assert!(targets.contains(&"https://docker.fnnas.com"), "{targets:?}");
 
         let mirror = report
@@ -452,7 +464,10 @@ mod tests {
             .filter(|program| program.as_str() != "/usr/bin/podman")
             .collect();
         assert!(!network.is_empty());
-        assert!(network.iter().all(|program| program.as_str() == "curl"), "{calls:?}");
+        assert!(
+            network.iter().all(|program| program.as_str() == "curl"),
+            "{calls:?}"
+        );
     }
 
     /// wget 兜底要自己解读退出码：**401/403 让 wget 退出 6，那是"通"**。
@@ -461,7 +476,13 @@ mod tests {
     /// 照退出码当成"不通"，会把能拉镜像的机器误报成不能。
     #[test]
     fn wget_auth_failures_are_reachable_because_the_server_answered() {
-        for (code, reachable) in [("0", true), ("6", true), ("8", true), ("4", false), ("5", false)] {
+        for (code, reachable) in [
+            ("0", true),
+            ("6", true),
+            ("8", true),
+            ("4", false),
+            ("5", false),
+        ] {
             let run: Runner = &move |program, _args| {
                 if program == "curl" {
                     Err(std::io::Error::other("curl 不存在"))
@@ -527,7 +548,7 @@ mod tests {
         assert!(report.warnings.is_empty(), "{:#?}", report.warnings);
     }
 
-        /// curl 不在时走 wget 兜底。兜底**答了话**（退出码 4 = 网络失败）就该报"不通"，
+    /// curl 不在时走 wget 兜底。兜底**答了话**（退出码 4 = 网络失败）就该报"不通"，
     /// 不能因为"第一个工具没装"而含糊成"没法查"。
     #[test]
     fn a_missing_curl_does_not_hide_the_wget_verdict() {
