@@ -58,6 +58,10 @@ mod report;
 mod runtime;
 mod state;
 mod sysfs;
+pub mod soc;
+pub mod storage;
+pub mod storage_health;
+pub mod system;
 pub mod tags;
 
 pub mod pci;
@@ -73,6 +77,17 @@ pub use live::{LiveOptions, LiveReport};
 pub use runtime::{LIBRARY_DIRS, OPENCL_VENDOR_DIR, library_inputs as runtime_library_inputs};
 pub use state::{AcceleratorState, DiskUsage, MemoryState, RuntimeState, SampleOptions};
 pub use sysfs::resolve_path_in_root;
+pub use soc::{SocDevice, SocReport, probe_soc};
+pub use storage::{BlockDevice, StorageInterface, StorageMount, StorageReport, probe_storage};
+pub use storage_health::{
+    MmcHealth, NvmeHealth, NvmeHealthError, NvmeSmartLog, StorageHealthOptions,
+    StorageHealthReport, StorageHealthState, StorageHealthError, StorageHealthErrorKind, decode_nvme_smart_log, read_nvme_health,
+    sample_storage_health, sample_storage_health_with,
+};
+pub use system::{
+    CpuTimes, SystemReport, SystemSampleOptions, SystemState, probe_system, probe_system_with,
+    sample_system_state, sample_system_state_with,
+};
 
 use std::collections::BTreeSet;
 use std::path::Path;

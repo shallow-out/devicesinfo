@@ -42,6 +42,12 @@ pub struct MemoryState {
 }
 
 impl MemoryState {
+    /// Total minus the kernel's estimated available memory, not just allocated pages.
+    /// Missing or inconsistent counters remain unknown.
+    pub fn used_bytes(&self) -> Option<u64> {
+        self.total_bytes?.checked_sub(self.available_bytes?)
+    }
+
     /// 可用于加载模型的内存（保守取 available，取不到退回 total）。
     pub fn usable_memory_bytes(&self) -> Option<u64> {
         self.available_bytes.or(self.total_bytes)
@@ -72,6 +78,14 @@ pub struct DiskUsage {
     /// 判断"装不装得下"要用这个：ext4 默认给 root 留 5%，拿 `free_bytes` 判断
     /// 会让普通用户以为还能装下但实际上写不进去。
     pub available_bytes: u64,
+}
+
+impl DiskUsage {
+    /// Allocated space, excluding free blocks reserved for privileged users.
+    /// Use `available_bytes`, rather than this value, for installation capacity checks.
+    pub fn used_bytes(&self) -> u64 {
+        self.total_bytes.saturating_sub(self.free_bytes)
+    }
 }
 
 /// 采样选项。
@@ -299,7 +313,7 @@ fn resident_memory_bytes(device_dir: &Path) -> Option<u64> {
         .or_else(|| crate::sysfs::read_u64(&device_dir.join("mem_info_vram_used")))
 }
 
-fn sample_memory(root: &Path, warnings: &mut Vec<String>) -> MemoryState {
+pub(crate) fn sample_memory(root: &Path, warnings: &mut Vec<String>) -> MemoryState {
     let path = root.join("proc/meminfo");
     let Ok(text) = fs::read_to_string(&path) else {
         warnings.push(format!("读不到 {}，内存状态缺失", path.display()));
@@ -326,7 +340,7 @@ fn sample_memory(root: &Path, warnings: &mut Vec<String>) -> MemoryState {
 /// 标准库没有 `statvfs`（`std::fs::statvfs` 至今不存在），所以要么用 `libc`，
 /// 要么拉起一个 `df` 子进程去解析输出——后者更糟：多一个外部依赖、输出格式要解析、
 /// 还要处理不同发行版的 `df` 方言。
-fn filesystem_usage(path: &Path) -> io::Result<DiskUsage> {
+pub(crate) fn filesystem_usage(path: &Path) -> io::Result<DiskUsage> {
     use std::os::unix::ffi::OsStrExt;
 
     let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())

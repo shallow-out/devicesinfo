@@ -149,8 +149,75 @@ cargo test
 let report = deviceinfo::probe(std::path::Path::new("/"));
 println!("{}", deviceinfo::render::human(&report));
 
-let state = deviceinfo::sample_state(&[std::path::PathBuf::from("/var/cache")]);
+let state = deviceinfo::sample_state(&deviceinfo::SampleOptions {
+    watch: vec![std::path::PathBuf::from("/var/cache")],
+    ..Default::default()
+});
 ```
+
+### 作为 rsetup-core 等控制工具的库依赖
+
+CPU、内存容量、发行版、内核和主机名可使用轻量入口：
+
+```rust
+use deviceinfo::{probe_system, sample_system_state, SystemSampleOptions};
+use std::path::Path;
+
+// 调用方低频缓存，重启、系统升级或修改主机名后主动失效。
+let identity = probe_system(Path::new("/"));
+let options = SystemSampleOptions { watch: vec!["/".into(), "/boot".into()] };
+let previous = sample_system_state(&options);
+// 在调用方的下一个正常刷新周期采样；库内不等待、不起线程。
+let current = sample_system_state(&options);
+let cpu_percent = current.cpu.zip(previous.cpu)
+    .and_then(|(now, old)| now.usage_since(&old));
+```
+
+- `probe_system[_with]` 返回 `SystemReport`，不枚举 GPU/NPU、不扫描推理库或软件环境。
+- `sample_system_state[_with]` 返回内存/swap、CPU ticks、负载、uptime 和指定路径的 `statvfs` 余量；不访问加速器计数器、不执行命令、不访问网络。
+- CPU 使用率由两次 `/proc/stat` 的差值计算；负载值是独立指标。首次读取、无时间差、计数器回退时为 `None`，不要伪造 0%。guest 已计入 user/nice，不再累加。
+- `MemoryState::used_bytes()` 是 `MemTotal - MemAvailable` 的估算；`DiskUsage::used_bytes()` 是 `total - free`。安装容量应使用 `available_bytes`，避免把文件系统保留块算成普通用户可写空间。
+- 未知数值保持 `Option`，诊断保留在 `warnings`。中英文提示、缓存周期和 UI 数据结构由调用方适配；SoC 身份、存储清单、挂载关系及健康观测由 deviceinfo 提供。GPIO/overlay、风扇、LED 的板级控制及存储操作由 rsetup-next 提供。
+- GPU/NPU 硬件低频调用 `probe`；已安装加速库和容器工具低频调用 `probe_environment`。文件存在只是观测，不能当成可推理或容器内运行的证明。
+
+联调可使用本地 `path` 依赖；正式接入应固定**已发布并验证过的完整提交**，而非跟随 `main`，并提交调用方的 Cargo.lock：
+
+```toml
+[dependencies]
+deviceinfo = { git = "https://github.com/shallow-out/devicesinfo", rev = "<reviewed-full-commit-sha>" }
+```
+
+只读示例：`cargo run -p deviceinfo --example system_dashboard -- /`（调用方显式等待一秒，输出身份和两次采样的 CPU 使用率）。
+
+`capture` 同步采集这些新增输入，可离线复现身份及单次状态观测；单份快照不能计算 CPU 使用率。旧夹具缺少新输入时保留 `None` 和诊断，不猜测历史状态。
+
+### SoC 与存储
+
+```rust
+use deviceinfo::{probe_soc, probe_storage, sample_storage_health, StorageHealthOptions};
+use std::path::Path;
+let soc = probe_soc(Path::new("/")); // probe_system 也包含 soc 字段
+let storage = probe_storage(Path::new("/"));
+let health = sample_storage_health(&StorageHealthOptions::default()); // MMC sysfs；不开 NVMe 节点
+// Linux 上需要 NVMe SMART 时由调用方显式开启；不提权，不执行命令。
+let smart = sample_storage_health(&StorageHealthOptions {
+    nvme_controllers: vec!["/dev/nvme0".into()],
+});
+```
+
+显式健康读取示例：`cargo run -p deviceinfo --example storage_health -- /dev/nvme0`。不传参数时仅查询 MMC sysfs。
+
+- SoC 从根设备树 `compatible` 和内核 SoC bus 的 `family/machine/soc_id/revision` 获取，保留原始属性及识别来源。只匹配 SoC 标识，不把板卡厂商或 ARM CPU implementer 当成芯片厂商；冲突或未识别时为 `None`。未知 JEP106 编码保留原文，不猜厂商。
+- `probe_storage` 读取块设备、分区父盘、dm/LVM/RAID 的 backing devices、型号、容量、扇区大小及可移除/只读/旋转属性；按 major:minor 关联挂载，正确处理 `/dev/root`、mapper 别名、bind mount 和转义空格。保留网络及伪文件系统挂载，不把它们伪装成物理磁盘。接口无法证实时为 `unknown`，SCSI 不等于 SATA 或 USB。
+- 块设备 `size` 按固定 512 字节单位换算，和逻辑扇区大小独立。容量、父盘和属性读不到时保持未知。盘、分区、逻辑卷、bind mount 是同一存储的不同视图，不能直接累加容量。
+- 文件系统已用/可用空间继续由 `sample_system_state` 的显式 `watch` 路径查询 `statvfs`。挂载属于当前进程的 namespace，拓扑在热插拔、分区或挂载变化后应刷新。
+- eMMC 健康保留 PRE_EOL 和寿命分档原始编码，不把 10% 桶当成精确剩余寿命。NVMe 使用只读 Get Log Page ioctl、5 秒命令超时；保留 critical warning 原始位和 128 位计数（十进制 JSON 字符串）。温度单位是 Kelvin。观测指标正常不保证整个磁盘没有故障。
+- 默认不读取 NVMe SMART；显式读时权限不足、控制器错误或平台不支持均返回未知及原因。注入 fixture root 时禁止打开真实控制器。ATA SMART 和 MMC ioctl 回退尚未实现；未暴露的健康数据不能当成正常。
+- `capture` 使用库提供的 SoC/存储输入清单，保留分区、backing devices 和 MMC 健康输入；不会为了采集执行 NVMe ioctl。
+
+数据来源参见 Linux [SoC ABI](https://github.com/torvalds/linux/blob/master/Documentation/ABI/testing/sysfs-devices-soc)、[block ABI](https://github.com/torvalds/linux/blob/master/Documentation/ABI/stable/sysfs-block)、[MMC 属性](https://github.com/torvalds/linux/blob/master/drivers/mmc/core/mmc.c)、[NVMe UAPI](https://github.com/torvalds/linux/blob/master/include/uapi/linux/nvme_ioctl.h) 和 [mountinfo 格式](https://man7.org/linux/man-pages/man5/proc_pid_mountinfo.5.html)。
+
+`crates/deviceinfo/tests/system.rs` 包含 **Q8B 风格的模拟文件树**，覆盖 ARM 核分组、逐核指令集、共享内存 Adreno/显示控制器分类以及 OS/内存/运行状态。它不是实机 capture，也不声明 Q8B 的实际频率或性能。现有 `fixtures/` 中的四台实机快照继续独立做回归；Q8B 可连接后应补充真正的 `capture`。
 
 所有探测都接受一个 `root` 前缀而不是写死 `/`，所以可以用**假文件树**做单元测试，
 也可以探测容器内的可见设备，或事后对着真机采样夹具做回归。

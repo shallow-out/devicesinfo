@@ -668,11 +668,37 @@ fn capture_plan(source: &Source) -> io::Result<CapturePlan> {
     // CPU 那部分**直接用库里的清单**，不在这里重抄一遍：抄一遍就会漂移，
     // 而漂移的后果（远端夹具静默少一个输入）很难发现。
     let mut files: Vec<String> = CPU_SHARED_INPUTS.iter().map(|path| path.to_string()).collect();
+    files.extend(deviceinfo::system::INPUTS.iter().map(|path| path.to_string()));
     let mut symlinks = Vec::new();
     let mut existence_only = Vec::new();
     // 探测会读 pci.ids（`pci::lookup`），所以要镜像进暂存树——但写夹具时另走一条路
     let databases: Vec<String> = PCI_DATABASE_PATHS.iter().map(|path| path.to_string()).collect();
     let mut lists = ListCache::new(source);
+
+    lists.ensure(&deviceinfo::soc::INPUT_DIRS.map(str::to_owned))?;
+    files.extend(deviceinfo::soc::inputs(&|dir| {
+        lists.entries(dir).iter().map(|e| e.name.clone()).collect()
+    }));
+    const BLOCK_DIR: &str = deviceinfo::storage::BLOCK_DIR;
+    lists.ensure(&[BLOCK_DIR.to_string()])?;
+    let blocks: Vec<_> = lists
+        .entries(BLOCK_DIR)
+        .iter()
+        .map(|e| e.name.clone())
+        .collect();
+    lists.ensure(&deviceinfo::storage::input_dirs(&blocks))?;
+    let (storage_files, storage_existence) = deviceinfo::storage::inputs(&blocks, &|dir| {
+        lists.entries(dir).iter().map(|e| e.name.clone()).collect()
+    });
+    files.extend(storage_files);
+    existence_only.extend(storage_existence);
+    for name in &blocks {
+        files.extend(
+            deviceinfo::storage_health::MMC_INPUTS
+                .iter()
+                .map(|leaf| format!("{BLOCK_DIR}/{name}/{leaf}")),
+        );
+    }
 
     // 阶段一：固定目录一次列完（远端每次调用都要在那边起一个 shell，很贵）
     const CPU_DIR: &str = "sys/devices/system/cpu";
@@ -842,6 +868,9 @@ fn capture_plan(source: &Source) -> io::Result<CapturePlan> {
         .map(|device| format!("{device}/driver"))
         .collect();
     link_paths.extend(pci_driver_links);
+    link_paths.extend(
+        blocks.iter().map(|name| format!("{BLOCK_DIR}/{name}/device/subsystem")),
+    );
     let links = source.link_many(&link_paths)?;
     for (path, target) in links {
         let Some(name) = target
@@ -1382,6 +1411,80 @@ mod tests {
         let text = deviceinfo::render::human_environment(&report);
         assert!(text.contains("Ubuntu Linux"), "{text}");
         assert!(text.contains("6.8.0-test"), "{text}");
+    }
+
+    #[test]
+    fn capture_preserves_lightweight_system_identity_and_state() {
+        let source = minimal_machine();
+        let out = TempTree::new().unwrap();
+        for (path, content) in [
+            ("etc/os-release", "ID=fixture-only\n"),
+            ("proc/sys/kernel/osrelease", "fixture-kernel\n"),
+            ("proc/sys/kernel/hostname", "fixture-host\n"),
+            ("proc/stat", "cpu 10 20 30 40 50 60 70 80 9 8\n"),
+            ("proc/loadavg", "1.0 2.0 3.0 1/100 4\n"),
+            ("proc/uptime", "123.5 400.0\n"),
+        ] {
+            write_file(&source.path.join(path), content.as_bytes()).unwrap();
+        }
+        capture(&Source::local(&source.path), "x86_64", &[], &out.path).unwrap();
+        assert_eq!(
+            deviceinfo::probe_system_with(&source.path, "x86_64"),
+            deviceinfo::probe_system_with(&out.path, "x86_64"),
+        );
+        let options = deviceinfo::SystemSampleOptions::default();
+        assert_eq!(
+            deviceinfo::sample_system_state_with(&source.path, &options),
+            deviceinfo::sample_system_state_with(&out.path, &options),
+        );
+    }
+
+    #[test]
+    fn capture_preserves_soc_storage_layers_and_health_inputs() {
+        let source = minimal_machine();
+        let out = TempTree::new().unwrap();
+        for (path, content) in [
+            (
+                "sys/firmware/devicetree/base/compatible",
+                "radxa,fixture\0rockchip,rk3588\0",
+            ),
+            ("sys/devices/soc0/family", "Rockchip\n"),
+            ("sys/bus/soc/devices/soc0/family", "Rockchip\n"),
+            ("sys/class/block/mmcblk0/dev", "179:0\n"),
+            ("sys/class/block/mmcblk0/size", "4000\n"),
+            ("sys/class/block/mmcblk0/removable", "0\n"),
+            ("sys/class/block/mmcblk0/device/type", "MMC\n"),
+            ("sys/class/block/mmcblk0/device/pre_eol_info", "0x02\n"),
+            ("sys/class/block/mmcblk0/device/life_time", "0x0a 0x01\n"),
+            ("sys/class/block/mmcblk0/mmcblk0p1/partition", "1\n"),
+            ("sys/class/block/mmcblk0p1/partition", "1\n"),
+            ("sys/class/block/mmcblk0p1/dev", "179:1\n"),
+            ("sys/class/block/mmcblk0p1/size", "2000\n"),
+            ("sys/class/block/dm-0/dev", "253:0\n"),
+            ("sys/class/block/dm-0/size", "2000\n"),
+            ("sys/class/block/dm-0/dm/name", "root\n"),
+            (
+                "proc/self/mountinfo",
+                "1 1 253:0 / / rw - ext4 /dev/mapper/root rw\n",
+            ),
+        ] {
+            write_file(&source.path.join(path), content.as_bytes()).unwrap();
+        }
+        fs::create_dir_all(source.path.join("sys/class/block/dm-0/slaves/mmcblk0p1")).unwrap();
+        capture(&Source::local(&source.path), "x86_64", &[], &out.path).unwrap();
+        assert_eq!(
+            deviceinfo::probe_soc(&source.path),
+            deviceinfo::probe_soc(&out.path)
+        );
+        assert_eq!(
+            deviceinfo::probe_storage(&source.path),
+            deviceinfo::probe_storage(&out.path)
+        );
+        let options = deviceinfo::StorageHealthOptions::default();
+        assert_eq!(
+            deviceinfo::sample_storage_health_with(&source.path, &options),
+            deviceinfo::sample_storage_health_with(&out.path, &options)
+        );
     }
 
     #[test]
