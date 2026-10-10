@@ -12,7 +12,8 @@
       "runtime": {
         "reason": "厂商未识别，不知道该找哪些组件",
         "state": "unknown"
-      }
+      },
+      "source": "/sys/class/drm/card0"
     },
     {
       "driver": "linlondp",
@@ -25,7 +26,8 @@
       "runtime": {
         "reason": "只能做显示输出，不涉及推理运行时",
         "state": "not-applicable"
-      }
+      },
+      "source": "/sys/class/drm/card1"
     },
     {
       "driver": "linlondp",
@@ -38,7 +40,8 @@
       "runtime": {
         "reason": "只能做显示输出，不涉及推理运行时",
         "state": "not-applicable"
-      }
+      },
+      "source": "/sys/class/drm/card2"
     },
     {
       "driver": "linlondp",
@@ -51,7 +54,8 @@
       "runtime": {
         "reason": "只能做显示输出，不涉及推理运行时",
         "state": "not-applicable"
-      }
+      },
+      "source": "/sys/class/drm/card3"
     }
   ],
   "cpu": {

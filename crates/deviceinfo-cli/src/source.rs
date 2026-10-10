@@ -66,6 +66,40 @@ pub(crate) struct RemoteSource {
 }
 
 impl Source {
+    /// Fresh source-side clock/boot observations, deliberately bypassing prefetch.
+    pub(crate) fn stamp(&self, started: bool) -> io::Result<deviceinfo::SampleStamp> {
+        match self {
+            Self::Local(root) => {
+                let context = deviceinfo::SampleContext::read(root);
+                Ok(if started {
+                    context.started
+                } else {
+                    context.finished
+                })
+            }
+            Self::Remote(remote) => parse_stamp(&remote.run_with_stdin(REMOTE_STAMP_SCRIPT, &[])?),
+        }
+    }
+
+    pub(crate) fn preserves_counters(&self) -> bool {
+        match self {
+            Self::Local(root) => deviceinfo::SampleContext::read(root).consistent,
+            Self::Remote(_) => true,
+        }
+    }
+
+    pub(crate) fn associations(
+        &self,
+        paths: &[String],
+    ) -> io::Result<Vec<deviceinfo::DeviceAssociation>> {
+        match self {
+            Self::Local(root) => Ok(deviceinfo::inspect_device_links(root).devices),
+            Self::Remote(remote) => parse_associations(
+                &remote.run_with_stdin(REMOTE_ASSOCIATIONS_SCRIPT, &stdin_lines(paths))?,
+            ),
+        }
+    }
+
     pub(crate) fn local(root: &Path) -> Self {
         Self::Local(root.to_path_buf())
     }
@@ -114,7 +148,10 @@ impl Source {
     }
 
     /// 一次取回多个路径的软链目标。不是软链、或读不到，对应 `None`。
-    pub(crate) fn link_many(&self, paths: &[String]) -> io::Result<BTreeMap<String, Option<String>>> {
+    pub(crate) fn link_many(
+        &self,
+        paths: &[String],
+    ) -> io::Result<BTreeMap<String, Option<String>>> {
         match self {
             Self::Local(root) => Ok(paths
                 .iter()
@@ -175,7 +212,8 @@ impl Source {
     pub(crate) fn read(&self, path: &str) -> Option<Vec<u8>> {
         match self {
             Self::Local(root) => deviceinfo::resolve_path_in_root(root, path)
-                .and_then(std::fs::read).ok(),
+                .and_then(std::fs::read)
+                .ok(),
             Self::Remote(remote) => remote
                 .contents
                 .borrow()
@@ -195,10 +233,7 @@ impl Source {
         let Self::Remote(remote) = self else {
             return Ok(());
         };
-        let mut items: Vec<String> = content
-            .iter()
-            .map(|path| format!("c {path}"))
-            .collect();
+        let mut items: Vec<String> = content.iter().map(|path| format!("c {path}")).collect();
         items.extend(existence_only.iter().map(|path| format!("e {path}")));
         let out = remote.run_with_stdin(&remote_fetch_script(), &stdin_lines(&items))?;
         let mut failures = Vec::new();
@@ -217,6 +252,88 @@ impl Source {
         }
         Ok(())
     }
+}
+
+const REMOTE_STAMP_SCRIPT: &str = r#"
+boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
+IFS=' ' read -r uptime idle < /proc/uptime
+printf '%s\n' "$boot" "$uptime" "$(date +%s%N 2>/dev/null)" "$(readlink /proc/self/ns/time 2>/dev/null)" "$(readlink /proc/self/ns/mnt 2>/dev/null)"
+cat /proc/sys/kernel/random/boot_id 2>/dev/null
+"#;
+
+// Linux GNU/coreutils and BusyBox support these read-only sysfs operations.
+const REMOTE_ASSOCIATIONS_SCRIPT: &str = r#"
+while IFS= read -r relative; do
+  source=/$relative
+  [ -d "$source" ] || continue
+  physical=$(readlink -f "$source/device" 2>/dev/null)
+  [ -d "$physical" ] || physical=$(readlink -f "$source" 2>/dev/null)
+  driver=$(readlink "$physical/driver" 2>/dev/null)
+  instance=$(stat -L -c '%d:%i' "$physical" 2>/dev/null)
+  channel=$(stat -L -c '%d:%i' "$source" 2>/dev/null)
+  printf '%s\t%s\t%s\t%s\t%s\n' "$source" "$physical" "${driver##*/}" "$(cat "$source/dev" 2>/dev/null)" "${instance:+${channel:+$instance:$channel}}"
+done
+"#;
+
+fn parse_stamp(raw: &[u8]) -> io::Result<deviceinfo::SampleStamp> {
+    let text = std::str::from_utf8(raw)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let fields: Vec<_> = text.lines().collect();
+    if fields.len() != 6 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "source sampling stamp is incomplete",
+        ));
+    }
+    let value = |index: usize| (!fields[index].is_empty()).then(|| fields[index].to_owned());
+    let boot_time_ns = fields[1].split_once('.').and_then(|(seconds, fraction)| {
+        if fraction.len() > 9 || !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        seconds
+            .parse::<u64>()
+            .ok()?
+            .checked_mul(1_000_000_000)?
+            .checked_add(
+                fraction
+                    .parse::<u64>()
+                    .ok()?
+                    .checked_mul(10u64.pow(9 - fraction.len() as u32))?,
+            )
+    });
+    Ok(deviceinfo::SampleStamp {
+        boot_id: (fields[0] == fields[5]).then(|| value(0)).flatten(),
+        boot_time_ns,
+        boot_clock_resolution_ns: boot_time_ns.map(|_| 10_000_000),
+        unix_time_ns: fields[2].parse().ok(),
+        time_namespace: value(3),
+        mount_namespace: value(4),
+    })
+}
+
+fn parse_associations(raw: &[u8]) -> io::Result<Vec<deviceinfo::DeviceAssociation>> {
+    let text = std::str::from_utf8(raw)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    text.lines()
+        .map(|line| {
+            let fields: Vec<_> = line.split('\t').collect();
+            if fields.len() != 5 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "source device association is incomplete",
+                ));
+            }
+            let value =
+                |index: usize| (!fields[index].is_empty()).then(|| fields[index].to_owned());
+            Ok(deviceinfo::DeviceAssociation {
+                source: PathBuf::from(fields[0]),
+                physical_path: value(1).map(PathBuf::from),
+                driver: value(2),
+                device_number: value(3),
+                kernel_instance: value(4),
+            })
+        })
+        .collect()
 }
 
 impl RemoteSource {
@@ -419,7 +536,10 @@ fn parse_listing(out: &[u8]) -> BTreeMap<String, Vec<Entry>> {
                 Some(name) => (name.to_string(), true),
                 None => (line, false),
             };
-            result.entry(dir.clone()).or_default().push(Entry { name, is_dir });
+            result
+                .entry(dir.clone())
+                .or_default()
+                .push(Entry { name, is_dir });
         }
     }
     result
@@ -525,7 +645,10 @@ mod tests {
         let mut kinds = BTreeMap::new();
         parse_batch(&out, &mut contents, &mut kinds, &mut Vec::new());
 
-        assert_eq!(contents.get("/x/one").map(Vec::as_slice), Some(&content[..]));
+        assert_eq!(
+            contents.get("/x/one").map(Vec::as_slice),
+            Some(&content[..])
+        );
         assert_eq!(kinds.get("/x/one"), Some(&EntryKind::File));
         assert_eq!(kinds.get("/x/dev"), Some(&EntryKind::Other));
         assert_eq!(kinds.get("/x/gone"), Some(&EntryKind::Missing));
@@ -544,12 +667,12 @@ mod tests {
         parse_batch(out, &mut contents, &mut kinds, &mut failures);
 
         assert_eq!(failures, vec!["/x/broken"]);
-        assert!(
-            !kinds.contains_key("/x/broken"),
-            "读失败不能被伪装成缺失"
-        );
+        assert!(!kinds.contains_key("/x/broken"), "读失败不能被伪装成缺失");
         assert_eq!(kinds.get("/x/gone"), Some(&EntryKind::Missing));
-        assert_eq!(contents.get("/x/ok").map(Vec::as_slice), Some(&b"hello"[..]));
+        assert_eq!(
+            contents.get("/x/ok").map(Vec::as_slice),
+            Some(&b"hello"[..])
+        );
     }
 
     #[test]
@@ -586,7 +709,12 @@ mod tests {
         let mut contents = BTreeMap::new();
         let mut kinds = BTreeMap::new();
         let mut failures = Vec::new();
-        parse_batch(b"@@R sys/firmware/efi\n@@D dev/sensor\n", &mut contents, &mut kinds, &mut failures);
+        parse_batch(
+            b"@@R sys/firmware/efi\n@@D dev/sensor\n",
+            &mut contents,
+            &mut kinds,
+            &mut failures,
+        );
         assert_eq!(kinds["sys/firmware/efi"], EntryKind::Directory);
         assert_eq!(kinds["dev/sensor"], EntryKind::Other);
         assert!(contents.is_empty());
@@ -661,6 +789,47 @@ mod tests {
         assert_eq!(stdin_lines(&[]), b"\n");
     }
 
+    #[test]
+    fn source_stamp_preserves_precision_and_rejects_reboot_or_broken_protocol() {
+        let boot = "01234567-89ab-cdef-0123-456789abcdef";
+        let raw = format!("{boot}\n123.45\n1792000000123456789\ntime:[42]\nmnt:[43]\n{boot}\n");
+        let stamp = parse_stamp(raw.as_bytes()).unwrap();
+        assert_eq!(stamp.boot_time_ns, Some(123_450_000_000));
+        assert_eq!(stamp.boot_clock_resolution_ns, Some(10_000_000));
+        assert_eq!(stamp.unix_time_ns, Some(1_792_000_000_123_456_789));
+        let reset = raw.replace(
+            &format!("\n{boot}\n"),
+            "\nfedcba98-7654-3210-fedc-ba9876543210\n",
+        );
+        assert_eq!(parse_stamp(reset.as_bytes()).unwrap().boot_id, None);
+        assert!(parse_stamp(b"partial\n").is_err());
+        assert_eq!(
+            parse_stamp(raw.replace("123.45", "-1.00").as_bytes())
+                .unwrap()
+                .boot_time_ns,
+            None
+        );
+        assert_eq!(
+            parse_stamp(
+                raw.replace("1792000000123456789", "1792000000%N")
+                    .as_bytes()
+            )
+            .unwrap()
+            .unix_time_ns,
+            None
+        );
+    }
+
+    #[test]
+    fn source_associations_keep_kernel_instance_and_explicit_unknown_fields() {
+        let devices = parse_associations(b"/sys/class/accel/accel0\t/sys/devices/pci0000:00/0000:00:0b.0\tintel_vpu\t261:0\t0:123:0:456\n/sys/class/hwmon/hwmon0\t/sys/devices/platform/thermal\t\t\t\n").unwrap();
+        assert_eq!(devices[0].kernel_instance.as_deref(), Some("0:123:0:456"));
+        assert_eq!(devices[0].device_number.as_deref(), Some("261:0"));
+        assert_eq!(devices[1].kernel_instance, None);
+        assert_eq!(devices[1].driver, None);
+        assert!(parse_associations(b"partial\n").is_err());
+    }
+
     /// 找一个**真的** busybox（不是那种只转发几条命令的 wrapper 脚本）。
     fn find_busybox() -> Option<PathBuf> {
         let usable = |path: &Path| {
@@ -708,7 +877,9 @@ mod tests {
         // busybox 按 argv[0] 选 applet，所以造一个指向它的软链农场当 PATH
         let bin = root.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
-        for applet in ["ls", "readlink", "cat", "wc", "printf", "test", "["] {
+        for applet in [
+            "ls", "readlink", "cat", "wc", "printf", "test", "[", "date", "stat",
+        ] {
             std::os::unix::fs::symlink(&busybox, bin.join(applet)).unwrap();
         }
 
@@ -772,7 +943,10 @@ mod tests {
         let mut failures = Vec::new();
         let inner = dir.join("inner").display().to_string();
         parse_batch(
-            &run(&remote_fetch_script(), &format!("c {one}\nc {missing}\ne {inner}\n")),
+            &run(
+                &remote_fetch_script(),
+                &format!("c {one}\nc {missing}\ne {inner}\n"),
+            ),
             &mut contents,
             &mut kinds,
             &mut failures,
@@ -782,6 +956,25 @@ mod tests {
         assert_eq!(kinds[&one], EntryKind::File);
         assert_eq!(kinds[&missing], EntryKind::Missing);
         assert_eq!(kinds[&inner], EntryKind::Directory);
+
+        #[cfg(target_os = "linux")]
+        {
+            let stamp = parse_stamp(&run(REMOTE_STAMP_SCRIPT, "")).unwrap();
+            let context = deviceinfo::SampleContext::from_bounds(
+                deviceinfo::ObservationOrigin::Captured,
+                stamp.clone(),
+                stamp,
+            );
+            assert!(context.consistent, "{context:?}");
+            let devices = parse_associations(&run(
+                REMOTE_ASSOCIATIONS_SCRIPT,
+                &format!("{}\n", dir_text.trim_start_matches('/')),
+            ))
+            .unwrap();
+            assert_eq!(devices.len(), 1);
+            assert_eq!(devices[0].source, dir);
+            assert!(devices[0].kernel_instance.is_some());
+        }
 
         std::fs::remove_dir_all(&root).ok();
     }

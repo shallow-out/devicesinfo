@@ -1,12 +1,12 @@
 //! 软件环境探测：**这台机器装了什么、配了什么**。
 //!
-//! 与 [`crate::probe`]（硬件）和 [`crate::sample_state`]（瞬时状态）并列的第三个入口。
+//! 与 [`crate::inspect_hardware`]（硬件）和 [`crate::observe_accelerators`]（瞬时状态）并列的第三个入口。
 //! 三者的区别是变化频率：硬件装了就不变；状态每秒在变；**环境装了/配了才变**——
 //! 所以它可以缓存，但它不是机器本身的固有属性（不能拿来跨机器比较"谁更强"）。
 //!
 //! # 只读，而且尽量只读**文件**
 //!
-//! 这条限制是刻意的：本模块要能隔着 ssh 采到（[`crate::probe`] 那套 `Source` 抽象），
+//! 这条限制是刻意的：本模块要能隔着 ssh 采到（[`crate::inspect_hardware`] 那套 `Source` 抽象），
 //! 也要能进夹具。所以**一概不执行命令**，只读文件与目录。
 //!
 //! 代价是有些东西读不到，其中最重要的是**版本号**：`docker --version` 要跑一遍；
@@ -168,7 +168,7 @@ pub struct EnvironmentReport {
     /// 当前启动的内核版本；升级或重启后可能改变，属于环境信息。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kernel_release: Option<String>,
-    /// 找到的包管理器（按 [`BIN_DIRS`] 顺序）。
+    /// 找到的包管理器（按 `BIN_DIRS` 顺序）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub package_managers: Vec<String>,
     /// init 系统。**`None` 意味着跑不了常驻服务**（容器里、或没见过的 init）。

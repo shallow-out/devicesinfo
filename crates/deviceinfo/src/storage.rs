@@ -119,7 +119,7 @@ pub fn inputs(names: &[String], list: &impl Fn(&str) -> Vec<String>) -> (Vec<Str
     (files, existence)
 }
 
-pub fn probe_storage(root: &Path) -> StorageReport {
+pub(crate) fn probe_storage(root: &Path) -> StorageReport {
     let mut report = StorageReport::default();
     let names = list(root, BLOCK_DIR, &mut report.warnings);
     let mut parents = BTreeMap::new();

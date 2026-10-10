@@ -8,6 +8,13 @@
 所以**报错比不报更糟**——一个乐观的数字会让人装上一个跑不动的模型，
 一个悲观的数字会让本机永远拿不到该干的活。
 
+## 接口版本
+
+当前是 **0.2.0 / schema_version = 2**，有意移除旧的 `probe` / `probe_with`、
+`probe_environment`、`sample_state[_with]`、模块内裸采样函数以及公开的 `CpuTimes::usage_since`。
+后续项目统一使用 `inspect_*`、`observe_*`、`check_environment` 返回的 `Snapshot<T>`；
+没有兼容别名，也不为旧报告补造采样时间。完整字段、关联规则和错误语义见 [API.md](API.md)。
+
 ## 三条原则
 
 1. **优先 sysfs，`/proc/cpuinfo` 只当兜底。** cpuinfo 是给人看的文本，字段随架构变化
@@ -24,7 +31,7 @@
 
 ## 四个入口，别混
 
-| | `probe()` → `HardwareReport` | `probe_environment()` → `EnvironmentReport` | `sample_state()` → `RuntimeState` | `live::probe()` → `LiveReport` |
+| | `inspect_hardware()` → `Snapshot<HardwareReport>` | `inspect_environment()` → `Snapshot<EnvironmentReport>` | `observe_accelerators()` → `Snapshot<RuntimeState>` | `check_environment()` → `Snapshot<LiveReport>` |
 |---|---|---|---|---|
 | 描述 | 这台机器**是什么** | **装了什么、配了什么** | **此刻**怎样 | **跑一次才知道**的 |
 | 内容 | 架构、型号、核数与性能分层、指令集、加速器及 NPU 能效档位、内存总量 | 发行版、内核版本、包管理器、init、cgroup、容器运行时与 socket、已装推理框架、镜像源、**人为声明的标签** | 可用内存、swap、磁盘余量、加速器的瞬时指标 | 工具版本、**逐个目标的连通性** |
@@ -124,8 +131,7 @@ CPU 任务的指令集检查要用 `cpu.common_features`：`cpu.features` 是 `/
 
 逐核记录完整时，`common_features` 是排序去重的交集，空数组表示确定没有公共特征；
 记录缺失、重复或冲突时，字段省略以表示未知。离线核仍可出现在 sysfs 拓扑里，
-但不一定出现在 cpuinfo 中，因此也可能导致公共特征未知。旧 JSON 缺少新增字段时仍可读取，
-不会从旧 `features` 自动推断全核能力。这些字段保留的是内核报告的特征，未逐条执行指令验证。
+但不一定出现在 cpuinfo 中，因此也可能导致公共特征未知。不从 `features` 并集自动推断全核能力。这些字段保留的是内核报告的特征，未逐条执行指令验证。
 数据来源与语义可对照内核的
 [x86 cpuinfo 实现](https://github.com/torvalds/linux/blob/master/arch/x86/kernel/cpu/proc.c)和
 [arm64 cpuinfo 实现](https://github.com/torvalds/linux/blob/master/arch/arm64/kernel/cpuinfo.c)。
@@ -146,12 +152,11 @@ cargo test
 ```
 
 ```rust
-let report = deviceinfo::probe(std::path::Path::new("/"));
-println!("{}", deviceinfo::render::human(&report));
-
-let state = deviceinfo::sample_state(&deviceinfo::SampleOptions {
-    watch: vec![std::path::PathBuf::from("/var/cache")],
-    ..Default::default()
+let root = std::path::Path::new("/");
+let report = deviceinfo::inspect_hardware(root, std::env::consts::ARCH);
+println!("{}", deviceinfo::render::human(&report.data));
+let state = deviceinfo::observe_accelerators(root, &deviceinfo::SampleOptions {
+    watch: vec!["/var/cache".into()], ..Default::default()
 });
 ```
 
@@ -160,25 +165,24 @@ let state = deviceinfo::sample_state(&deviceinfo::SampleOptions {
 CPU、内存容量、发行版、内核和主机名可使用轻量入口：
 
 ```rust
-use deviceinfo::{probe_system, sample_system_state, SystemSampleOptions};
+use deviceinfo::{inspect_system, observe_system, SystemSampleOptions};
 use std::path::Path;
-
-// 调用方低频缓存，重启、系统升级或修改主机名后主动失效。
-let identity = probe_system(Path::new("/"));
+let root = Path::new("/");
+let identity = inspect_system(root, std::env::consts::ARCH);
 let options = SystemSampleOptions { watch: vec!["/".into(), "/boot".into()] };
-let previous = sample_system_state(&options);
-// 在调用方的下一个正常刷新周期采样；库内不等待、不起线程。
-let current = sample_system_state(&options);
-let cpu_percent = current.cpu.zip(previous.cpu)
-    .and_then(|(now, old)| now.usage_since(&old));
+let previous = observe_system(root, &options);
+// 在调用方的下一次正常刷新周期采样；库内不等待、不起线程。
+let current = observe_system(root, &options);
+let cpu_percent = current.cpu_usage_since(&previous).ok();
+// None 时展示未知；重启、namespace 变化、重叠窗口、计数器回退都会拒绝差分。
 ```
 
-- `probe_system[_with]` 返回 `SystemReport`，不枚举 GPU/NPU、不扫描推理库或软件环境。
-- `sample_system_state[_with]` 返回内存/swap、CPU ticks、负载、uptime 和指定路径的 `statvfs` 余量；不访问加速器计数器、不执行命令、不访问网络。
-- CPU 使用率由两次 `/proc/stat` 的差值计算；负载值是独立指标。首次读取、无时间差、计数器回退时为 `None`，不要伪造 0%。guest 已计入 user/nice，不再累加。
+- `inspect_system` 返回 `Snapshot<SystemReport>`，不枚举 GPU/NPU、不扫描推理库或软件环境。
+- `observe_system` 返回带上下文的内存/swap、CPU ticks、负载、uptime 和指定路径的 `statvfs` 余量；不访问加速器计数器、不执行命令、不访问网络。
+- CPU 使用率由两次 `/proc/stat` 的差值计算；负载值是独立指标。首次读取、无时间差、计数器回退时返回 `DifferenceError`，不要伪造 0%。guest 已计入 user/nice，不再累加。
 - `MemoryState::used_bytes()` 是 `MemTotal - MemAvailable` 的估算；`DiskUsage::used_bytes()` 是 `total - free`。安装容量应使用 `available_bytes`，避免把文件系统保留块算成普通用户可写空间。
 - 未知数值保持 `Option`，诊断保留在 `warnings`。中英文提示、缓存周期和 UI 数据结构由调用方适配；SoC 身份、存储清单、挂载关系及健康观测由 deviceinfo 提供。GPIO/overlay、风扇、LED 的板级控制及存储操作由 rsetup-next 提供。
-- GPU/NPU 硬件低频调用 `probe`；已安装加速库和容器工具低频调用 `probe_environment`。文件存在只是观测，不能当成可推理或容器内运行的证明。
+- GPU/NPU 硬件低频调用 `inspect_hardware`；已安装加速库和容器工具低频调用 `inspect_environment`。文件存在只是观测，不能当成可推理或容器内运行的证明。
 
 联调可使用本地 `path` 依赖；正式接入应固定**已发布并验证过的完整提交**，而非跟随 `main`，并提交调用方的 Cargo.lock：
 
@@ -194,25 +198,26 @@ deviceinfo = { git = "https://github.com/shallow-out/devicesinfo", rev = "<revie
 ### SoC 与存储
 
 ```rust
-use deviceinfo::{probe_soc, probe_storage, sample_storage_health, StorageHealthOptions};
+use deviceinfo::{inspect_soc, inspect_storage, observe_storage_health, StorageHealthOptions};
 use std::path::Path;
-let soc = probe_soc(Path::new("/")); // probe_system 也包含 soc 字段
-let storage = probe_storage(Path::new("/"));
-let health = sample_storage_health(&StorageHealthOptions::default()); // MMC sysfs；不开 NVMe 节点
-// Linux 上需要 NVMe SMART 时由调用方显式开启；不提权，不执行命令。
-let smart = sample_storage_health(&StorageHealthOptions {
+let root = Path::new("/");
+let soc = inspect_soc(root); // inspect_system 的 data.soc 也包含 SoC 身份
+let storage = inspect_storage(root);
+let health = observe_storage_health(root, &StorageHealthOptions::default());
+// 显式启用 Linux NVMe SMART；默认只读取 MMC sysfs。
+let smart = observe_storage_health(root, &StorageHealthOptions {
     nvme_controllers: vec!["/dev/nvme0".into()],
 });
 ```
 
 显式健康读取示例：`cargo run -p deviceinfo --example storage_health -- /dev/nvme0`。不传参数时仅查询 MMC sysfs。
 
-eMMC 的内核没有暴露 `life_time/pre_eol_info` 时，调用方可显式使用 `read_mmc_health(Path::new("/dev/mmcblk0"))`，或运行 `cargo run -p deviceinfo --example mmc_health -- /dev/mmcblk0`。接口验证块设备身份后读取 CMD8 EXT_CSD，不写入、不执行命令、不自动提权；默认采样和 capture 都不会调用它。SD/SDIO、分区、boot/RPMB 节点会被拒绝，别名按打开后的设备号验证。MMC 数据传输超时配置为 2 秒、命令超时配置为 5 秒，由内核驱动处理；这不是用户态硬中断计时器。
+eMMC 的内核没有暴露 `life_time/pre_eol_info` 时，调用方可显式使用 `observe_mmc_health(Path::new("/"), Path::new("/dev/mmcblk0"))`，或运行 `cargo run -p deviceinfo --example mmc_health -- /dev/mmcblk0`。接口验证块设备身份后读取 CMD8 EXT_CSD，不写入、不执行命令、不自动提权；默认采样和 capture 都不会调用它。SD/SDIO、分区、boot/RPMB 节点会被拒绝，别名按打开后的设备号验证。MMC 数据传输超时配置为 2 秒、命令超时配置为 5 秒，由内核驱动处理；这不是用户态硬中断计时器。
 
 - SoC 从根设备树 `compatible` 和内核 SoC bus 的 `family/machine/soc_id/revision` 获取，保留原始属性及识别来源。只匹配 SoC 标识，不把板卡厂商或 ARM CPU implementer 当成芯片厂商；冲突或未识别时为 `None`。未知 JEP106 编码保留原文，不猜厂商。
-- `probe_storage` 读取块设备、分区父盘、dm/LVM/RAID 的 backing devices、型号、容量、扇区大小及可移除/只读/旋转属性；按 major:minor 关联挂载，正确处理 `/dev/root`、mapper 别名、bind mount 和转义空格。保留网络及伪文件系统挂载，不把它们伪装成物理磁盘。接口无法证实时为 `unknown`，SCSI 不等于 SATA 或 USB。
+- `inspect_storage` 读取块设备、分区父盘、dm/LVM/RAID 的 backing devices、型号、容量、扇区大小及可移除/只读/旋转属性；按 major:minor 关联挂载，正确处理 `/dev/root`、mapper 别名、bind mount 和转义空格。保留网络及伪文件系统挂载，不把它们伪装成物理磁盘。接口无法证实时为 `unknown`，SCSI 不等于 SATA 或 USB。
 - 块设备 `size` 按固定 512 字节单位换算，和逻辑扇区大小独立。容量、父盘和属性读不到时保持未知。盘、分区、逻辑卷、bind mount 是同一存储的不同视图，不能直接累加容量。
-- 文件系统已用/可用空间继续由 `sample_system_state` 的显式 `watch` 路径查询 `statvfs`。挂载属于当前进程的 namespace，拓扑在热插拔、分区或挂载变化后应刷新。
+- 文件系统已用/可用空间继续由 `observe_system` 的显式 `watch` 路径查询 `statvfs`。挂载属于当前进程的 namespace，拓扑在热插拔、分区或挂载变化后应刷新。
 - eMMC 健康保留 PRE_EOL 和寿命分档原始编码，不把 10% 桶当成精确剩余寿命。NVMe 使用只读 Get Log Page ioctl、5 秒命令超时；保留 critical warning 原始位和 128 位计数（十进制 JSON 字符串）。温度单位是 Kelvin。观测指标正常不保证整个磁盘没有故障。
 - 默认不读取 NVMe SMART 或 MMC ioctl；显式读时权限不足、控制器错误或平台不支持均返回未知及原因。注入 fixture root 时禁止打开真实控制器。ATA SMART 尚未实现；未暴露的健康数据不能当成正常。EXT_CSD 解码只解释 revision 7 及以上的健康字段；sysfs 已知旧版本时同样返回未知，缺失版本时仍可使用内核暴露的健康字段。旧版本的保留字节不会被当成健康数据。sysfs 寿命 A/B 分别校验，损坏字段不能掩盖另一个字段的临界告警，也不能令无告警结果伪装成正常。错误分类包含 `invalid_data`，供调用方区分格式损坏和权限不足。
 - `capture` 使用库提供的 SoC/存储输入清单，保留分区、backing devices 和 MMC 健康输入；不会为了采集执行 NVMe ioctl。
@@ -226,24 +231,24 @@ MMC 原生读取的布局和寄存器字段依据 [MMC UAPI](https://github.com/
 ### 温度、风扇与启动身份（Next 可独立接入）
 
 ```rust
-use deviceinfo::{probe_platform, sample_thermal, DiagnosticCode};
+use deviceinfo::{inspect_platform, observe_thermal, ThermalOptions, DiagnosticCode};
 use std::path::Path;
 let root = Path::new("/");
-let identity = probe_platform(root); // 低频缓存；固件或设备树变化后刷新
-let telemetry = sample_thermal(root); // 按需读，不睡眠、不写控制节点
-for diagnostic in &telemetry.diagnostics {
+let identity = inspect_platform(root);
+let telemetry = observe_thermal(root, &ThermalOptions::default());
+for diagnostic in &telemetry.data.diagnostics {
     if diagnostic.code == DiagnosticCode::PermissionDenied {
-        // 由调用方按设备、来源路径显示提示，不解析 diagnostic.message。
+        // 按 device 与 path 显示提示；诊断 message 只供人阅读。
     }
 }
 ```
 
-- `probe_platform` 分别记录 UEFI、DT、ACPI 的 `exposed/not_exposed/unknown` 观测及来源。三者允许同时暴露，因此 Q8B 的 UEFI + DT 不会被压成互斥启动模式。`not_exposed` 只表示当前进程看不到该 sysfs 接口，不能据此断言使用 Legacy BIOS 或设备没有该能力。这里不推断 ACPI/DT 是否被内核实际选作硬件描述来源。
+- `inspect_platform` 分别记录 UEFI、DT、ACPI 的 `exposed/not_exposed/unknown` 观测及来源。三者允许同时暴露，因此 Q8B 的 UEFI + DT 不会被压成互斥启动模式。`not_exposed` 只表示当前进程看不到该 sysfs 接口，不能据此断言使用 Legacy BIOS 或设备没有该能力。这里不推断 ACPI/DT 是否被内核实际选作硬件描述来源。
 - DT 的型号和 compatible、DMI 的系统/板卡名称及版本、BIOS 厂商/版本/日期分别保留，带字段来源；冲突时不任选一个覆盖其他证据。`board_version` 是板卡版本，`bios_version` 是固件版本，`fw_platform_size` 是 UEFI 位数；没有暴露的版本保持未知。不采集 DMI 序列号、UUID 或固件二进制表。
-- `sample_thermal` 枚举 thermal zone、hwmon 温度/风扇/PWM 和 cooling device。保留芯片名称、标签、温度原始值、告警标记、故障和启用状态，以及 thermal trip 类型/温度/滞回与 hwmon min/max/crit/emergency 阈值。滞回通过 `hysteresis_kind` 区分 thermal 的相对温差和 hwmon 的绝对阈值。温度单位为毫摄氏度，负值和零合法；低于绝对零度的读数保留原文并报告 `invalid_data`，不显示成可信温度；故障、禁用或损坏的状态标记不会给出可信温度/RPM，但保留原始读数。
+- `observe_thermal` 枚举 thermal zone、hwmon 温度/风扇/PWM 和 cooling device。保留芯片名称、标签、温度原始值、告警标记、故障和启用状态，以及 thermal trip 类型/温度/滞回与 hwmon min/max/crit/emergency 阈值。滞回通过 `hysteresis_kind` 区分 thermal 的相对温差和 hwmon 的绝对阈值。温度单位为毫摄氏度，负值和零合法；低于绝对零度的读数保留原文并报告 `invalid_data`，不显示成可信温度；故障、禁用或损坏的状态标记不会给出可信温度/RPM，但保留原始读数。
 - RPM 只来自 `fanN_input`；`fanN_target` 另列目标 RPM。PWM 保留内核报告的 0..255 设定、控制模式和频率，它不是电气测量的实际占空比。PWM、风扇和 cooling state 分成三个数组，不按相同编号猜测接线、不把散热档位或目标转速当成实测 RPM。hwmon 与 thermal 可能描述同一个物理传感器，保留各自来源，不通过名称强行去重。
 - thermistor/ADC 驱动可能返回毫伏。`tempN_type=4` 的输入默认单位未知；调用方可用 `ThermalOptions.hwmon_temperature_units` 按源路径明确指定单位。毫伏不会被转换成摄氏温度。无 type 字段的标准 hwmon 温度按内核 ABI 使用毫摄氏度；特殊驱动应显式覆盖。
-- 新接口共用 `Diagnostic { code, device, path, operation, errno, message }`；错误码固定为 `unsupported/not_exposed/permission_denied/read_failed/invalid_data`。`message` 仅供展示，OS 错误码存在时保留；读取时返回 EINVAL 属于 `read_failed`，仅解码失败才标为 `invalid_data`。不存在的可选标签/阈值不产生错误；所需采样输入缺失或读取失败才报告诊断。现有硬件/环境/系统/存储接口仍保留旧 `warnings`/健康错误结构以兼容，尚未全部迁移到此结构。
+- 新接口共用 `Diagnostic { code, device, path, operation, errno, message }`；错误码固定为 `unsupported/not_exposed/permission_denied/read_failed/invalid_data`。`message` 仅供展示，OS 错误码存在时保留；读取时返回 EINVAL 属于 `read_failed`，仅解码失败才标为 `invalid_data`。不存在的可选标签/阈值不产生错误；所需采样输入缺失或读取失败才报告诊断。硬件/环境/系统/存储载荷仍有供人阅读的 `warnings`，NVMe 保留控制器状态错误；启动与设备差分只使用 v2 的结构化上下文和 `DifferenceError`，不解析这些文字。
 - 两个接口只读文件；非 Linux 真机返回 `unsupported`，注入的 Linux 文件树在其他平台仍可回归。`capture`/SSH mirror 共享输入清单，保留空固件目录；显式加 `capture --telemetry` 时复制传感器输入。普通硬件/环境 SSH 探测和默认 capture 不读取 thermal/hwmon，避免一个坏传感器阻断其他探测。开启遥测采集后读取失败会终止 capture，当前尚不记录可回放的 I/O 错误；不会把失败伪装成零值。温度和风扇快照是采集时的读数，回放不能用于判断当前设备状态，也不能从单个样本计算利用率或采样间隔。
 
 示例：`cargo run -p deviceinfo --example platform_thermal -- [captured-root]`。
@@ -256,8 +261,9 @@ ABI 来源：[hwmon](https://docs.kernel.org/hwmon/sysfs-interface.html)、[ther
 也可以探测容器内的可见设备，或事后对着真机采样夹具做回归。
 
 例外是磁盘余量：它走 `statvfs`，查的是**真实挂载的文件系统**，
-`sample_state_with(root, watch)` 里的 `watch` 不经过 `root`——对着假文件树问
-"这块盘还剩多少"没有意义。
+`observe_system` 和 `observe_accelerators` 的 `watch` 仅在 `root = /` 时查询当前机器。
+注入目录、SSH 镜像或离线 capture 不会混入采集机的磁盘空间；返回空 disks 和
+`context.diagnostics` 中的 `unsupported`。磁盘空间应在目标机原生采样。
 
 ## 模块划分
 

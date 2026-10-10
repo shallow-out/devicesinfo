@@ -63,7 +63,7 @@ pub fn decode_mmc_ext_csd(bytes: &[u8]) -> io::Result<MmcExtCsdHealth> {
         target_arch = "aarch64"
     )
 ))]
-pub fn read_mmc_health(path: &Path) -> io::Result<MmcExtCsdHealth> {
+pub(crate) fn read_mmc_health(path: &Path) -> io::Result<MmcExtCsdHealth> {
     use std::{
         fs,
         os::unix::fs::{FileTypeExt, MetadataExt},
@@ -214,7 +214,7 @@ const R1_READ_ERRORS: u32 = (1 << 31)
         target_arch = "aarch64"
     )
 )))]
-pub fn read_mmc_health(_path: &Path) -> io::Result<MmcExtCsdHealth> {
+pub(crate) fn read_mmc_health(_path: &Path) -> io::Result<MmcExtCsdHealth> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "MMC health requires a supported Linux ioctl target",

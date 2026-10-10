@@ -9,7 +9,7 @@
 //!
 //! 加一台机器：`deviceinfo capture --out fixtures/<名字>`，然后把新目录提交。
 
-use deviceinfo::{HardwareReport, probe_with};
+use deviceinfo::{HardwareReport, inspect_hardware};
 use std::path::{Path, PathBuf};
 
 /// 递归统计一个目录的字节数。
@@ -60,7 +60,7 @@ fn captured_machines_still_probe_the_same() {
         // **直接比，不做任何路径归一化**：报告里的路径是"机器上的路径"
         // （`/dev/accel/accel0`），本机、远端、夹具三种来源本来就该给出同一串。
         // 以前要归一化，是因为路径里混了探测根——那掩盖了"夹具与真机不同"这类偏差。
-        let actual = probe_with(&fixture, arch);
+        let actual = inspect_hardware(&fixture, arch).data;
         assert_eq!(
             actual,
             expected,
@@ -75,12 +75,16 @@ fn captured_machines_still_probe_the_same() {
             fixture.join("expected-environment.json"),
         )
         .unwrap_or_else(|error| {
-            panic!("{} 缺 expected-environment.json: {error}", fixture.display())
+            panic!(
+                "{} 缺 expected-environment.json: {error}",
+                fixture.display()
+            )
         });
         let expected_environment: deviceinfo::EnvironmentReport =
-            serde_json::from_str(&expected_environment).expect("expected-environment.json 应可解析");
+            serde_json::from_str(&expected_environment)
+                .expect("expected-environment.json 应可解析");
         assert_eq!(
-            deviceinfo::probe_environment(&fixture),
+            deviceinfo::inspect_environment(&fixture).data,
             expected_environment,
             "\n夹具 {} 的环境探测结果变了。\n",
             fixture.display()
@@ -128,13 +132,13 @@ fn state_and_hardware_agree_on_which_devices_exist() {
             continue;
         }
         let arch = "x86_64";
-        let hardware = probe_with(&fixture, arch);
+        let hardware = inspect_hardware(&fixture, arch).data;
         let options = deviceinfo::SampleOptions {
             watch: Vec::new(),
             // 夹具里也有计数器文件，打开才能验证那条路径真的读得到
             counters: true,
         };
-        let state = deviceinfo::sample_state_with(&fixture, &options);
+        let state = deviceinfo::observe_accelerators(&fixture, &options).data;
 
         assert_eq!(
             state.accelerators.len(),
@@ -143,11 +147,12 @@ fn state_and_hardware_agree_on_which_devices_exist() {
             fixture.display()
         );
 
-        // 每一台都要能用 PCI 标识对上，且状态里至少读到了一个瞬时值
+        // 每一台都要能用来源路径对上，不能把同型号卡当成同一个实例，且状态里至少读到了一个瞬时值
         for accel in &hardware.accelerators {
-            let matched = state.accelerators.iter().find(|candidate| {
-                candidate.kind == accel.kind && candidate.pci_id == accel.pci_id
-            });
+            let matched = state
+                .accelerators
+                .iter()
+                .find(|candidate| candidate.kind == accel.kind && candidate.source == accel.source);
             let matched = matched.unwrap_or_else(|| {
                 panic!(
                     "{}: 硬件里有 {:?} {:?}，状态里找不到",

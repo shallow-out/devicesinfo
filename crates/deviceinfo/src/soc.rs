@@ -53,7 +53,7 @@ fn is_soc_name(name: &str) -> bool {
         .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
 }
 
-pub fn probe_soc(root: &Path) -> SocReport {
+pub(crate) fn probe_soc(root: &Path) -> SocReport {
     let mut report = SocReport::default();
     let dt_path = SHARED_INPUTS[0];
     if let Some(raw) = read(root, dt_path) {

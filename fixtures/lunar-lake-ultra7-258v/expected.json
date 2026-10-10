@@ -27,7 +27,8 @@
         "state": "ready"
       },
       "scheduling_mode": "HW",
-      "vendor": "Intel"
+      "vendor": "Intel",
+      "source": "/sys/class/accel/accel0"
     },
     {
       "device_path": "/dev/dri/renderD128",
@@ -52,7 +53,8 @@
         "stack": "Level Zero / OpenCL",
         "state": "ready"
       },
-      "vendor": "Intel"
+      "vendor": "Intel",
+      "source": "/sys/class/drm/card0"
     }
   ],
   "cpu": {

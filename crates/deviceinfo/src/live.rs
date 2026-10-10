@@ -120,7 +120,11 @@ impl Default for LiveOptions {
 ///
 /// `environment` 决定查哪些工具的版本、以及要把哪些镜像源加进连通性目标——
 /// 所以实时探测**依赖**环境报告，而不是重复一遍它的枚举逻辑。
-pub fn probe(environment: &EnvironmentReport, options: &LiveOptions, run: Runner) -> LiveReport {
+pub(crate) fn probe(
+    environment: &EnvironmentReport,
+    options: &LiveOptions,
+    run: Runner,
+) -> LiveReport {
     let mut versions: Vec<ToolVersion> = environment
         .containers
         .iter()

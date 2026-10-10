@@ -1,7 +1,7 @@
 //! Pure EXT_CSD and sysfs contracts; no tests issue commands to a physical MMC.
 use deviceinfo::{
     StorageHealthError, StorageHealthErrorKind, StorageHealthOptions, StorageHealthState,
-    decode_mmc_ext_csd, sample_storage_health_with,
+    decode_mmc_ext_csd, observe_storage_health,
 };
 use std::{fs, io, path::PathBuf};
 
@@ -25,7 +25,7 @@ impl Root {
         fs::write(path, text).unwrap();
     }
     fn health(&self) -> deviceinfo::StorageHealthReport {
-        sample_storage_health_with(&self.0, &StorageHealthOptions::default())
+        observe_storage_health(&self.0, &StorageHealthOptions::default()).data
     }
 }
 impl Drop for Root {
@@ -152,16 +152,19 @@ fn malformed_ext_csd_has_a_typed_error_instead_of_a_health_verdict() {
 fn linux_mmc_reader_rejects_regular_and_character_files_before_ioctl() {
     let root = Root::new("nondevice");
     let path = root.0.join("sys/class/block/mmcblk0/device/type");
-    assert_eq!(
-        deviceinfo::read_mmc_health(&path).unwrap_err().kind(),
-        io::ErrorKind::InvalidInput
-    );
-    assert_eq!(
-        deviceinfo::read_mmc_health(std::path::Path::new("/dev/null"))
-            .unwrap_err()
-            .kind(),
-        io::ErrorKind::InvalidInput
-    );
+    for path in [path.as_path(), std::path::Path::new("/dev/null")] {
+        let observation = deviceinfo::observe_mmc_health(std::path::Path::new("/"), path);
+        assert!(observation.data.health.is_none());
+        assert_eq!(
+            observation.data.diagnostics[0].code,
+            deviceinfo::DiagnosticCode::ReadFailed
+        );
+        assert!(
+            observation.data.diagnostics[0]
+                .message
+                .contains("block device")
+        );
+    }
 }
 
 #[cfg(not(all(
@@ -175,10 +178,13 @@ fn linux_mmc_reader_rejects_regular_and_character_files_before_ioctl() {
 )))]
 #[test]
 fn other_platforms_return_unsupported_without_opening_a_path() {
+    let observation = deviceinfo::observe_mmc_health(
+        std::path::Path::new("/"),
+        std::path::Path::new("/does-not-exist"),
+    );
+    assert!(observation.data.health.is_none());
     assert_eq!(
-        deviceinfo::read_mmc_health(std::path::Path::new("/does-not-exist"))
-            .unwrap_err()
-            .kind(),
-        io::ErrorKind::Unsupported
+        observation.data.diagnostics[0].code,
+        deviceinfo::DiagnosticCode::Unsupported
     );
 }

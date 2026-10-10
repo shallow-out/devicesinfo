@@ -120,11 +120,7 @@ pub struct ThermalReport {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-pub fn sample_thermal(root: &Path) -> ThermalReport {
-    sample_thermal_with(root, &ThermalOptions::default())
-}
-
-pub fn sample_thermal_with(root: &Path, options: &ThermalOptions) -> ThermalReport {
+pub(crate) fn sample_thermal_with(root: &Path, options: &ThermalOptions) -> ThermalReport {
     let mut reader = Reader::new(root);
     let mut report = ThermalReport::default();
     if !reader.supported("thermal", INPUT_DIRS[0]) {

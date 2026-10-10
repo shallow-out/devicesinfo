@@ -133,12 +133,8 @@ pub struct StorageHealthReport {
     pub warnings: Vec<String>,
 }
 
-pub fn sample_storage_health(options: &StorageHealthOptions) -> StorageHealthReport {
-    sample_storage_health_with(Path::new("/"), options)
-}
-
 /// Fixture roots never open real device nodes, even with an NVMe opt-in list.
-pub fn sample_storage_health_with(
+pub(crate) fn sample_storage_health_with(
     root: &Path,
     options: &StorageHealthOptions,
 ) -> StorageHealthReport {
@@ -378,7 +374,7 @@ impl std::error::Error for NvmeHealthError {
         target_arch = "aarch64"
     )
 ))]
-pub fn read_nvme_health(path: &Path) -> Result<NvmeSmartLog, NvmeHealthError> {
+pub(crate) fn read_nvme_health(path: &Path) -> Result<NvmeSmartLog, NvmeHealthError> {
     use std::os::fd::AsRawFd;
     #[repr(C)]
     struct Command {
@@ -449,7 +445,7 @@ pub fn read_nvme_health(path: &Path) -> Result<NvmeSmartLog, NvmeHealthError> {
         target_arch = "aarch64"
     )
 )))]
-pub fn read_nvme_health(_path: &Path) -> Result<NvmeSmartLog, NvmeHealthError> {
+pub(crate) fn read_nvme_health(_path: &Path) -> Result<NvmeSmartLog, NvmeHealthError> {
     Err(NvmeHealthError::Unsupported(
         "requires a supported Linux ioctl target",
     ))

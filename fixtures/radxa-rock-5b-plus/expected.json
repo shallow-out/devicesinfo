@@ -13,7 +13,8 @@
       "runtime": {
         "reason": "厂商未识别，不知道该找哪些组件",
         "state": "unknown"
-      }
+      },
+      "source": "/sys/class/drm/card0"
     },
     {
       "compatible": "rockchip,display-subsystem",
@@ -27,7 +28,8 @@
       "runtime": {
         "reason": "只能做显示输出，不涉及推理运行时",
         "state": "not-applicable"
-      }
+      },
+      "source": "/sys/class/drm/card1"
     }
   ],
   "cpu": {

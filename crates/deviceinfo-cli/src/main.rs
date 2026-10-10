@@ -9,7 +9,7 @@ use clap::{Parser, Subcommand};
 use deviceinfo::pci::{PCI_DATABASE_PATHS, extract_entries};
 use deviceinfo::{
     CPU_PER_CORE_INPUTS, CPU_SHARED_INPUTS, LIBRARY_DIRS, OPENCL_VENDOR_DIR, PciId, SampleOptions,
-    probe_with, render, sample_state_with,
+    inspect_hardware, observe_accelerators, render,
 };
 use source::{Entry, EntryKind, Source};
 use std::collections::BTreeMap;
@@ -153,15 +153,15 @@ fn main() {
                     std::process::exit(2);
                 }
             };
-            let report = probe_with(&local_root, &arch);
+            let report = inspect_hardware(&local_root, &arch);
             let mut report = report;
-            report.warnings.splice(0..0, arch_warnings);
+            report.data.warnings.splice(0..0, arch_warnings);
             if cli.json {
                 print_json(&report);
             } else {
-                print!("{}", render::human(&report));
+                print!("{}", render::human(&report.data));
             }
-            if strict && !report.warnings.is_empty() {
+            if strict && !report.data.warnings.is_empty() {
                 std::process::exit(1);
             }
         }
@@ -177,13 +177,13 @@ fn main() {
                     std::process::exit(2);
                 }
             };
-            let report = deviceinfo::probe_environment(&local_root);
+            let report = deviceinfo::inspect_environment(&local_root);
             if cli.json {
                 print_json(&report);
             } else {
-                print!("{}", render::human_environment(&report));
+                print!("{}", render::human_environment(&report.data));
             }
-            if strict && !report.warnings.is_empty() {
+            if strict && !report.data.warnings.is_empty() {
                 std::process::exit(1);
             }
         }
@@ -205,7 +205,7 @@ fn main() {
                     std::process::exit(2);
                 }
             };
-            let environment = deviceinfo::probe_environment(&local_root);
+            let environment = deviceinfo::inspect_environment(&local_root);
             let options = deviceinfo::LiveOptions {
                 timeout: Duration::from_secs(timeout.max(1)),
                 skip_network: no_network,
@@ -216,15 +216,18 @@ fn main() {
                 host: ssh.clone(),
                 timeout: options.timeout,
             };
-            let report = deviceinfo::live::probe(&environment, &options, &|program, args| {
-                runner.run(program, args)
-            });
+            let report = deviceinfo::check_environment(
+                &runner.root,
+                &environment.data,
+                &options,
+                &|program, args| runner.run(program, args),
+            );
             if cli.json {
                 print_json(&report);
             } else {
-                print!("{}", render::human_live(&report));
+                print!("{}", render::human_live(&report.data));
             }
-            if strict && !report.warnings.is_empty() {
+            if strict && !report.data.warnings.is_empty() {
                 std::process::exit(1);
             }
         }
@@ -234,19 +237,13 @@ fn main() {
             root,
             strict,
         } => {
-            let state = sample_state_with(
-                &root,
-                &SampleOptions {
-                    watch,
-                    counters,
-                },
-            );
+            let state = observe_accelerators(&root, &SampleOptions { watch, counters });
             if cli.json {
                 print_json(&state);
             } else {
-                print!("{}", render::human_state(&state));
+                print!("{}", render::human_state(&state.data));
             }
-            if strict && !state.warnings.is_empty() {
+            if strict && !state.data.warnings.is_empty() {
                 std::process::exit(1);
             }
         }
@@ -304,7 +301,13 @@ fn capture(source: &Source, arch: &str, extra_warnings: &[String], out: &Path) -
     capture_with_telemetry(source, arch, extra_warnings, out, false)
 }
 
-fn capture_with_telemetry(source: &Source, arch: &str, extra_warnings: &[String], out: &Path, telemetry: bool) -> io::Result<()> {
+fn capture_with_telemetry(
+    source: &Source,
+    arch: &str,
+    extra_warnings: &[String],
+    out: &Path,
+    telemetry: bool,
+) -> io::Result<()> {
     // 不把新输入叠加到旧夹具上：源端消失的设备、库和标签必须随之消失。
     if out.exists() && fs::read_dir(out)?.next().transpose()?.is_some() {
         return Err(io::Error::other(format!(
@@ -423,11 +426,14 @@ fn mirror(source: &Source, stage: &Path) -> io::Result<()> {
     mirror_with_telemetry(source, stage, false)
 }
 fn mirror_with_telemetry(source: &Source, stage: &Path, telemetry: bool) -> io::Result<()> {
+    let started = source.stamp(true)?;
     let plan = if telemetry {
         capture_plan_with_telemetry(source, true)?
     } else {
         capture_plan(source)?
     };
+    let associations = association_paths(&plan);
+    let devices_before = source.associations(&associations)?;
     // 一次 ssh 把全部内容取回来，而不是每个文件开一次连接
     // 两批分开传：**内容一定要**的，和**只要"在不在"**的。
     // 后者如果混进"要内容"那批，远端会把 `/usr/bin/podman`（45 MB）之类整个传回来。
@@ -440,7 +446,7 @@ fn mirror_with_telemetry(source: &Source, stage: &Path, telemetry: bool) -> io::
         match source.kind(rel) {
             EntryKind::Directory => fs::create_dir_all(stage.join(rel))?,
             EntryKind::File | EntryKind::Other => write_file(&stage.join(rel), b"")?,
-            EntryKind::Missing => {},
+            EntryKind::Missing => {}
         }
     }
 
@@ -470,9 +476,9 @@ fn mirror_with_telemetry(source: &Source, stage: &Path, telemetry: bool) -> io::
             // **说它是普通文件就得真读到内容。** 这里以前是 `unwrap_or_default()`——
             // 读失败就写一个空文件，而那正是我修过两次的病：空文件看起来像正常数据，
             // 探测会把缺的值读成空字符串。读到就报错，至少能看出是哪一条。
-            EntryKind::File => source.read(rel).ok_or_else(|| {
-                io::Error::other(format!("{rel} 报为普通文件但读不到内容"))
-            })?,
+            EntryKind::File => source
+                .read(rel)
+                .ok_or_else(|| io::Error::other(format!("{rel} 报为普通文件但读不到内容")))?,
             // **不存在就跳过。** 写成空文件会让探测把缺的项读成空字符串
             EntryKind::Missing => continue,
         };
@@ -494,7 +500,61 @@ fn mirror_with_telemetry(source: &Source, stage: &Path, telemetry: bool) -> io::
             write_file(&stage.join(&dir).join(entry.name), b"")?;
         }
     }
+    persist_context(
+        stage,
+        started,
+        source.stamp(false)?,
+        devices_before,
+        source.associations(&associations)?,
+        source.preserves_counters(),
+    )?;
     Ok(())
+}
+
+fn association_paths(plan: &CapturePlan) -> Vec<String> {
+    let mut paths = std::collections::BTreeSet::new();
+    for path in plan.files.iter().chain(&plan.directories) {
+        let parts: Vec<_> = path.split('/').collect();
+        if parts.len() >= 4
+            && parts[0] == "sys"
+            && parts[1] == "class"
+            && ["drm", "accel", "thermal", "hwmon", "block", "nvme"].contains(&parts[2])
+        {
+            paths.insert(parts[..4].join("/"));
+        }
+    }
+    paths.into_iter().collect()
+}
+
+fn persist_context(
+    out: &Path,
+    started: deviceinfo::SampleStamp,
+    finished: deviceinfo::SampleStamp,
+    before: Vec<deviceinfo::DeviceAssociation>,
+    mut devices: Vec<deviceinfo::DeviceAssociation>,
+    counters_preserved: bool,
+) -> io::Result<()> {
+    let mut context = deviceinfo::SampleContext::from_bounds(
+        deviceinfo::ObservationOrigin::Captured,
+        started,
+        finished,
+    );
+    for device in &mut devices {
+        if !before.iter().any(|old| old == device) {
+            device.kernel_instance = None;
+            context.consistent = false;
+        }
+    }
+    let metadata = deviceinfo::CaptureMetadata {
+        schema_version: deviceinfo::SCHEMA_VERSION,
+        context,
+        devices,
+        counters_preserved,
+    };
+    write_file(
+        &out.join(deviceinfo::CONTEXT_FILE),
+        &serde_json::to_vec_pretty(&metadata)?,
+    )
 }
 
 /// 采集期间用的临时目录，用完自动删。
@@ -528,12 +588,23 @@ impl Drop for TempTree {
 }
 
 /// 从一棵**本地**文件树写夹具。
-fn capture_from_root(root: &Path, arch: &str, extra_warnings: &[String], out: &Path, telemetry: bool) -> io::Result<()> {
+fn capture_from_root(
+    root: &Path,
+    arch: &str,
+    extra_warnings: &[String],
+    out: &Path,
+    telemetry: bool,
+) -> io::Result<()> {
     let source = Source::local(root);
-    let mut report = probe_with(root, arch);
+    let started = source.stamp(true)?;
+    let devices_before = source.associations(&[])?;
+    let mut report = inspect_hardware(root, arch);
     // 架构是猜来的（或调用方指定的）时，报告里要跟着一句解释——否则夹具里那个
     // 架构值看起来就像探测出来的事实。
-    report.warnings.splice(0..0, extra_warnings.iter().cloned());
+    report
+        .data
+        .warnings
+        .splice(0..0, extra_warnings.iter().cloned());
     let plan = capture_plan_with_telemetry(&source, telemetry)?;
 
     // Preserve empty observed firmware/class directories without copying binary tables.
@@ -541,7 +612,7 @@ fn capture_from_root(root: &Path, arch: &str, extra_warnings: &[String], out: &P
         match source.kind(rel) {
             EntryKind::Directory => fs::create_dir_all(out.join(rel))?,
             EntryKind::File | EntryKind::Other => write_file(&out.join(rel), b"")?,
-            EntryKind::Missing => {},
+            EntryKind::Missing => {}
         }
     }
 
@@ -595,10 +666,7 @@ fn capture_from_root(root: &Path, arch: &str, extra_warnings: &[String], out: &P
                 // 是哪个文件，唯一的线索就没了（本机以非 root 采 `/` 时会撞上 root-only
                 // 的文件，而"哪个文件"决定了是"该用 sudo"还是"计划里不该有它"）。
                 let raw = fs::read(&from).map_err(|error| {
-                    io::Error::new(
-                        error.kind(),
-                        format!("读 {} 失败：{error}", from.display()),
-                    )
+                    io::Error::new(error.kind(), format!("读 {} 失败：{error}", from.display()))
                 })?;
                 match String::from_utf8(raw.clone()) {
                     Ok(text) => write_file(&out.join(rel), filter_volatile(rel, &text).as_bytes())?,
@@ -632,6 +700,7 @@ fn capture_from_root(root: &Path, arch: &str, extra_warnings: &[String], out: &P
 
     // 3) pci.ids 只留用到的条目
     let ids: Vec<PciId> = report
+        .data
         .accelerators
         .iter()
         .filter_map(|accel| accel.pci_id.clone())
@@ -647,7 +716,22 @@ fn capture_from_root(root: &Path, arch: &str, extra_warnings: &[String], out: &P
     }
 
     // 4) 元信息与期望输出
+    persist_context(
+        out,
+        started,
+        source.stamp(false)?,
+        devices_before,
+        source.associations(&[])?,
+        false,
+    )?;
+    // Expected output describes the frozen tree, whose volatile counters are scrubbed.
+    let mut report = inspect_hardware(out, arch);
+    report
+        .data
+        .warnings
+        .splice(0..0, extra_warnings.iter().cloned());
     let meta = serde_json::json!({
+        "schema_version": deviceinfo::SCHEMA_VERSION,
         "arch": arch,
         "includes_thermal_telemetry": telemetry,
         "note": "由 `deviceinfo capture` 生成。expected.json 是采集当时的探测结果快照——\
@@ -666,16 +750,18 @@ fn capture_from_root(root: &Path, arch: &str, extra_warnings: &[String], out: &P
     // （比如镜像时把目录写成了文件、于是 init 永远报 null）不会被任何测试发现。
     write_file(
         &out.join("expected.json"),
-        to_json(&serde_json::to_value(&report).map_err(|error| {
-            io::Error::other(format!("报告序列化失败: {error}"))
-        })?)?
+        to_json(
+            &serde_json::to_value(&report)
+                .map_err(|error| io::Error::other(format!("报告序列化失败: {error}")))?,
+        )?
         .as_bytes(),
     )?;
     write_file(
         &out.join("expected-environment.json"),
-        to_json(&serde_json::to_value(deviceinfo::probe_environment(root)).map_err(
-            |error| io::Error::other(format!("环境报告序列化失败: {error}")),
-        )?)? 
+        to_json(
+            &serde_json::to_value(deviceinfo::inspect_environment(out))
+                .map_err(|error| io::Error::other(format!("环境报告序列化失败: {error}")))?,
+        )?
         .as_bytes(),
     )?;
     Ok(())
@@ -710,23 +796,49 @@ fn capture_plan(source: &Source) -> io::Result<CapturePlan> {
 fn capture_plan_with_telemetry(source: &Source, telemetry: bool) -> io::Result<CapturePlan> {
     // CPU 那部分**直接用库里的清单**，不在这里重抄一遍：抄一遍就会漂移，
     // 而漂移的后果（远端夹具静默少一个输入）很难发现。
-    let mut files: Vec<String> = CPU_SHARED_INPUTS.iter().map(|path| path.to_string()).collect();
-    files.extend(deviceinfo::system::INPUTS.iter().map(|path| path.to_string()));
+    let mut files: Vec<String> = CPU_SHARED_INPUTS
+        .iter()
+        .map(|path| path.to_string())
+        .collect();
+    files.push(deviceinfo::BOOT_ID_INPUT.to_owned());
+    files.extend(
+        deviceinfo::system::INPUTS
+            .iter()
+            .map(|path| path.to_string()),
+    );
     files.extend(deviceinfo::platform::inputs());
-    let mut directories: Vec<String> = deviceinfo::platform::INPUT_DIRS.iter().map(|path| path.to_string()).collect();
+    let mut directories: Vec<String> = deviceinfo::platform::INPUT_DIRS
+        .iter()
+        .map(|path| path.to_string())
+        .collect();
     let mut symlinks = Vec::new();
     let mut existence_only = Vec::new();
     // 探测会读 pci.ids（`pci::lookup`），所以要镜像进暂存树——但写夹具时另走一条路
-    let databases: Vec<String> = PCI_DATABASE_PATHS.iter().map(|path| path.to_string()).collect();
+    let databases: Vec<String> = PCI_DATABASE_PATHS
+        .iter()
+        .map(|path| path.to_string())
+        .collect();
     let mut lists = ListCache::new(source);
 
     if telemetry {
         directories.extend(deviceinfo::thermal::INPUT_DIRS.map(str::to_owned));
         lists.ensure(&deviceinfo::thermal::INPUT_DIRS.map(str::to_owned))?;
-        let thermal_dirs = deviceinfo::thermal::input_dirs(&|dir| lists.entries(dir).iter().map(|entry| entry.name.clone()).collect());
+        let thermal_dirs = deviceinfo::thermal::input_dirs(&|dir| {
+            lists
+                .entries(dir)
+                .iter()
+                .map(|entry| entry.name.clone())
+                .collect()
+        });
         lists.ensure(&thermal_dirs)?;
         directories.extend(thermal_dirs);
-        files.extend(deviceinfo::thermal::inputs(&|dir| lists.entries(dir).iter().map(|entry| entry.name.clone()).collect()));
+        files.extend(deviceinfo::thermal::inputs(&|dir| {
+            lists
+                .entries(dir)
+                .iter()
+                .map(|entry| entry.name.clone())
+                .collect()
+        }));
     }
 
     lists.ensure(&deviceinfo::soc::INPUT_DIRS.map(str::to_owned))?;
@@ -923,7 +1035,9 @@ fn capture_plan_with_telemetry(source: &Source, telemetry: bool) -> io::Result<C
         .collect();
     link_paths.extend(pci_driver_links);
     link_paths.extend(
-        blocks.iter().map(|name| format!("{BLOCK_DIR}/{name}/device/subsystem")),
+        blocks
+            .iter()
+            .map(|name| format!("{BLOCK_DIR}/{name}/device/subsystem")),
     );
     let links = source.link_many(&link_paths)?;
     for (path, target) in links {
@@ -1119,7 +1233,11 @@ impl Runner {
             Some(host) => {
                 let mut words: Vec<String> = vec![source::quoted(program)];
                 words.extend(args.iter().map(|arg| source::quoted(arg)));
-                ssh_exec(host, &words.join(" "), self.timeout + Duration::from_secs(5))
+                ssh_exec(
+                    host,
+                    &words.join(" "),
+                    self.timeout + Duration::from_secs(5),
+                )
             }
         }
     }
@@ -1291,14 +1409,19 @@ mod tests {
     /// 且没有任何测试会红。这条端到端钉住它。
     #[test]
     fn capture_preserves_declared_tags() {
-        let root = std::env::temp_dir().join(format!("deviceinfo-tagcapture-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("deviceinfo-tagcapture-{}", std::process::id()));
         let out = std::env::temp_dir().join(format!("deviceinfo-tagout-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&out);
 
         // 一棵最小的"机器"：采集守卫要求 proc/cpuinfo 与 proc/meminfo 在
         fs::create_dir_all(root.join("proc")).unwrap();
-        fs::write(root.join("proc/cpuinfo"), "processor\t: 0\nmodel name\t: x\n").unwrap();
+        fs::write(
+            root.join("proc/cpuinfo"),
+            "processor\t: 0\nmodel name\t: x\n",
+        )
+        .unwrap();
         fs::write(root.join("proc/meminfo"), "MemTotal: 1000 kB\n").unwrap();
         fs::create_dir_all(root.join("etc/deviceinfo")).unwrap();
         fs::write(
@@ -1310,7 +1433,7 @@ mod tests {
         capture(&Source::local(&root), "x86_64", &[], &out).expect("采集应当成功");
 
         // 夹具本身要能探测出来
-        let report = deviceinfo::probe_environment(&out);
+        let report = deviceinfo::inspect_environment(&out).data;
         assert!(report.always_on(), "{:#?}", report.declared_tags);
         assert!(report.powersave());
         // 期望值里也要有（否则夹具测试不会因为标签丢失而失败）
@@ -1332,10 +1455,7 @@ mod tests {
 
         let error = capture(&source, "x86_64", &[], &out).unwrap_err();
         assert!(error.to_string().contains("proc/cpuinfo"), "{error}");
-        assert!(
-            !out.exists(),
-            "失败时不该留下半个夹具目录——那比没有更坏"
-        );
+        assert!(!out.exists(), "失败时不该留下半个夹具目录——那比没有更坏");
 
         let _ = fs::remove_dir_all(&out);
     }
@@ -1371,10 +1491,61 @@ mod tests {
         tree
     }
 
+    #[test]
+    fn remirroring_retains_capture_window_and_never_reenables_scrubbed_counters() {
+        let source = minimal_machine();
+        let boot = "01234567-89ab-cdef-0123-456789abcdef";
+        write_file(
+            &source.path.join(deviceinfo::BOOT_ID_INPUT),
+            boot.as_bytes(),
+        )
+        .unwrap();
+        let started = deviceinfo::SampleStamp {
+            boot_id: Some(boot.into()),
+            boot_time_ns: Some(1_000_000_000),
+            unix_time_ns: Some(1_792_000_000_123_456_789),
+            boot_clock_resolution_ns: Some(1),
+            time_namespace: Some("time:[42]".into()),
+            mount_namespace: Some("mnt:[43]".into()),
+        };
+        let mut finished = started.clone();
+        finished.boot_time_ns = Some(2_000_000_000);
+        for preserved in [false, true] {
+            let metadata = deviceinfo::CaptureMetadata {
+                schema_version: deviceinfo::SCHEMA_VERSION,
+                context: deviceinfo::SampleContext::from_bounds(
+                    deviceinfo::ObservationOrigin::Captured,
+                    started.clone(),
+                    finished.clone(),
+                ),
+                devices: Vec::new(),
+                counters_preserved: preserved,
+            };
+            write_file(
+                &source.path.join(deviceinfo::CONTEXT_FILE),
+                &serde_json::to_vec(&metadata).unwrap(),
+            )
+            .unwrap();
+            let stage = TempTree::new().unwrap();
+            mirror(&Source::local(&source.path), &stage.path).unwrap();
+            let mirrored: deviceinfo::CaptureMetadata = serde_json::from_slice(
+                &fs::read(stage.path.join(deviceinfo::CONTEXT_FILE)).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(mirrored.context.started, started);
+            assert_eq!(mirrored.context.finished, finished);
+            assert_eq!(mirrored.counters_preserved, preserved);
+            assert_eq!(
+                deviceinfo::SampleContext::read(&stage.path).consistent,
+                preserved
+            );
+        }
+    }
+
     fn assert_hardware_snapshot_matches(out: &Path) {
-        let expected: deviceinfo::HardwareReport =
+        let expected: deviceinfo::Snapshot<deviceinfo::HardwareReport> =
             serde_json::from_slice(&fs::read(out.join("expected.json")).unwrap()).unwrap();
-        assert_eq!(probe_with(out, "x86_64"), expected);
+        assert_eq!(inspect_hardware(out, "x86_64").data, expected.data);
     }
 
     #[test]
@@ -1396,7 +1567,10 @@ mod tests {
             ("sys/class/accel/accel0/device/device", "0x643e\n"),
             ("sys/class/accel/accel0/device/freq/hw_max_freq", "1900\n"),
             ("sys/class/accel/accel0/device/freq/hw_min_freq", "650\n"),
-            ("sys/class/accel/accel0/device/freq/hw_efficient_freq", "950\n"),
+            (
+                "sys/class/accel/accel0/device/freq/hw_efficient_freq",
+                "950\n",
+            ),
             ("sys/class/accel/accel0/device/sched_mode", "HW\n"),
             ("usr/lib/x86_64-linux-gnu/libze_loader.so.1", ""),
             ("usr/lib/x86_64-linux-gnu/libze_intel_npu.so", ""),
@@ -1410,11 +1584,14 @@ mod tests {
                 .join("usr/lib/x86_64-linux-gnu/libze_loader.so.1")
                 .is_file()
         );
-        let report = probe_with(&out.path, "x86_64");
+        let report = inspect_hardware(&out.path, "x86_64").data;
         assert_eq!(report.accelerators[0].max_freq_mhz, Some(1900));
         assert_eq!(report.accelerators[0].min_freq_mhz, Some(650));
         assert_eq!(report.accelerators[0].efficient_freq_mhz, Some(950));
-        assert_eq!(report.accelerators[0].scheduling_mode.as_deref(), Some("HW"));
+        assert_eq!(
+            report.accelerators[0].scheduling_mode.as_deref(),
+            Some("HW")
+        );
         match &report.accelerators[0].runtime {
             deviceinfo::RuntimeStatus::Incomplete { missing, .. } => assert_eq!(missing.len(), 1),
             status => panic!("预期只缺编译器: {status:?}"),
@@ -1432,8 +1609,8 @@ mod tests {
         .unwrap();
         capture(&Source::local(&source.path), "x86_64", &[], &out.path).unwrap();
         assert_hardware_snapshot_matches(&out.path);
-        let original = probe_with(&source.path, "x86_64");
-        let captured = probe_with(&out.path, "x86_64");
+        let original = inspect_hardware(&source.path, "x86_64").data;
+        let captured = inspect_hardware(&out.path, "x86_64").data;
         assert_eq!(original.cpu, captured.cpu);
         assert_eq!(captured.cpu.common_features, Some(vec!["aes".into()]));
         assert_eq!(captured.cpu.feature_groups[1].cpus, [7]);
@@ -1444,19 +1621,22 @@ mod tests {
         let source = minimal_machine();
         let out = TempTree::new().unwrap();
         for (path, content) in [
-            ("etc/os-release", "ID=ubuntu\nID_LIKE=debian\nPRETTY_NAME=\"Ubuntu Linux\"\nVERSION_ID=24.04\n"),
+            (
+                "etc/os-release",
+                "ID=ubuntu\nID_LIKE=debian\nPRETTY_NAME=\"Ubuntu Linux\"\nVERSION_ID=24.04\n",
+            ),
             ("usr/lib/os-release", "ID=default\n"),
             ("proc/sys/kernel/osrelease", "6.8.0-test\n"),
         ] {
             write_file(&source.path.join(path), content.as_bytes()).unwrap();
         }
         capture(&Source::local(&source.path), "x86_64", &[], &out.path).unwrap();
-        let report = deviceinfo::probe_environment(&out.path);
-        assert_eq!(report, deviceinfo::probe_environment(&source.path));
-        let expected: serde_json::Value = serde_json::from_slice(
-            &fs::read(out.path.join("expected-environment.json")).unwrap(),
-        ).unwrap();
-        assert_eq!(serde_json::to_value(&report).unwrap(), expected);
+        let report = deviceinfo::inspect_environment(&out.path).data;
+        assert_eq!(report, deviceinfo::inspect_environment(&source.path).data);
+        let expected: serde_json::Value =
+            serde_json::from_slice(&fs::read(out.path.join("expected-environment.json")).unwrap())
+                .unwrap();
+        assert_eq!(serde_json::to_value(&report).unwrap(), expected["data"]);
         let os = report.operating_system.as_ref().unwrap();
         assert_eq!(os.id.as_deref(), Some("ubuntu"));
         assert_eq!(os.version_id.as_deref(), Some("24.04"));
@@ -1484,13 +1664,13 @@ mod tests {
         }
         capture(&Source::local(&source.path), "x86_64", &[], &out.path).unwrap();
         assert_eq!(
-            deviceinfo::probe_system_with(&source.path, "x86_64"),
-            deviceinfo::probe_system_with(&out.path, "x86_64"),
+            deviceinfo::inspect_system(&source.path, "x86_64").data,
+            deviceinfo::inspect_system(&out.path, "x86_64").data,
         );
         let options = deviceinfo::SystemSampleOptions::default();
         assert_eq!(
-            deviceinfo::sample_system_state_with(&source.path, &options),
-            deviceinfo::sample_system_state_with(&out.path, &options),
+            deviceinfo::observe_system(&source.path, &options).data,
+            deviceinfo::observe_system(&out.path, &options).data,
         );
     }
 
@@ -1529,21 +1709,24 @@ mod tests {
         fs::create_dir_all(source.path.join("sys/class/block/dm-0/slaves/mmcblk0p1")).unwrap();
         capture(&Source::local(&source.path), "x86_64", &[], &out.path).unwrap();
         assert_eq!(
-            deviceinfo::probe_soc(&source.path),
-            deviceinfo::probe_soc(&out.path)
+            deviceinfo::inspect_soc(&source.path).data,
+            deviceinfo::inspect_soc(&out.path).data
         );
         assert_eq!(
-            deviceinfo::probe_storage(&source.path),
-            deviceinfo::probe_storage(&out.path)
+            deviceinfo::inspect_storage(&source.path).data,
+            deviceinfo::inspect_storage(&out.path).data
         );
         let options = deviceinfo::StorageHealthOptions::default();
         assert_eq!(
-            deviceinfo::sample_storage_health_with(&out.path, &options).mmc[0].state,
+            deviceinfo::observe_storage_health(&out.path, &options)
+                .data
+                .mmc[0]
+                .state,
             deviceinfo::StorageHealthState::Unknown
         );
         assert_eq!(
-            deviceinfo::sample_storage_health_with(&source.path, &options),
-            deviceinfo::sample_storage_health_with(&out.path, &options)
+            deviceinfo::observe_storage_health(&source.path, &options).data,
+            deviceinfo::observe_storage_health(&out.path, &options).data
         );
     }
 
@@ -1554,7 +1737,10 @@ mod tests {
         for (path, text) in [
             ("sys/firmware/efi/fw_platform_size", "64\n"),
             ("sys/firmware/devicetree/base/model", "Q8B fixture\0"),
-            ("sys/firmware/devicetree/base/compatible", "radxa,fixture\0qcom,qcs6490\0"),
+            (
+                "sys/firmware/devicetree/base/compatible",
+                "radxa,fixture\0qcom,qcs6490\0",
+            ),
             ("sys/class/dmi/id/board_version", "rev-fixture\n"),
             ("sys/class/dmi/id/bios_version", "firmware-fixture\n"),
             ("sys/class/hwmon/hwmon0/name", "fan-fixture\n"),
@@ -1570,29 +1756,61 @@ mod tests {
         }
         fs::create_dir_all(source.path.join("sys/firmware/acpi/tables")).unwrap();
         let default_plan = capture_plan(&Source::local(&source.path)).unwrap();
-        assert!(!default_plan.files.iter().any(|path| path.starts_with("sys/class/hwmon/")));
-        capture_with_telemetry(&Source::local(&source.path), "aarch64", &[], &out.path, true).unwrap();
+        assert!(
+            !default_plan
+                .files
+                .iter()
+                .any(|path| path.starts_with("sys/class/hwmon/"))
+        );
+        capture_with_telemetry(
+            &Source::local(&source.path),
+            "aarch64",
+            &[],
+            &out.path,
+            true,
+        )
+        .unwrap();
         assert!(out.path.join("sys/firmware/acpi/tables").is_dir());
-        assert_eq!(deviceinfo::probe_platform(&source.path), deviceinfo::probe_platform(&out.path));
-        assert_eq!(deviceinfo::sample_thermal(&source.path), deviceinfo::sample_thermal(&out.path));
+        assert_eq!(
+            deviceinfo::inspect_platform(&source.path).data,
+            deviceinfo::inspect_platform(&out.path).data
+        );
+        assert_eq!(
+            deviceinfo::observe_thermal(&source.path, &deviceinfo::ThermalOptions::default()).data,
+            deviceinfo::observe_thermal(&out.path, &deviceinfo::ThermalOptions::default()).data
+        );
         // Remote mirror uses the same directory marker protocol and input plan.
         let stage = TempTree::new().unwrap();
         mirror_with_telemetry(&Source::local(&source.path), &stage.path, true).unwrap();
-        assert_eq!(deviceinfo::probe_platform(&source.path), deviceinfo::probe_platform(&stage.path));
-        assert_eq!(deviceinfo::sample_thermal(&source.path), deviceinfo::sample_thermal(&stage.path));
+        assert_eq!(
+            deviceinfo::inspect_platform(&source.path).data,
+            deviceinfo::inspect_platform(&stage.path).data
+        );
+        assert_eq!(
+            deviceinfo::observe_thermal(&source.path, &deviceinfo::ThermalOptions::default()).data,
+            deviceinfo::observe_thermal(&stage.path, &deviceinfo::ThermalOptions::default()).data
+        );
     }
 
     #[test]
     fn capture_resolves_absolute_os_release_symlinks_in_the_target_root() {
         let source = minimal_machine();
         let out = TempTree::new().unwrap();
-        write_file(&source.path.join("usr/lib/os-release"), b"ID=fixture-only\n").unwrap();
+        write_file(
+            &source.path.join("usr/lib/os-release"),
+            b"ID=fixture-only\n",
+        )
+        .unwrap();
         fs::create_dir_all(source.path.join("etc")).unwrap();
-        std::os::unix::fs::symlink("/usr/lib/os-release", source.path.join("etc/os-release")).unwrap();
+        std::os::unix::fs::symlink("/usr/lib/os-release", source.path.join("etc/os-release"))
+            .unwrap();
         capture(&Source::local(&source.path), "x86_64", &[], &out.path).unwrap();
-        let report = deviceinfo::probe_environment(&out.path);
-        assert_eq!(report, deviceinfo::probe_environment(&source.path));
-        assert_eq!(report.operating_system.unwrap().id.as_deref(), Some("fixture-only"));
+        let report = deviceinfo::inspect_environment(&out.path).data;
+        assert_eq!(report, deviceinfo::inspect_environment(&source.path).data);
+        assert_eq!(
+            report.operating_system.unwrap().id.as_deref(),
+            Some("fixture-only")
+        );
     }
 
     #[test]
@@ -1615,7 +1833,7 @@ mod tests {
         }
         capture(&Source::local(&source.path), "x86_64", &[], &out.path).unwrap();
         assert_hardware_snapshot_matches(&out.path);
-        assert!(probe_with(&out.path, "x86_64").has_usable_gpu());
+        assert!(inspect_hardware(&out.path, "x86_64").data.has_usable_gpu());
     }
 
     #[test]

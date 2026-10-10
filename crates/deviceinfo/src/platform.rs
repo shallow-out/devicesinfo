@@ -80,7 +80,7 @@ pub struct PlatformReport {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-pub fn probe_platform(root: &Path) -> PlatformReport {
+pub(crate) fn probe_platform(root: &Path) -> PlatformReport {
     let mut reader = Reader::new(root);
     let supported = reader.supported("platform", "sys/firmware");
     let mut observation = |device: &str, path: &str| FirmwareObservation {

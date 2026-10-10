@@ -1,7 +1,7 @@
 //! Synthetic ABI contracts, not physical Q8B or storage-health certification.
 use deviceinfo::{
-    StorageHealthOptions, StorageHealthState, StorageInterface, decode_nvme_smart_log, probe_soc,
-    probe_storage, sample_storage_health_with,
+    StorageHealthOptions, StorageHealthState, StorageInterface, decode_nvme_smart_log, inspect_soc,
+    inspect_storage, observe_storage_health,
 };
 use std::{fs, path::PathBuf};
 
@@ -44,7 +44,7 @@ fn soc_uses_soc_evidence_and_retains_unknown_or_conflicting_vendors() {
         "radxa,dragon-q8b\0qcom,qcs8550\0",
     );
     root.write("proc/cpuinfo", "CPU implementer : 0x41\n");
-    let soc = probe_soc(&root.0);
+    let soc = inspect_soc(&root.0).data;
     assert_eq!(soc.vendor.as_deref(), Some("Qualcomm"));
     assert_eq!(soc.model.as_deref(), Some("qcs8550"));
     assert_eq!(
@@ -52,7 +52,7 @@ fn soc_uses_soc_evidence_and_retains_unknown_or_conflicting_vendors() {
         Some("/sys/firmware/devicetree/base/compatible".into())
     );
     root.write("sys/devices/soc0/family", "Rockchip\n");
-    let conflict = probe_soc(&root.0);
+    let conflict = inspect_soc(&root.0).data;
     assert_eq!(conflict.vendor, None);
     assert_eq!(conflict.vendor_source, None);
     assert_eq!(conflict.warnings.len(), 1);
@@ -61,8 +61,8 @@ fn soc_uses_soc_evidence_and_retains_unknown_or_conflicting_vendors() {
         "rockchip,unknown-board\0radxa,rock-5b\0",
     );
     fs::remove_dir_all(root.0.join("sys/devices/soc0")).unwrap();
-    assert_eq!(probe_soc(&root.0).vendor, None);
-    assert_eq!(probe_soc(&root.0).model, None);
+    assert_eq!(inspect_soc(&root.0).data.vendor, None);
+    assert_eq!(inspect_soc(&root.0).data.model, None);
 }
 
 #[test]
@@ -72,7 +72,7 @@ fn soc_bus_absolute_aliases_stay_in_fixture_root_and_do_not_duplicate() {
     root.write("sys/devices/soc0/machine", "SM8550\n");
     root.write("sys/devices/soc0/soc_id", "292\n");
     root.link("/sys/devices/soc0", "sys/bus/soc/devices/soc0");
-    let soc = probe_soc(&root.0);
+    let soc = inspect_soc(&root.0).data;
     assert_eq!(soc.devices.len(), 1);
     assert_eq!(soc.vendor.as_deref(), Some("Qualcomm"));
     assert_eq!(soc.model.as_deref(), Some("SM8550"));
@@ -94,7 +94,7 @@ fn common_sbc_soc_names_use_chip_not_board_manufacturer() {
     ] {
         let root = Root::new(model);
         root.write("sys/firmware/devicetree/base/compatible", compatible);
-        let soc = probe_soc(&root.0);
+        let soc = inspect_soc(&root.0).data;
         assert_eq!(soc.vendor.as_deref(), Some(vendor));
         assert_eq!(soc.model.as_deref(), Some(model));
     }
@@ -120,7 +120,7 @@ fn storage_links_partitions_and_mapper_mounts_by_device_number() {
     root.write("sys/class/block/dm-0/dm/name", "cryptroot");
     fs::create_dir_all(root.0.join("sys/class/block/dm-0/slaves/nvme0n1p2")).unwrap();
     root.write("proc/self/mountinfo", "1 1 253:0 / / rw shared:1 - ext4 /dev/mapper/cryptroot rw\n2 1 259:2 / /boot rw - vfat /dev/root rw\n3 1 259:2 /docs /mnt/My\\040Disk rw - ext4 /dev/root rw\n4 1 0:45 / /proc rw - proc proc rw\n");
-    let report = probe_storage(&root.0);
+    let report = inspect_storage(&root.0).data;
     assert!(report.warnings.is_empty(), "{:?}", report.warnings);
     let nvme = report.devices.iter().find(|d| d.name == "nvme0n1").unwrap();
     assert_eq!(nvme.total_bytes, Some(4096 * 512)); // size is always 512-byte sectors, not logical sectors.
@@ -147,7 +147,7 @@ fn malformed_storage_does_not_invent_capacity_or_mount_associations() {
     disk(&root, "sda", "not-a-number", &u64::MAX.to_string());
     root.write("sys/class/block/sda/removable", "maybe");
     root.write("proc/self/mountinfo", "1 1 8:0 / /mnt\\999bad rw - ext4 /dev/sda rw\n2 1 8:0 / / rw - ext4 /dev/sda rw\n2 1 8:0 / / rw - ext4 /dev/sda rw\n");
-    let report = probe_storage(&root.0);
+    let report = inspect_storage(&root.0).data;
     assert_eq!(report.devices[0].total_bytes, None);
     assert_eq!(report.devices[0].removable, None);
     assert_eq!(report.devices[0].device_number, None);
@@ -179,7 +179,7 @@ fn absolute_block_symlinks_and_scsi_subsystem_are_root_relative() {
         "proc/self/mountinfo",
         "1 1 8:1 / / rw - ext4 /dev/root rw\n",
     );
-    let report = probe_storage(&root.0);
+    let report = inspect_storage(&root.0).data;
     assert_eq!(report.devices[1].parent.as_deref(), Some("sda"));
     assert_eq!(report.devices[1].removable, Some(false));
     assert_eq!(report.devices[1].interface, StorageInterface::Scsi);
@@ -195,18 +195,18 @@ fn mmc_health_preserves_lifetime_buckets_and_unknown_data() {
     disk(&root, "mmcblk1", "179:8", "1000");
     root.write("sys/class/block/mmcblk1/device/type", "SD");
     let options = StorageHealthOptions::default();
-    let health = sample_storage_health_with(&root.0, &options);
+    let health = observe_storage_health(&root.0, &options).data;
     assert_eq!(health.mmc.len(), 1);
     assert_eq!(health.mmc[0].state, StorageHealthState::Warning);
     assert_eq!(health.mmc[0].life_time_a, Some(10));
     root.write("sys/class/block/mmcblk0/device/life_time", "0x0b 0x01");
     assert_eq!(
-        sample_storage_health_with(&root.0, &options).mmc[0].state,
+        observe_storage_health(&root.0, &options).data.mmc[0].state,
         StorageHealthState::Critical
     );
     root.write("sys/class/block/mmcblk0/device/pre_eol_info", "0x00");
     root.write("sys/class/block/mmcblk0/device/life_time", "0x00 0x00");
-    let unknown = sample_storage_health_with(&root.0, &options);
+    let unknown = observe_storage_health(&root.0, &options).data;
     assert_eq!(unknown.mmc[0].state, StorageHealthState::Unknown);
     assert!(!unknown.warnings.is_empty());
 }
@@ -243,12 +243,13 @@ fn smart_decode_preserves_u128_unknown_bits_and_temperature_units() {
 fn fixture_health_never_opens_real_nvme_controllers() {
     let root = Root::new("no-ioctl");
     fs::create_dir_all(root.0.join("sys/class/block")).unwrap();
-    let report = sample_storage_health_with(
+    let report = observe_storage_health(
         &root.0,
         &StorageHealthOptions {
             nvme_controllers: vec!["/dev/nvme0".into()],
         },
-    );
+    )
+    .data;
     assert_eq!(report.nvme[0].state, StorageHealthState::Unknown);
     assert!(report.nvme[0].smart.is_none());
     assert!(

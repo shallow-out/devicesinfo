@@ -1,8 +1,8 @@
 //! Consumer-level regression tests. Q8B-style inputs below are synthetic contracts,
 //! not captures of a physical board or evidence of its exact frequencies.
 use deviceinfo::{
-    AcceleratorKind, AcceleratorMemory, SystemSampleOptions, probe_system_with, probe_with,
-    sample_system_state_with,
+    AcceleratorKind, AcceleratorMemory, SystemSampleOptions, inspect_hardware, inspect_system,
+    observe_system,
 };
 use std::{
     fs,
@@ -76,7 +76,7 @@ fn q8b_contract(root: &Root) {
 fn q8b_style_cpu_memory_and_identity_use_only_lightweight_inputs() {
     let root = Root::new("q8b-system");
     q8b_contract(&root);
-    let report = probe_system_with(&root.0, "aarch64");
+    let report = inspect_system(&root.0, "aarch64").data;
     assert_eq!(report.cpu.arch, "aarch64");
     assert_eq!(
         report.cpu.machine_model.as_deref(),
@@ -128,7 +128,7 @@ fn q8b_style_cpu_memory_and_identity_use_only_lightweight_inputs() {
     assert_eq!(report.hostname.as_deref(), Some("q8b-fixture"));
     // No /dev, DRM, PCI or runtime library inputs exist. They must not warn.
     assert!(report.warnings.is_empty(), "{:?}", report.warnings);
-    let all = probe_with(&root.0, "aarch64");
+    let all = inspect_hardware(&root.0, "aarch64").data;
     assert_eq!(report.cpu, all.cpu);
     assert_eq!(report.memory, all.memory);
 }
@@ -138,23 +138,24 @@ fn system_sampling_observes_changes_without_rescanning_cached_identity() {
     let root = Root::new("q8b-state");
     q8b_contract(&root);
     let options = SystemSampleOptions::default();
-    let before = sample_system_state_with(&root.0, &options);
+    let before = observe_system(&root.0, &options).data;
     root.write("proc/stat", "cpu 120 20 40 430 60 2 3 4 100 10\n");
     root.write(
         "proc/meminfo",
         "MemTotal: 16000000 kB\nMemAvailable: 8000000 kB\nSwapTotal: 4000000 kB\nSwapFree: 0 kB\n",
     );
     root.write("proc/loadavg", "12.0 3.0 2.0\n");
-    let after = sample_system_state_with(&root.0, &options);
+    let after = observe_system(&root.0, &options).data;
     assert_eq!(before.memory.used_bytes(), Some(4_000_000 * 1024));
     assert_eq!(after.memory.used_bytes(), Some(8_000_000 * 1024));
     assert!(after.memory.swap_exhausted());
-    let percent = after
-        .cpu
-        .unwrap()
-        .usage_since(&before.cpu.unwrap())
-        .unwrap();
-    assert!((percent - 100.0 * 30.0 / 70.0).abs() < 1e-10);
+    // This raw injected tree has no trustworthy sampling clock. Never calculate
+    // a percentage from counters alone, even though they increased.
+    let snapshot = observe_system(&root.0, &options);
+    assert_eq!(
+        snapshot.cpu_usage_since(&snapshot),
+        Err(deviceinfo::DifferenceError::InvalidContext)
+    );
     assert_eq!(after.load_average, Some([12.0, 3.0, 2.0]));
     assert_eq!(after.uptime_seconds, Some(123.5));
     assert!(after.warnings.is_empty(), "{:?}", after.warnings);
@@ -165,7 +166,7 @@ fn unknown_inputs_and_invalid_metrics_are_explicit_and_serializable() {
     let root = Root::new("missing");
     root.write("proc/loadavg", "NaN 1 2");
     root.write("proc/uptime", "-1");
-    let state = sample_system_state_with(&root.0, &SystemSampleOptions::default());
+    let state = observe_system(&root.0, &SystemSampleOptions::default()).data;
     assert_eq!(state.memory.used_bytes(), None);
     let inconsistent_memory = deviceinfo::MemoryState {
         total_bytes: Some(100),
@@ -180,7 +181,7 @@ fn unknown_inputs_and_invalid_metrics_are_explicit_and_serializable() {
     let json = serde_json::to_value(&state).unwrap();
     assert!(json["cpu"].is_null());
     assert!(json["load_average"].is_null());
-    let report = probe_system_with(&root.0, "aarch64");
+    let report = inspect_system(&root.0, "aarch64").data;
     assert_eq!(report.operating_system, None);
     assert_eq!(report.memory.total_bytes, None);
     assert!(
@@ -192,16 +193,25 @@ fn unknown_inputs_and_invalid_metrics_are_explicit_and_serializable() {
 }
 
 #[test]
-fn watched_disks_are_host_filesystems_even_with_an_injected_proc_root() {
+fn watched_disks_never_mix_host_filesystems_with_injected_proc_data() {
     let root = Root::new("disks");
     q8b_contract(&root);
     let missing = root.0.join("absent");
-    let state = sample_system_state_with(
-        &root.0,
-        &SystemSampleOptions {
-            watch: vec![root.0.clone(), missing],
-        },
+    let options = SystemSampleOptions {
+        watch: vec![root.0.clone(), missing],
+    };
+    let injected = observe_system(&root.0, &options);
+    assert!(injected.data.disks.is_empty());
+    assert_eq!(
+        injected
+            .context
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.device.as_deref() == Some("filesystem"))
+            .count(),
+        2
     );
+    let state = observe_system(Path::new("/"), &options).data;
     assert_eq!(state.disks.len(), 1);
     assert_eq!(state.disks[0].path, root.0);
     assert!(state.disks[0].total_bytes > 0);
@@ -209,7 +219,6 @@ fn watched_disks_are_host_filesystems_even_with_an_injected_proc_root() {
         state.disks[0].used_bytes(),
         state.disks[0].total_bytes - state.disks[0].free_bytes
     );
-    assert_eq!(state.warnings.len(), 1);
     // Reserved free blocks must not be counted as already allocated space.
     let reserved_blocks = deviceinfo::DiskUsage {
         path: root.0.clone(),
@@ -244,7 +253,7 @@ fn q8b_style_adreno_compute_and_display_only_cards_remain_distinct() {
         "qcom,sc8280xp-mdss\0",
     );
     fs::create_dir_all(root.0.join(display).join("drm/card1")).unwrap();
-    let report = probe_with(&root.0, "aarch64");
+    let report = inspect_hardware(&root.0, "aarch64").data;
     assert_eq!(report.accelerators.len(), 2);
     assert_eq!(report.accelerators[0].kind, AcceleratorKind::Gpu);
     assert_eq!(

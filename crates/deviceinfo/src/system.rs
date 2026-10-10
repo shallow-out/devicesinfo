@@ -36,13 +36,8 @@ pub struct SystemReport {
     pub warnings: Vec<String>,
 }
 
-/// Inspect the local Linux-visible system, without the accelerator/runtime scan.
-pub fn probe_system(root: &Path) -> SystemReport {
-    probe_system_with(root, std::env::consts::ARCH)
-}
-
 /// As [`probe_system`], with an explicit architecture for fixtures/captured roots.
-pub fn probe_system_with(root: &Path, arch: &str) -> SystemReport {
+pub(crate) fn probe_system_with(root: &Path, arch: &str) -> SystemReport {
     let mut warnings = Vec::new();
     let cpu = crate::cpu::probe(root, arch, &mut warnings);
     let memory = crate::memory::probe(root, &mut warnings);
@@ -55,7 +50,7 @@ pub fn probe_system_with(root: &Path, arch: &str) -> SystemReport {
     }
     let kernel_release = read_text(root, "proc/sys/kernel/osrelease", &mut warnings);
     let hostname = read_text(root, "proc/sys/kernel/hostname", &mut warnings);
-    let soc = crate::probe_soc(root);
+    let soc = crate::soc::probe_soc(root);
     SystemReport {
         cpu,
         memory,
@@ -86,7 +81,7 @@ impl CpuTimes {
     /// The first sample, zero elapsed ticks, resets or decreasing counters are
     /// unknown. This is CPU utilization, not load average divided by CPU count.
     /// Linux iowait is not reliable and can decrease; that interval is unknown too.
-    pub fn usage_since(&self, previous: &Self) -> Option<f64> {
+    pub(crate) fn usage_since(&self, previous: &Self) -> Option<f64> {
         let values = |c: &Self| {
             [
                 c.user, c.nice, c.system, c.idle, c.iowait, c.irq, c.softirq, c.steal,
@@ -109,9 +104,7 @@ impl CpuTimes {
     }
 }
 
-/// Disk paths are real host paths, even when a fixture root is injected.
-/// This matches [`crate::SampleOptions::watch`]; `statvfs` never queries a
-/// fixture's filesystem as if it were the captured machine's disk.
+/// Filesystems to observe on a native root. Injected roots reject host filesystem reads.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SystemSampleOptions {
     pub watch: Vec<PathBuf>,
@@ -128,12 +121,8 @@ pub struct SystemState {
     pub warnings: Vec<String>,
 }
 
-pub fn sample_system_state(options: &SystemSampleOptions) -> SystemState {
-    sample_system_state_with(Path::new("/"), options)
-}
-
-/// Inject `/proc` for deterministic testing; watched disks still belong to the host.
-pub fn sample_system_state_with(root: &Path, options: &SystemSampleOptions) -> SystemState {
+/// Internal parser; the public API disables watched disks for injected roots.
+pub(crate) fn sample_system_state_with(root: &Path, options: &SystemSampleOptions) -> SystemState {
     let mut warnings = Vec::new();
     let memory = crate::state::sample_memory(root, &mut warnings);
     let cpu = read_parsed(root, "proc/stat", parse_cpu_times, &mut warnings);

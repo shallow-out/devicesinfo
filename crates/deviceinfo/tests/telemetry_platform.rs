@@ -1,7 +1,7 @@
 //! Synthetic consumer contracts, not captures of a physical Q8B or fan wiring.
 use deviceinfo::{
     Diagnostic, DiagnosticCode, DiagnosticOperation, Exposure, TemperatureUnit, ThermalOptions,
-    probe_platform, sample_thermal, sample_thermal_with,
+    inspect_platform, observe_thermal,
 };
 use std::{
     fs, io,
@@ -52,7 +52,7 @@ fn q8b_contract_allows_uefi_and_dt_and_independent_acpi_observation() {
         "sys/firmware/devicetree/base/compatible",
         "radxa,dragon-q8b\0qcom,qcs6490\0",
     );
-    let report = probe_platform(&root.0);
+    let report = inspect_platform(&root.0).data;
     assert_eq!(report.uefi.exposure, Exposure::Exposed);
     assert_eq!(report.device_tree.exposure, Exposure::Exposed);
     assert_eq!(report.acpi.exposure, Exposure::NotExposed);
@@ -64,7 +64,10 @@ fn q8b_contract_allows_uefi_and_dt_and_independent_acpi_observation() {
         Path::new("/sys/firmware/devicetree/base/model")
     );
     root.dir("sys/firmware/acpi/tables");
-    assert_eq!(probe_platform(&root.0).acpi.exposure, Exposure::Exposed);
+    assert_eq!(
+        inspect_platform(&root.0).data.acpi.exposure,
+        Exposure::Exposed
+    );
 }
 
 #[test]
@@ -75,7 +78,7 @@ fn dmi_versions_and_dt_model_are_evidence_not_an_arbitrary_winner() {
     root.write("sys/class/dmi/id/bios_version", "Firmware 2026.10\n");
     root.write("sys/firmware/devicetree/base/model", "DT board\0");
     root.write("sys/firmware/devicetree/base/compatible", "vendor,board\0");
-    let report = probe_platform(&root.0);
+    let report = inspect_platform(&root.0).data;
     assert_eq!(report.dmi.product_name.unwrap().value, "Different DMI name");
     assert_eq!(report.device_tree_model.unwrap().value, "DT board");
     assert_eq!(report.dmi.board_version.unwrap().value, "Board Rev 2");
@@ -90,7 +93,7 @@ fn malformed_firmware_attributes_remain_unknown_with_path_and_code() {
     root.write("sys/firmware/devicetree/base/model", "Not NUL terminated");
     root.bytes("sys/firmware/devicetree/base/compatible", &[255, 0]);
     root.write("sys/firmware/acpi/tables", "not a directory");
-    let report = probe_platform(&root.0);
+    let report = inspect_platform(&root.0).data;
     assert_eq!(report.uefi.exposure, Exposure::Exposed);
     assert_eq!(report.uefi_platform_bits, None);
     assert_eq!(report.acpi.exposure, Exposure::Unknown);
@@ -200,7 +203,7 @@ fn temperatures_preserve_negative_values_and_trip_semantics() {
     root.write("sys/class/hwmon/hwmon0/temp1_label", "Ambient\n");
     root.write("sys/class/hwmon/hwmon0/temp1_crit", "100000\n");
     root.write("sys/class/hwmon/hwmon0/temp1_crit_alarm", "1\n");
-    let report = sample_thermal(&root.0);
+    let report = observe_thermal(&root.0, &deviceinfo::ThermalOptions::default()).data;
     assert_eq!(report.temperatures.len(), 2);
     assert_eq!(report.temperatures[0].temperature_millicelsius, Some(-1250));
     assert_eq!(report.temperatures[0].thresholds[0].kind, "critical");
@@ -237,7 +240,7 @@ fn measured_rpm_pwm_target_and_cooling_state_are_never_substituted() {
     root.write("sys/class/thermal/cooling_device0/type", "pwm-fan\n");
     root.write("sys/class/thermal/cooling_device0/cur_state", "2\n");
     root.write("sys/class/thermal/cooling_device0/max_state", "5\n");
-    let report = sample_thermal(&root.0);
+    let report = observe_thermal(&root.0, &deviceinfo::ThermalOptions::default()).data;
     assert_eq!(report.fans[0].rpm, Some(0));
     assert_eq!(report.fans[0].target_rpm, Some(3000));
     assert_eq!(report.pwm[0].value_0_255, Some(128));
@@ -245,7 +248,7 @@ fn measured_rpm_pwm_target_and_cooling_state_are_never_substituted() {
     assert_eq!(report.pwm[0].frequency_hz, Some(25000));
     assert_eq!(report.cooling_devices[0].current_state, Some(2));
     fs::remove_file(root.0.join("sys/class/hwmon/hwmon0/fan1_input")).unwrap();
-    let report = sample_thermal(&root.0);
+    let report = observe_thermal(&root.0, &deviceinfo::ThermalOptions::default()).data;
     assert_eq!(report.fans[0].rpm, None);
     assert!(
         report
@@ -269,7 +272,7 @@ fn corrupt_inputs_and_invalid_states_are_not_zero_or_normal() {
     root.write("sys/class/thermal/cooling_device1/type", "Processor");
     root.write("sys/class/thermal/cooling_device1/cur_state", "6");
     root.write("sys/class/thermal/cooling_device1/max_state", "5");
-    let report = sample_thermal(&root.0);
+    let report = observe_thermal(&root.0, &deviceinfo::ThermalOptions::default()).data;
     assert_eq!(report.temperatures[0].temperature_millicelsius, None);
     assert_eq!(report.fans[0].rpm, None);
     assert_eq!(report.pwm[0].value_0_255, None);
@@ -291,7 +294,7 @@ fn firmware_absolute_zero_sentinel_is_not_a_usable_temperature() {
     root.write("sys/class/thermal/thermal_zone0/temp", "-273200");
     root.write("sys/class/hwmon/hwmon0/name", "acpitz");
     root.write("sys/class/hwmon/hwmon0/temp1_input", "-273200");
-    let report = sample_thermal(&root.0);
+    let report = observe_thermal(&root.0, &deviceinfo::ThermalOptions::default()).data;
     for sensor in report.temperatures {
         assert_eq!(sensor.raw_input, Some(-273200));
         assert_eq!(sensor.temperature_millicelsius, None);
@@ -315,14 +318,14 @@ fn faults_and_disabled_inputs_keep_raw_evidence_but_no_usable_measurement() {
     root.write("sys/class/hwmon/hwmon0/temp1_fault", "1");
     root.write("sys/class/hwmon/hwmon0/fan1_input", "2100");
     root.write("sys/class/hwmon/hwmon0/fan1_enable", "0");
-    let report = sample_thermal(&root.0);
+    let report = observe_thermal(&root.0, &deviceinfo::ThermalOptions::default()).data;
     assert_eq!(report.temperatures[0].temperature_millicelsius, None);
     assert_eq!(report.temperatures[0].raw_input, Some(30000));
     assert_eq!(report.fans[0].rpm, None);
     assert_eq!(report.fans[0].raw_rpm, Some(2100));
     root.write("sys/class/hwmon/hwmon0/temp1_fault", "2");
     root.write("sys/class/hwmon/hwmon0/fan1_enable", "2");
-    let report = sample_thermal(&root.0);
+    let report = observe_thermal(&root.0, &deviceinfo::ThermalOptions::default()).data;
     assert_eq!(report.temperatures[0].temperature_millicelsius, None);
     assert_eq!(report.fans[0].rpm, None);
     assert_eq!(
@@ -341,7 +344,7 @@ fn thermistor_voltage_cannot_be_fabricated_as_a_celsius_temperature() {
     root.write("sys/class/hwmon/hwmon0/name", "adc");
     root.write("sys/class/hwmon/hwmon0/temp1_input", "1250");
     root.write("sys/class/hwmon/hwmon0/temp1_type", "4");
-    let report = sample_thermal(&root.0);
+    let report = observe_thermal(&root.0, &deviceinfo::ThermalOptions::default()).data;
     assert_eq!(report.temperatures[0].unit, TemperatureUnit::Unknown);
     assert_eq!(report.temperatures[0].temperature_millicelsius, None);
     let mut options = ThermalOptions::default();
@@ -349,7 +352,7 @@ fn thermistor_voltage_cannot_be_fabricated_as_a_celsius_temperature() {
         "/sys/class/hwmon/hwmon0/temp1_input".into(),
         TemperatureUnit::Millivolt,
     );
-    let report = sample_thermal_with(&root.0, &options);
+    let report = observe_thermal(&root.0, &options).data;
     assert_eq!(report.temperatures[0].raw_input, Some(1250));
     assert_eq!(report.temperatures[0].unit, TemperatureUnit::Millivolt);
     assert_eq!(report.temperatures[0].temperature_millicelsius, None);
@@ -361,7 +364,7 @@ fn thermistor_voltage_cannot_be_fabricated_as_a_celsius_temperature() {
     );
     for code in ["bad", "99"] {
         root.write("sys/class/hwmon/hwmon0/temp1_type", code);
-        let report = sample_thermal(&root.0);
+        let report = observe_thermal(&root.0, &deviceinfo::ThermalOptions::default()).data;
         assert_eq!(report.temperatures[0].unit, TemperatureUnit::Unknown);
         assert_eq!(report.temperatures[0].temperature_millicelsius, None);
         assert!(
@@ -387,7 +390,10 @@ fn absolute_sysfs_alias_is_resolved_inside_the_injected_root() {
     )
     .unwrap();
     assert_eq!(
-        sample_thermal(&root.0).temperatures[0].temperature_millicelsius,
+        observe_thermal(&root.0, &deviceinfo::ThermalOptions::default())
+            .data
+            .temperatures[0]
+            .temperature_millicelsius,
         Some(42500)
     );
 }
@@ -395,10 +401,10 @@ fn absolute_sysfs_alias_is_resolved_inside_the_injected_root() {
 #[cfg(not(target_os = "linux"))]
 #[test]
 fn non_linux_host_reports_unsupported_without_assuming_boot_mode() {
-    let report = probe_platform(Path::new("/"));
+    let report = inspect_platform(Path::new("/")).data;
     assert_eq!(report.uefi.exposure, Exposure::Unknown);
     assert_eq!(report.diagnostics[0].code, DiagnosticCode::Unsupported);
-    let report = sample_thermal(Path::new("/"));
+    let report = observe_thermal(Path::new("/"), &deviceinfo::ThermalOptions::default()).data;
     assert!(report.temperatures.is_empty());
     assert_eq!(report.diagnostics[0].code, DiagnosticCode::Unsupported);
 }

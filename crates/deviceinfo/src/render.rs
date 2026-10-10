@@ -553,6 +553,7 @@ mod tests {
             },
             accelerators: vec![
                 crate::Accelerator {
+                    source: "/sys/class/drm/card0".into(),
                     kind: AcceleratorKind::Gpu,
                     name: "NVIDIA GA102 [GeForce RTX 3090]".into(),
                     device_path: Some("/dev/dri/renderD128".into()),
@@ -577,6 +578,7 @@ mod tests {
                     notes: Vec::new(),
                 },
                 crate::Accelerator {
+                    source: "/sys/class/accel/accel0".into(),
                     kind: AcceleratorKind::Npu,
                     name: "Intel Core Ultra 200V Series Processors NPU".into(),
                     device_path: Some("/dev/accel/accel0".into()),
@@ -679,6 +681,7 @@ mod tests {
             disks: Vec::new(),
             accelerators: vec![
                 crate::AcceleratorState {
+                    source: "/sys/class/accel/accel0".into(),
                     kind: AcceleratorKind::Npu,
                     node: "accel0".into(),
                     pci_id: Some(PciId {
@@ -691,6 +694,7 @@ mod tests {
                     busy_time_us: Some(88_694_865),
                 },
                 crate::AcceleratorState {
+                    source: "/sys/class/drm/card0".into(),
                     kind: AcceleratorKind::Gpu,
                     node: "card0".into(),
                     pci_id: None,

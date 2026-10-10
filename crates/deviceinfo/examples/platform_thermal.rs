@@ -8,8 +8,8 @@ fn main() {
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
-            "platform": deviceinfo::probe_platform(&root),
-            "thermal": deviceinfo::sample_thermal(&root),
+            "platform": deviceinfo::inspect_platform(&root),
+            "thermal": deviceinfo::observe_thermal(&root, &deviceinfo::ThermalOptions::default()),
         }))
         .unwrap()
     );

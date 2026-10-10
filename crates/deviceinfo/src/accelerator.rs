@@ -386,6 +386,7 @@ pub(crate) fn probe_npus(
         let driver_version = driver_version_of(root, driver.as_deref());
 
         let mut accel = Accelerator {
+            source: Path::new("/sys/class/accel").join(&node),
             kind: AcceleratorKind::Npu,
             name,
             device_path: Some(node_path),
@@ -504,6 +505,7 @@ pub(crate) fn probe_gpus(
         }
 
         found.push(Accelerator {
+            source: Path::new("/sys/class/drm").join(&node),
             kind,
             name,
             device_path,

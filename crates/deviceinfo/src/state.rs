@@ -1,6 +1,6 @@
 //! 运行时状态采样。
 //!
-//! # 为什么和 [`crate::probe`] 分开
+//! # 为什么和 [`crate::inspect_hardware`] 分开
 //!
 //! 两者的**生命周期完全不同**：
 //!
@@ -109,6 +109,8 @@ pub struct SampleOptions {
 /// 与 [`crate::Accelerator`] 的分工：那边是"这设备是什么"，这里是"它现在在什么状态"。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AcceleratorState {
+    /// Same kernel class path as Accelerator.source and snapshot.devices.source.
+    pub source: PathBuf,
     pub kind: AcceleratorKind,
     /// 设备在 sysfs 里的名字：`accel0` / `card1`。
     ///
@@ -117,10 +119,8 @@ pub struct AcceleratorState {
     /// 才能区分——而"按位置对应"正是本模块在别处刻意避开的做法（见 `renderD` 的归属）。
     /// 这个名字是**每个设备唯一**的，而且人也能在 sysfs 里对上。
     pub node: String,
-    /// 与硬件报告里同一台设备的连接键。
-    ///
-    /// 用 PCI 标识而不是下标：列表顺序不是契约，而 `8086:643e` 是。
-    /// 没有 PCI 的加速器（ARM 上的 NPU 之类）这里是 `None`，只能靠 [`Self::kind`] 对应。
+    /// PCI vendor/product describes the model. Use source + snapshot device
+    /// association to match an instance; identical cards can share this ID.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pci_id: Option<crate::report::PciId>,
     /// 当前频率（MHz）。
@@ -194,8 +194,7 @@ pub(crate) fn sample(root: &Path, options: &SampleOptions) -> RuntimeState {
 ///
 /// 这份发现逻辑和 [`crate::accelerator`] 里的是两份实现（那边需要更多上下文，
 /// 拆出来反而难读），靠 `state_and_hardware_agree_on_which_devices_exist`
-/// 这个测试保证两边不会走偏——**包括顺序**：两边都按设备名排序，
-/// 所以第 N 个状态对应第 N 个设备。
+/// 这个测试按 source 检验两边描述同一批设备，不能把列表下标当关联键。
 fn accelerator_devices(root: &Path) -> Vec<(AcceleratorKind, String, PathBuf, PathBuf)> {
     // 顺序必须由名字决定，不能由目录项顺序决定：否则状态列表和硬件列表对不上，
     // 而两份都声称自己在描述同一批设备
@@ -266,6 +265,7 @@ fn sample_accelerators(
             ));
         }
         let mut state = AcceleratorState {
+            source: Path::new("/").join(node_dir.strip_prefix(root).expect("device enumeration stays within root")),
             kind,
             node,
             pci_id: crate::accelerator::read_pci_id(&device_dir),

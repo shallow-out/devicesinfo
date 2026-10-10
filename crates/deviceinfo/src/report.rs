@@ -116,6 +116,9 @@ impl RuntimeStatus {
 /// 设备信息会以同样的形状合并进报告，所以字段要能表达"不完整"（见 `notes`）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Accelerator {
+    /// Kernel class path used to join inventory, telemetry and snapshot.devices.
+    /// PCI vendor:product identifies a model, never a particular device instance.
+    pub source: PathBuf,
     pub kind: AcceleratorKind,
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]

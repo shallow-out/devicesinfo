@@ -23,7 +23,8 @@
         "stack": "Level Zero / OpenCL",
         "state": "incomplete"
       },
-      "vendor": "Intel"
+      "vendor": "Intel",
+      "source": "/sys/class/drm/card1"
     }
   ],
   "cpu": {
