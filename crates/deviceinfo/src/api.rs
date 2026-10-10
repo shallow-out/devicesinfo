@@ -257,19 +257,66 @@ pub fn observe_storage_health(
         },
     )
 }
-/// Explicit command/network checks; the runner must operate in the given root's source environment.
+/// Explicit command/network checks, bracketed by fresh source-side clock observations.
+///
+/// `run` and `read_stamp` must operate on the same target. `read_stamp` is called
+/// before and after all checks and must query the target anew, never replay capture
+/// metadata or substitute the collector's clock for a remote target's clock.
+/// A failed clock read leaves that boundary unknown and `consistent = false`;
+/// checks still run and their results are retained.
+///
+/// ```no_run
+/// use deviceinfo::{LiveOptions, LiveReport, SampleContext, Snapshot, check_environment, inspect_environment};
+/// use std::path::Path;
+/// fn check_local(run: deviceinfo::live::Runner<'_>) -> Snapshot<LiveReport> {
+///     let environment = inspect_environment(Path::new("/"));
+///     check_environment(
+///         &environment.data,
+///         &LiveOptions::default(),
+///         run,
+///         &|| Ok(SampleContext::read(Path::new("/")).started),
+///     )
+/// }
+/// ```
 pub fn check_environment(
-    root: &Path,
     environment: &EnvironmentReport,
     options: &LiveOptions,
     run: crate::live::Runner<'_>,
+    read_stamp: &dyn Fn() -> std::io::Result<SampleStamp>,
 ) -> Snapshot<LiveReport> {
-    collect(
-        root,
-        &[],
-        || crate::live::probe(environment, options, run),
-        |_| Vec::new(),
-    )
+    let before = read_stamp();
+    let data = crate::live::probe(environment, options, run);
+    let after = read_stamp();
+    let origin = if before.is_ok() && after.is_ok() {
+        ObservationOrigin::Live
+    } else {
+        ObservationOrigin::Unattributed
+    };
+    let mut diagnostics = Vec::new();
+    let mut boundary = |result: std::io::Result<SampleStamp>, name: &str| match result {
+        Ok(stamp) => stamp,
+        Err(error) => {
+            let mut diagnostic = Diagnostic::from_io(
+                Some("sample_context"),
+                Path::new("/proc"),
+                DiagnosticOperation::Read,
+                &error,
+            );
+            diagnostic.message = format!("{name}: {}", diagnostic.message);
+            diagnostics.push(diagnostic);
+            SampleStamp::default()
+        }
+    };
+    let started = boundary(before, "live check start");
+    let finished = boundary(after, "live check finish");
+    let mut context = SampleContext::from_bounds(origin, started, finished);
+    context.diagnostics = diagnostics;
+    Snapshot {
+        schema_version: SCHEMA_VERSION,
+        context,
+        devices: Vec::new(),
+        data,
+    }
 }
 
 /// Inventory of kernel device links for collectors. No metric or command is read.

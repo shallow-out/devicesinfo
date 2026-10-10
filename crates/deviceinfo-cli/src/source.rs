@@ -66,7 +66,7 @@ pub(crate) struct RemoteSource {
 }
 
 impl Source {
-    /// Fresh source-side clock/boot observations, deliberately bypassing prefetch.
+    /// Source-side capture bounds; a local mirror retains its frozen window.
     pub(crate) fn stamp(&self, started: bool) -> io::Result<deviceinfo::SampleStamp> {
         match self {
             Self::Local(root) => {
@@ -77,6 +77,20 @@ impl Source {
                     context.finished
                 })
             }
+            Self::Remote(remote) => parse_stamp(&remote.run_with_stdin(REMOTE_STAMP_SCRIPT, &[])?),
+        }
+    }
+
+    /// Clock/boot observations for newly executed checks, never capture replay.
+    pub(crate) fn fresh_stamp(&self) -> io::Result<deviceinfo::SampleStamp> {
+        match self {
+            Self::Local(root) if root == Path::new("/") => {
+                Ok(deviceinfo::SampleContext::read(root).started)
+            }
+            Self::Local(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "An injected root cannot supply fresh target clock/boot observations",
+            )),
             Self::Remote(remote) => parse_stamp(&remote.run_with_stdin(REMOTE_STAMP_SCRIPT, &[])?),
         }
     }
@@ -629,6 +643,47 @@ fn parse_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_clock_never_replays_a_local_mirrors_frozen_context() {
+        let root =
+            std::env::temp_dir().join(format!("deviceinfo-live-source-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("proc/sys/kernel/random")).unwrap();
+        let boot = "01234567-89ab-cdef-0123-456789abcdef";
+        std::fs::write(root.join(deviceinfo::BOOT_ID_INPUT), boot).unwrap();
+        let stamp = deviceinfo::SampleStamp {
+            boot_time_ns: Some(123_450_000_000),
+            boot_clock_resolution_ns: Some(10_000_000),
+            boot_id: Some(boot.into()),
+            time_namespace: Some("time:[42]".into()),
+            mount_namespace: Some("mnt:[43]".into()),
+            ..Default::default()
+        };
+        let metadata = deviceinfo::CaptureMetadata {
+            schema_version: deviceinfo::SCHEMA_VERSION,
+            context: deviceinfo::SampleContext::from_bounds(
+                deviceinfo::ObservationOrigin::Captured,
+                stamp.clone(),
+                stamp.clone(),
+            ),
+            counters_preserved: true,
+            devices: Vec::new(),
+        };
+        std::fs::write(
+            root.join(deviceinfo::CONTEXT_FILE),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+        let source = Source::local(&root);
+        assert!(deviceinfo::SampleContext::read(&root).consistent);
+        assert_eq!(source.stamp(true).unwrap(), stamp);
+        assert_eq!(source.stamp(false).unwrap(), stamp);
+        assert_eq!(
+            source.fresh_stamp().unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn parses_a_batch_response_with_binary_content() {

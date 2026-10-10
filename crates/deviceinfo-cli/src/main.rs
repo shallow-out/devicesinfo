@@ -217,10 +217,10 @@ fn main() {
                 timeout: options.timeout,
             };
             let report = deviceinfo::check_environment(
-                &runner.root,
                 &environment.data,
                 &options,
                 &|program, args| runner.run(program, args),
+                &|| source.fresh_stamp(),
             );
             if cli.json {
                 print_json(&report);

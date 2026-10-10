@@ -17,7 +17,7 @@
 | `observe_thermal(root, options)` | `ThermalReport` | 温度、RPM、PWM、散热状态，按需只读 |
 | `observe_storage_health(root, options)` | `StorageHealthReport` | MMC sysfs；NVMe ioctl 需显式启用 |
 | `observe_mmc_health(root, path)` | `MmcHealthObservation` | 显式读取原生 MMC EXT_CSD；注入目录禁止打开设备 |
-| `check_environment(root, environment, options, runner)` | `LiveReport` | 显式运行命令/网络检查，runner 必须属于给定来源 |
+| `check_environment(environment, options, runner, read_stamp)` | `LiveReport` | 显式运行命令/网络检查，命令与时间回调必须属于同一目标 |
 
 输入清单、数据类型、纯字节解码器和文本渲染函数仍可复用。底层裸 IO 探测函数不是公开 API。
 读取载荷要使用 `.data`；保存、传输和缓存必须保留**完整** `Snapshot`。
@@ -58,6 +58,14 @@
 `delta` 保留计数器原单位，`per_second()` 转为每秒。较长采样窗口会增加速率估计的不确定性。
 
 ## SSH 与夹具
+
+`check_environment` 在执行全部检查前后各调用一次 `read_stamp`，获取目标当时的
+`SampleStamp`；回调签名为 `Fn() -> io::Result<SampleStamp>`。
+回调必须重新读取目标时间、启动身份与 namespace，不能返回镜像的冻结窗口。
+它的上下文独立于用于选择检查项的环境库存。SSH CLI 在两侧重新查询目标机，绕过文件缓存。
+回调失败时保留检查结果，失败边界全部为 null，`origin = unattributed`、`consistent = false`，
+并附结构化诊断；启动身份缺失、重启或 namespace 改变也不能声明一致。
+本地 `live --root <镜像>` 无法获取来源的即时时钟，按未知处理，不使用镜像或采集机时间。
 
 新采集会冻结 `deviceinfo-context.json` (`CaptureMetadata`) 和来源 `boot_id`。
 SSH 的时钟、namespace、canonical sysfs 路径和 inode 全部在目标机读取，并在采集前后复核。
