@@ -475,12 +475,16 @@ struct TempTree {
 
 impl TempTree {
     fn new() -> io::Result<Self> {
+        // macOS clock resolution can give concurrent captures the same timestamp.
+        // Keep per-process trees distinct so one capture cannot overwrite another.
+        static NEXT_TREE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = NEXT_TREE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|taken| taken.as_nanos())
             .unwrap_or_default();
         let path = std::env::temp_dir().join(format!(
-            "deviceinfo-mirror-{}-{stamp}",
+            "deviceinfo-mirror-{}-{stamp}-{sequence}",
             std::process::id()
         ));
         fs::create_dir_all(&path)?;
