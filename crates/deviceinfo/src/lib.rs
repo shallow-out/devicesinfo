@@ -53,6 +53,7 @@ pub mod environment;
 mod features;
 pub mod live;
 mod memory;
+pub mod mmc_health;
 mod os;
 mod report;
 mod runtime;
@@ -77,6 +78,7 @@ pub use live::{LiveOptions, LiveReport};
 pub use runtime::{LIBRARY_DIRS, OPENCL_VENDOR_DIR, library_inputs as runtime_library_inputs};
 pub use state::{AcceleratorState, DiskUsage, MemoryState, RuntimeState, SampleOptions};
 pub use sysfs::resolve_path_in_root;
+pub use mmc_health::{MmcExtCsdHealth, decode_mmc_ext_csd, read_mmc_health};
 pub use soc::{SocDevice, SocReport, probe_soc};
 pub use storage::{BlockDevice, StorageInterface, StorageMount, StorageReport, probe_storage};
 pub use storage_health::{

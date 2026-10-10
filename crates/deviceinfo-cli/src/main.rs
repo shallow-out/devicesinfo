@@ -1454,6 +1454,7 @@ mod tests {
             ("sys/class/block/mmcblk0/size", "4000\n"),
             ("sys/class/block/mmcblk0/removable", "0\n"),
             ("sys/class/block/mmcblk0/device/type", "MMC\n"),
+            ("sys/class/block/mmcblk0/device/rev", "0x06\n"),
             ("sys/class/block/mmcblk0/device/pre_eol_info", "0x02\n"),
             ("sys/class/block/mmcblk0/device/life_time", "0x0a 0x01\n"),
             ("sys/class/block/mmcblk0/mmcblk0p1/partition", "1\n"),
@@ -1481,6 +1482,10 @@ mod tests {
             deviceinfo::probe_storage(&out.path)
         );
         let options = deviceinfo::StorageHealthOptions::default();
+        assert_eq!(
+            deviceinfo::sample_storage_health_with(&out.path, &options).mmc[0].state,
+            deviceinfo::StorageHealthState::Unknown
+        );
         assert_eq!(
             deviceinfo::sample_storage_health_with(&source.path, &options),
             deviceinfo::sample_storage_health_with(&out.path, &options)

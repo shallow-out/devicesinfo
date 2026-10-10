@@ -65,6 +65,7 @@ pub struct NvmeHealth {
 #[serde(rename_all = "snake_case")]
 pub enum StorageHealthErrorKind {
     PermissionDenied,
+    InvalidData,
     Io,
     NvmeStatus,
     Unsupported,
@@ -81,14 +82,7 @@ pub struct StorageHealthError {
 impl From<NvmeHealthError> for StorageHealthError {
     fn from(error: NvmeHealthError) -> Self {
         let (kind, code) = match &error {
-            NvmeHealthError::Io(error) => (
-                if error.kind() == io::ErrorKind::PermissionDenied {
-                    StorageHealthErrorKind::PermissionDenied
-                } else {
-                    StorageHealthErrorKind::Io
-                },
-                error.raw_os_error(),
-            ),
+            NvmeHealthError::Io(error) => return error.into(),
             NvmeHealthError::CompletionStatus(code) => {
                 (StorageHealthErrorKind::NvmeStatus, Some(*code))
             }
@@ -99,6 +93,30 @@ impl From<NvmeHealthError> for StorageHealthError {
             code,
             message: error.to_string(),
         }
+    }
+}
+
+impl From<&io::Error> for StorageHealthError {
+    fn from(error: &io::Error) -> Self {
+        let kind = match error.kind() {
+            io::ErrorKind::PermissionDenied => StorageHealthErrorKind::PermissionDenied,
+            io::ErrorKind::InvalidData | io::ErrorKind::InvalidInput => {
+                StorageHealthErrorKind::InvalidData
+            }
+            io::ErrorKind::Unsupported => StorageHealthErrorKind::Unsupported,
+            _ => StorageHealthErrorKind::Io,
+        };
+        Self {
+            kind,
+            code: error.raw_os_error(),
+            message: error.to_string(),
+        }
+    }
+}
+
+impl From<io::Error> for StorageHealthError {
+    fn from(error: io::Error) -> Self {
+        (&error).into()
     }
 }
 
@@ -151,6 +169,27 @@ pub fn sample_storage_health_with(
                 {
                     continue;
                 }
+                let warning_start = report.warnings.len();
+                let revision = read(root, &format!("{base}/device/rev"));
+                let revision_code = revision.as_deref().and_then(parse_hex);
+                if revision_code.is_some_and(|rev| rev < 7) {
+                    report.warnings.push(format!(
+                        "MMC health unsupported for {name}: EXT_CSD revision below 7"
+                    ));
+                    report.mmc.push(MmcHealth {
+                        device: name,
+                        pre_eol_info: None,
+                        life_time_a: None,
+                        life_time_b: None,
+                        state: StorageHealthState::Unknown,
+                    });
+                    continue;
+                }
+                if revision.is_some() && revision_code.is_none() {
+                    report
+                        .warnings
+                        .push(format!("Invalid MMC revision for {name}"));
+                }
                 let pre_eol_info = read_code(
                     root,
                     &format!("{base}/{}", MMC_INPUTS[0]),
@@ -158,33 +197,9 @@ pub fn sample_storage_health_with(
                     &mut report.warnings,
                 );
                 let values = read(root, &format!("{base}/{}", MMC_INPUTS[1]));
-                let parsed = values
-                    .as_deref()
-                    .and_then(|text| {
-                        let parts: Vec<_> = text.split_whitespace().collect();
-                        if parts.len() != 2 {
-                            return None;
-                        }
-                        Some((parse_hex(parts[0])?, parse_hex(parts[1])?))
-                    })
-                    .filter(|(a, b)| *a <= 11 && *b <= 11);
-                if values.is_some() && parsed.is_none() {
-                    report
-                        .warnings
-                        .push(format!("Invalid MMC lifetime for {name}"));
-                }
-                let (a, b) = parsed
-                    .map(|(a, b)| ((a != 0).then_some(a), (b != 0).then_some(b)))
-                    .unwrap_or_default();
-                let state = if pre_eol_info == Some(3) || a == Some(11) || b == Some(11) {
-                    StorageHealthState::Critical
-                } else if pre_eol_info == Some(2) || a == Some(10) || b == Some(10) {
-                    StorageHealthState::Warning
-                } else if pre_eol_info == Some(1) || a.is_some() || b.is_some() {
-                    StorageHealthState::Normal
-                } else {
-                    StorageHealthState::Unknown
-                };
+                let (a, b) = parse_lifetime(values.as_deref(), &name, &mut report.warnings);
+                let invalid = report.warnings.len() != warning_start;
+                let state = mmc_state(pre_eol_info, a, b, invalid);
                 if state == StorageHealthState::Unknown {
                     report
                         .warnings
@@ -245,6 +260,48 @@ fn parse_hex(text: &str) -> Option<u8> {
         16,
     )
     .ok()
+}
+
+fn parse_lifetime(
+    text: Option<&str>,
+    device: &str,
+    warnings: &mut Vec<String>,
+) -> (Option<u8>, Option<u8>) {
+    let Some(text) = text else {
+        return (None, None);
+    };
+    let parts: Vec<_> = text.split_whitespace().collect();
+    if parts.len() != 2 {
+        warnings.push(format!(
+            "Invalid MMC lifetime for {device}: expected two values"
+        ));
+        return (None, None);
+    }
+    let mut code = |text: &str, label| {
+        let code = parse_hex(text).filter(|v| *v <= 11);
+        if code.is_none() {
+            warnings.push(format!("Invalid MMC lifetime {label} for {device}"));
+        }
+        code.filter(|v| *v != 0)
+    };
+    (code(parts[0], "A"), code(parts[1], "B"))
+}
+
+pub(crate) fn mmc_state(
+    pre: Option<u8>,
+    a: Option<u8>,
+    b: Option<u8>,
+    invalid: bool,
+) -> StorageHealthState {
+    if pre == Some(3) || a == Some(11) || b == Some(11) {
+        StorageHealthState::Critical
+    } else if pre == Some(2) || a == Some(10) || b == Some(10) {
+        StorageHealthState::Warning
+    } else if !invalid && (pre == Some(1) || a.is_some() || b.is_some()) {
+        StorageHealthState::Normal
+    } else {
+        StorageHealthState::Unknown
+    }
 }
 
 pub fn decode_nvme_smart_log(bytes: &[u8]) -> io::Result<NvmeSmartLog> {

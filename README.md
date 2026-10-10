@@ -207,15 +207,19 @@ let smart = sample_storage_health(&StorageHealthOptions {
 
 显式健康读取示例：`cargo run -p deviceinfo --example storage_health -- /dev/nvme0`。不传参数时仅查询 MMC sysfs。
 
+eMMC 的内核没有暴露 `life_time/pre_eol_info` 时，调用方可显式使用 `read_mmc_health(Path::new("/dev/mmcblk0"))`，或运行 `cargo run -p deviceinfo --example mmc_health -- /dev/mmcblk0`。接口验证块设备身份后读取 CMD8 EXT_CSD，不写入、不执行命令、不自动提权；默认采样和 capture 都不会调用它。SD/SDIO、分区、boot/RPMB 节点会被拒绝，别名按打开后的设备号验证。MMC 数据传输超时配置为 2 秒、命令超时配置为 5 秒，由内核驱动处理；这不是用户态硬中断计时器。
+
 - SoC 从根设备树 `compatible` 和内核 SoC bus 的 `family/machine/soc_id/revision` 获取，保留原始属性及识别来源。只匹配 SoC 标识，不把板卡厂商或 ARM CPU implementer 当成芯片厂商；冲突或未识别时为 `None`。未知 JEP106 编码保留原文，不猜厂商。
 - `probe_storage` 读取块设备、分区父盘、dm/LVM/RAID 的 backing devices、型号、容量、扇区大小及可移除/只读/旋转属性；按 major:minor 关联挂载，正确处理 `/dev/root`、mapper 别名、bind mount 和转义空格。保留网络及伪文件系统挂载，不把它们伪装成物理磁盘。接口无法证实时为 `unknown`，SCSI 不等于 SATA 或 USB。
 - 块设备 `size` 按固定 512 字节单位换算，和逻辑扇区大小独立。容量、父盘和属性读不到时保持未知。盘、分区、逻辑卷、bind mount 是同一存储的不同视图，不能直接累加容量。
 - 文件系统已用/可用空间继续由 `sample_system_state` 的显式 `watch` 路径查询 `statvfs`。挂载属于当前进程的 namespace，拓扑在热插拔、分区或挂载变化后应刷新。
 - eMMC 健康保留 PRE_EOL 和寿命分档原始编码，不把 10% 桶当成精确剩余寿命。NVMe 使用只读 Get Log Page ioctl、5 秒命令超时；保留 critical warning 原始位和 128 位计数（十进制 JSON 字符串）。温度单位是 Kelvin。观测指标正常不保证整个磁盘没有故障。
-- 默认不读取 NVMe SMART；显式读时权限不足、控制器错误或平台不支持均返回未知及原因。注入 fixture root 时禁止打开真实控制器。ATA SMART 和 MMC ioctl 回退尚未实现；未暴露的健康数据不能当成正常。
+- 默认不读取 NVMe SMART 或 MMC ioctl；显式读时权限不足、控制器错误或平台不支持均返回未知及原因。注入 fixture root 时禁止打开真实控制器。ATA SMART 尚未实现；未暴露的健康数据不能当成正常。EXT_CSD 解码只解释 revision 7 及以上的健康字段；sysfs 已知旧版本时同样返回未知，缺失版本时仍可使用内核暴露的健康字段。旧版本的保留字节不会被当成健康数据。sysfs 寿命 A/B 分别校验，损坏字段不能掩盖另一个字段的临界告警，也不能令无告警结果伪装成正常。错误分类包含 `invalid_data`，供调用方区分格式损坏和权限不足。
 - `capture` 使用库提供的 SoC/存储输入清单，保留分区、backing devices 和 MMC 健康输入；不会为了采集执行 NVMe ioctl。
 
 数据来源参见 Linux [SoC ABI](https://github.com/torvalds/linux/blob/master/Documentation/ABI/testing/sysfs-devices-soc)、[block ABI](https://github.com/torvalds/linux/blob/master/Documentation/ABI/stable/sysfs-block)、[MMC 属性](https://github.com/torvalds/linux/blob/master/drivers/mmc/core/mmc.c)、[NVMe UAPI](https://github.com/torvalds/linux/blob/master/include/uapi/linux/nvme_ioctl.h) 和 [mountinfo 格式](https://man7.org/linux/man-pages/man5/proc_pid_mountinfo.5.html)。
+
+MMC 原生读取的布局和寄存器字段依据 [MMC UAPI](https://github.com/torvalds/linux/blob/master/include/uapi/linux/mmc/ioctl.h) 与 [内核 MMC 定义](https://github.com/torvalds/linux/blob/master/include/linux/mmc/mmc.h)，版本门槛与内核读取健康字段的条件一致。
 
 `crates/deviceinfo/tests/system.rs` 包含 **Q8B 风格的模拟文件树**，覆盖 ARM 核分组、逐核指令集、共享内存 Adreno/显示控制器分类以及 OS/内存/运行状态。它不是实机 capture，也不声明 Q8B 的实际频率或性能。现有 `fixtures/` 中的四台实机快照继续独立做回归；Q8B 可连接后应补充真正的 `capture`。
 
