@@ -49,11 +49,13 @@
 
 mod accelerator;
 mod cpu;
+pub mod diagnostics;
 pub mod environment;
 mod features;
 pub mod live;
 mod memory;
 pub mod mmc_health;
+pub mod platform;
 mod os;
 mod report;
 mod runtime;
@@ -63,6 +65,7 @@ pub mod soc;
 pub mod storage;
 pub mod storage_health;
 pub mod system;
+pub mod thermal;
 pub mod tags;
 
 pub mod pci;
@@ -79,6 +82,9 @@ pub use runtime::{LIBRARY_DIRS, OPENCL_VENDOR_DIR, library_inputs as runtime_lib
 pub use state::{AcceleratorState, DiskUsage, MemoryState, RuntimeState, SampleOptions};
 pub use sysfs::resolve_path_in_root;
 pub use mmc_health::{MmcExtCsdHealth, decode_mmc_ext_csd, read_mmc_health};
+pub use diagnostics::{Diagnostic, DiagnosticCode, DiagnosticOperation};
+pub use platform::{DmiIdentity, Exposure, FirmwareObservation, IdentityValue, PlatformReport, probe_platform};
+pub use thermal::{CoolingDevice, FanSensor, HysteresisKind, PwmChannel, TemperatureOrigin, TemperatureSensor, TemperatureThreshold, TemperatureUnit, ThermalOptions, ThermalReport, sample_thermal, sample_thermal_with};
 pub use soc::{SocDevice, SocReport, probe_soc};
 pub use storage::{BlockDevice, StorageInterface, StorageMount, StorageReport, probe_storage};
 pub use storage_health::{
