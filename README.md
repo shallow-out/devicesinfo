@@ -223,6 +223,35 @@ MMC 原生读取的布局和寄存器字段依据 [MMC UAPI](https://github.com/
 
 `crates/deviceinfo/tests/system.rs` 包含 **Q8B 风格的模拟文件树**，覆盖 ARM 核分组、逐核指令集、共享内存 Adreno/显示控制器分类以及 OS/内存/运行状态。它不是实机 capture，也不声明 Q8B 的实际频率或性能。现有 `fixtures/` 中的四台实机快照继续独立做回归；Q8B 可连接后应补充真正的 `capture`。
 
+### 温度、风扇与启动身份（Next 可独立接入）
+
+```rust
+use deviceinfo::{probe_platform, sample_thermal, DiagnosticCode};
+use std::path::Path;
+let root = Path::new("/");
+let identity = probe_platform(root); // 低频缓存；固件或设备树变化后刷新
+let telemetry = sample_thermal(root); // 按需读，不睡眠、不写控制节点
+for diagnostic in &telemetry.diagnostics {
+    if diagnostic.code == DiagnosticCode::PermissionDenied {
+        // 由调用方按设备、来源路径显示提示，不解析 diagnostic.message。
+    }
+}
+```
+
+- `probe_platform` 分别记录 UEFI、DT、ACPI 的 `exposed/not_exposed/unknown` 观测及来源。三者允许同时暴露，因此 Q8B 的 UEFI + DT 不会被压成互斥启动模式。`not_exposed` 只表示当前进程看不到该 sysfs 接口，不能据此断言使用 Legacy BIOS 或设备没有该能力。这里不推断 ACPI/DT 是否被内核实际选作硬件描述来源。
+- DT 的型号和 compatible、DMI 的系统/板卡名称及版本、BIOS 厂商/版本/日期分别保留，带字段来源；冲突时不任选一个覆盖其他证据。`board_version` 是板卡版本，`bios_version` 是固件版本，`fw_platform_size` 是 UEFI 位数；没有暴露的版本保持未知。不采集 DMI 序列号、UUID 或固件二进制表。
+- `sample_thermal` 枚举 thermal zone、hwmon 温度/风扇/PWM 和 cooling device。保留芯片名称、标签、温度原始值、告警标记、故障和启用状态，以及 thermal trip 类型/温度/滞回与 hwmon min/max/crit/emergency 阈值。滞回通过 `hysteresis_kind` 区分 thermal 的相对温差和 hwmon 的绝对阈值。温度单位为毫摄氏度，负值和零合法；低于绝对零度的读数保留原文并报告 `invalid_data`，不显示成可信温度；故障、禁用或损坏的状态标记不会给出可信温度/RPM，但保留原始读数。
+- RPM 只来自 `fanN_input`；`fanN_target` 另列目标 RPM。PWM 保留内核报告的 0..255 设定、控制模式和频率，它不是电气测量的实际占空比。PWM、风扇和 cooling state 分成三个数组，不按相同编号猜测接线、不把散热档位或目标转速当成实测 RPM。hwmon 与 thermal 可能描述同一个物理传感器，保留各自来源，不通过名称强行去重。
+- thermistor/ADC 驱动可能返回毫伏。`tempN_type=4` 的输入默认单位未知；调用方可用 `ThermalOptions.hwmon_temperature_units` 按源路径明确指定单位。毫伏不会被转换成摄氏温度。无 type 字段的标准 hwmon 温度按内核 ABI 使用毫摄氏度；特殊驱动应显式覆盖。
+- 新接口共用 `Diagnostic { code, device, path, operation, errno, message }`；错误码固定为 `unsupported/not_exposed/permission_denied/read_failed/invalid_data`。`message` 仅供展示，OS 错误码存在时保留；读取时返回 EINVAL 属于 `read_failed`，仅解码失败才标为 `invalid_data`。不存在的可选标签/阈值不产生错误；所需采样输入缺失或读取失败才报告诊断。现有硬件/环境/系统/存储接口仍保留旧 `warnings`/健康错误结构以兼容，尚未全部迁移到此结构。
+- 两个接口只读文件；非 Linux 真机返回 `unsupported`，注入的 Linux 文件树在其他平台仍可回归。`capture`/SSH mirror 共享输入清单，保留空固件目录；显式加 `capture --telemetry` 时复制传感器输入。普通硬件/环境 SSH 探测和默认 capture 不读取 thermal/hwmon，避免一个坏传感器阻断其他探测。开启遥测采集后读取失败会终止 capture，当前尚不记录可回放的 I/O 错误；不会把失败伪装成零值。温度和风扇快照是采集时的读数，回放不能用于判断当前设备状态，也不能从单个样本计算利用率或采样间隔。
+
+示例：`cargo run -p deviceinfo --example platform_thermal -- [captured-root]`。
+
+ABI 来源：[hwmon](https://docs.kernel.org/hwmon/sysfs-interface.html)、[thermal](https://docs.kernel.org/driver-api/thermal/sysfs-api.html)、[DMI 属性](https://github.com/torvalds/linux/blob/master/drivers/firmware/dmi-id.c)、[EFI sysfs](https://github.com/torvalds/linux/blob/master/Documentation/ABI/testing/sysfs-firmware-efi)、[ACPI sysfs](https://github.com/torvalds/linux/blob/master/Documentation/ABI/testing/sysfs-firmware-acpi)。Q8B 的 UEFI + DT 测试是模拟接口契约，尚非实机证据。
+
+本轮先提供这些 P0 接口；按 cpufreq policy 的调频状态、ARM 驱动专用忙碌/频率遥测、网络接口与地址/统计仍是后续工作。Next 可先接入已验证的 CPU/内存/SoC/存储及这些接口，无须等待 P1。
+
 所有探测都接受一个 `root` 前缀而不是写死 `/`，所以可以用**假文件树**做单元测试，
 也可以探测容器内的可见设备，或事后对着真机采样夹具做回归。
 

@@ -121,6 +121,9 @@ enum Command {
         /// 记录到 meta.json 里的架构
         #[arg(long, value_name = "ARCH")]
         arch: Option<String>,
+        /// 额外采集温度/风扇瞬时读数；读取失败会终止采集。
+        #[arg(long)]
+        telemetry: bool,
     },
 }
 
@@ -252,13 +255,19 @@ fn main() {
             root,
             ssh,
             arch,
+            telemetry,
         } => {
             let source = match &ssh {
                 Some(host) => Source::remote(host),
                 None => Source::local(&root),
             };
             let (arch, arch_warnings) = resolve_arch(&source, &root, arch);
-            match capture(&source, &arch, &arch_warnings, &out) {
+            let result = if telemetry {
+                capture_with_telemetry(&source, &arch, &arch_warnings, &out, true)
+            } else {
+                capture(&source, &arch, &arch_warnings, &out)
+            };
+            match result {
                 Ok(()) => println!("已从 {} 采集到 {}", source.describe(), out.display()),
                 Err(error) => {
                     eprintln!("采集失败: {error}");
@@ -292,6 +301,10 @@ fn print_json<T: serde::Serialize>(value: &T) {
 /// 这样 `tests/fixtures.rs` 就能"拿真机形状跑一遍，结果必须一样"——
 /// 手写的假 flags 列表抓不到真实内核里的意外（`smep` 就是这么混进指令集列表的）。
 fn capture(source: &Source, arch: &str, extra_warnings: &[String], out: &Path) -> io::Result<()> {
+    capture_with_telemetry(source, arch, extra_warnings, out, false)
+}
+
+fn capture_with_telemetry(source: &Source, arch: &str, extra_warnings: &[String], out: &Path, telemetry: bool) -> io::Result<()> {
     // 不把新输入叠加到旧夹具上：源端消失的设备、库和标签必须随之消失。
     if out.exists() && fs::read_dir(out)?.next().transpose()?.is_some() {
         return Err(io::Error::other(format!(
@@ -305,7 +318,7 @@ fn capture(source: &Source, arch: &str, extra_warnings: &[String], out: &Path) -
     let root = match source {
         Source::Local(root) => root.clone(),
         Source::Remote(_) => {
-            mirror(source, &staging.path)?;
+            mirror_with_telemetry(source, &staging.path, telemetry)?;
             staging.path.clone()
         }
     };
@@ -330,7 +343,7 @@ fn capture(source: &Source, arch: &str, extra_warnings: &[String], out: &Path) -
         }
     }
 
-    capture_from_root(&root, arch, extra_warnings, out)?;
+    capture_from_root(&root, arch, extra_warnings, out, telemetry)?;
     refuse_if_oversized(out)
 }
 
@@ -407,13 +420,29 @@ fn resolve_local_root(source: &Source) -> io::Result<(PathBuf, Option<TempTree>)
 /// 只拉探测**读**的那些文件，加上库目录的**文件名**——库内容对夹具毫无用处，
 /// 而 `LibraryIndex` 只看名字。
 fn mirror(source: &Source, stage: &Path) -> io::Result<()> {
-    let plan = capture_plan(source)?;
+    mirror_with_telemetry(source, stage, false)
+}
+fn mirror_with_telemetry(source: &Source, stage: &Path, telemetry: bool) -> io::Result<()> {
+    let plan = if telemetry {
+        capture_plan_with_telemetry(source, true)?
+    } else {
+        capture_plan(source)?
+    };
     // 一次 ssh 把全部内容取回来，而不是每个文件开一次连接
     // 两批分开传：**内容一定要**的，和**只要"在不在"**的。
     // 后者如果混进"要内容"那批，远端会把 `/usr/bin/podman`（45 MB）之类整个传回来。
     let mut wanted = plan.files.clone();
     wanted.extend(plan.databases.iter().cloned());
-    source.prefetch(&wanted, &plan.existence_only)?;
+    let mut existence = plan.existence_only.clone();
+    existence.extend(plan.directories.iter().cloned());
+    source.prefetch(&wanted, &existence)?;
+    for rel in &plan.directories {
+        match source.kind(rel) {
+            EntryKind::Directory => fs::create_dir_all(stage.join(rel))?,
+            EntryKind::File | EntryKind::Other => write_file(&stage.join(rel), b"")?,
+            EntryKind::Missing => {},
+        }
+    }
 
     for rel in plan.existence_only.iter() {
         let kind = source.kind(rel);
@@ -437,7 +466,7 @@ fn mirror(source: &Source, stage: &Path) -> io::Result<()> {
         let raw = match source.kind(rel) {
             // 设备节点（`/dev/accel/accel0` 这类字符设备）取不得内容：直接读会阻塞。
             // 夹具只需要"它存在"这个事实。
-            EntryKind::Other => Vec::new(),
+            EntryKind::Other | EntryKind::Directory => Vec::new(),
             // **说它是普通文件就得真读到内容。** 这里以前是 `unwrap_or_default()`——
             // 读失败就写一个空文件，而那正是我修过两次的病：空文件看起来像正常数据，
             // 探测会把缺的值读成空字符串。读到就报错，至少能看出是哪一条。
@@ -499,13 +528,22 @@ impl Drop for TempTree {
 }
 
 /// 从一棵**本地**文件树写夹具。
-fn capture_from_root(root: &Path, arch: &str, extra_warnings: &[String], out: &Path) -> io::Result<()> {
+fn capture_from_root(root: &Path, arch: &str, extra_warnings: &[String], out: &Path, telemetry: bool) -> io::Result<()> {
     let source = Source::local(root);
     let mut report = probe_with(root, arch);
     // 架构是猜来的（或调用方指定的）时，报告里要跟着一句解释——否则夹具里那个
     // 架构值看起来就像探测出来的事实。
     report.warnings.splice(0..0, extra_warnings.iter().cloned());
-    let plan = capture_plan(&source)?;
+    let plan = capture_plan_with_telemetry(&source, telemetry)?;
+
+    // Preserve empty observed firmware/class directories without copying binary tables.
+    for rel in &plan.directories {
+        match source.kind(rel) {
+            EntryKind::Directory => fs::create_dir_all(out.join(rel))?,
+            EntryKind::File | EntryKind::Other => write_file(&out.join(rel), b"")?,
+            EntryKind::Missing => {},
+        }
+    }
 
     // 0) **只需要"存在"**的输入：夹具里放空占位。可执行文件动辄几十 MB，
     //    复制内容会让夹具爆掉（真的发生过：428 MB）。
@@ -611,6 +649,7 @@ fn capture_from_root(root: &Path, arch: &str, extra_warnings: &[String], out: &P
     // 4) 元信息与期望输出
     let meta = serde_json::json!({
         "arch": arch,
+        "includes_thermal_telemetry": telemetry,
         "note": "由 `deviceinfo capture` 生成。expected.json 是采集当时的探测结果快照——\
                  探测行为变化时它会失败，人工看 diff 决定是改了行为还是修了 bug。",
     });
@@ -648,6 +687,7 @@ fn capture_from_root(root: &Path, arch: &str, extra_warnings: &[String], out: &P
 /// 宁可多列几个不存在的路径（`fs::metadata` 会跳过），也不要漏。
 struct CapturePlan {
     files: Vec<String>,
+    directories: Vec<String>,
     /// **只需要"存在"**的路径：只放空占位，不复制内容。
     ///
     /// 必须和 `files` 分开：环境探测要问"`/usr/bin/podman` 在不在"，而那是 45 MB
@@ -665,15 +705,29 @@ struct CapturePlan {
 }
 
 fn capture_plan(source: &Source) -> io::Result<CapturePlan> {
+    capture_plan_with_telemetry(source, false)
+}
+fn capture_plan_with_telemetry(source: &Source, telemetry: bool) -> io::Result<CapturePlan> {
     // CPU 那部分**直接用库里的清单**，不在这里重抄一遍：抄一遍就会漂移，
     // 而漂移的后果（远端夹具静默少一个输入）很难发现。
     let mut files: Vec<String> = CPU_SHARED_INPUTS.iter().map(|path| path.to_string()).collect();
     files.extend(deviceinfo::system::INPUTS.iter().map(|path| path.to_string()));
+    files.extend(deviceinfo::platform::inputs());
+    let mut directories: Vec<String> = deviceinfo::platform::INPUT_DIRS.iter().map(|path| path.to_string()).collect();
     let mut symlinks = Vec::new();
     let mut existence_only = Vec::new();
     // 探测会读 pci.ids（`pci::lookup`），所以要镜像进暂存树——但写夹具时另走一条路
     let databases: Vec<String> = PCI_DATABASE_PATHS.iter().map(|path| path.to_string()).collect();
     let mut lists = ListCache::new(source);
+
+    if telemetry {
+        directories.extend(deviceinfo::thermal::INPUT_DIRS.map(str::to_owned));
+        lists.ensure(&deviceinfo::thermal::INPUT_DIRS.map(str::to_owned))?;
+        let thermal_dirs = deviceinfo::thermal::input_dirs(&|dir| lists.entries(dir).iter().map(|entry| entry.name.clone()).collect());
+        lists.ensure(&thermal_dirs)?;
+        directories.extend(thermal_dirs);
+        files.extend(deviceinfo::thermal::inputs(&|dir| lists.entries(dir).iter().map(|entry| entry.name.clone()).collect()));
+    }
 
     lists.ensure(&deviceinfo::soc::INPUT_DIRS.map(str::to_owned))?;
     files.extend(deviceinfo::soc::inputs(&|dir| {
@@ -887,6 +941,7 @@ fn capture_plan(source: &Source) -> io::Result<CapturePlan> {
 
     Ok(CapturePlan {
         files,
+        directories,
         existence_only,
         databases,
         symlinks,
@@ -1490,6 +1545,41 @@ mod tests {
             deviceinfo::sample_storage_health_with(&source.path, &options),
             deviceinfo::sample_storage_health_with(&out.path, &options)
         );
+    }
+
+    #[test]
+    fn capture_preserves_coexisting_firmware_and_thermal_channels() {
+        let source = minimal_machine();
+        let out = TempTree::new().unwrap();
+        for (path, text) in [
+            ("sys/firmware/efi/fw_platform_size", "64\n"),
+            ("sys/firmware/devicetree/base/model", "Q8B fixture\0"),
+            ("sys/firmware/devicetree/base/compatible", "radxa,fixture\0qcom,qcs6490\0"),
+            ("sys/class/dmi/id/board_version", "rev-fixture\n"),
+            ("sys/class/dmi/id/bios_version", "firmware-fixture\n"),
+            ("sys/class/hwmon/hwmon0/name", "fan-fixture\n"),
+            ("sys/class/hwmon/hwmon0/temp1_input", "42000\n"),
+            ("sys/class/hwmon/hwmon0/temp1_crit", "95000\n"),
+            ("sys/class/hwmon/hwmon0/fan1_input", "2200\n"),
+            ("sys/class/hwmon/hwmon0/pwm2", "128\n"),
+            ("sys/class/thermal/cooling_device0/type", "pwm-fan\n"),
+            ("sys/class/thermal/cooling_device0/cur_state", "2\n"),
+            ("sys/class/thermal/cooling_device0/max_state", "5\n"),
+        ] {
+            write_file(&source.path.join(path), text.as_bytes()).unwrap();
+        }
+        fs::create_dir_all(source.path.join("sys/firmware/acpi/tables")).unwrap();
+        let default_plan = capture_plan(&Source::local(&source.path)).unwrap();
+        assert!(!default_plan.files.iter().any(|path| path.starts_with("sys/class/hwmon/")));
+        capture_with_telemetry(&Source::local(&source.path), "aarch64", &[], &out.path, true).unwrap();
+        assert!(out.path.join("sys/firmware/acpi/tables").is_dir());
+        assert_eq!(deviceinfo::probe_platform(&source.path), deviceinfo::probe_platform(&out.path));
+        assert_eq!(deviceinfo::sample_thermal(&source.path), deviceinfo::sample_thermal(&out.path));
+        // Remote mirror uses the same directory marker protocol and input plan.
+        let stage = TempTree::new().unwrap();
+        mirror_with_telemetry(&Source::local(&source.path), &stage.path, true).unwrap();
+        assert_eq!(deviceinfo::probe_platform(&source.path), deviceinfo::probe_platform(&stage.path));
+        assert_eq!(deviceinfo::sample_thermal(&source.path), deviceinfo::sample_thermal(&stage.path));
     }
 
     #[test]

@@ -45,7 +45,9 @@ pub(crate) struct Entry {
 pub(crate) enum EntryKind {
     /// 普通文件（软链会跟随，和 `fs::metadata().is_file()` 一致）。
     File,
-    /// 存在，但不是普通文件：设备节点、目录、断掉的软链。
+    /// A directory, including empty firmware observation markers.
+    Directory,
+    /// 存在，但不是普通文件或目录：设备节点等。
     Other,
     Missing,
 }
@@ -141,6 +143,7 @@ impl Source {
             Self::Local(root) => match deviceinfo::resolve_path_in_root(root, path)
                 .and_then(std::fs::metadata) {
                 Ok(meta) if meta.is_file() => EntryKind::File,
+                Ok(meta) if meta.is_dir() => EntryKind::Directory,
                 Ok(_) => EntryKind::Other,
                 Err(_) => EntryKind::Missing,
             },
@@ -153,13 +156,14 @@ impl Source {
                 .unwrap_or_else(|| {
                     let answer = remote
                         .run(&format!(
-                            "if [ -f {0} ]; then echo F; elif [ -e {0} ]; then echo D; else echo M; fi",
+                            "if [ -f {0} ]; then echo F; elif [ -d {0} ]; then echo R; elif [ -e {0} ]; then echo D; else echo M; fi",
                             quoted(path)
                         ))
                         .map(|out| String::from_utf8_lossy(&out).trim().to_string())
                         .unwrap_or_else(|_| "M".into());
                     match answer.as_str() {
                         "F" => EntryKind::File,
+                        "R" => EntryKind::Directory,
                         "D" => EntryKind::Other,
                         _ => EntryKind::Missing,
                     }
@@ -341,6 +345,8 @@ while IFS= read -r line; do
       # 报 0 字节且不带内容：本地据此写占位
       printf '@@F 0 %s\\n' \"$p\"
     fi
+  elif [ -d \"$p\" ]; then
+    printf '@@R %s\\n' \"$p\"
   elif [ -e \"$p\" ]; then
     printf '@@D %s\\n' \"$p\"
   else
@@ -479,6 +485,10 @@ fn parse_batch(
                 kinds.insert(path.to_string(), EntryKind::Other);
                 pos = body_start;
             }
+            (Some("@@R"), Some(path), None) => {
+                kinds.insert(path.to_string(), EntryKind::Directory);
+                pos = body_start;
+            }
             (Some("@@M"), Some(path), None) => {
                 kinds.insert(path.to_string(), EntryKind::Missing);
                 pos = body_start;
@@ -572,6 +582,18 @@ mod tests {
     }
 
     #[test]
+    fn batch_directory_marker_does_not_become_a_regular_file() {
+        let mut contents = BTreeMap::new();
+        let mut kinds = BTreeMap::new();
+        let mut failures = Vec::new();
+        parse_batch(b"@@R sys/firmware/efi\n@@D dev/sensor\n", &mut contents, &mut kinds, &mut failures);
+        assert_eq!(kinds["sys/firmware/efi"], EntryKind::Directory);
+        assert_eq!(kinds["dev/sensor"], EntryKind::Other);
+        assert!(contents.is_empty());
+        assert!(failures.is_empty());
+    }
+
+    #[test]
     fn link_markers_separate_targets_from_absence() {
         let out = b"@@K a/driver\n@@T ../../../bus/platform/drivers/panthor\n@@K a/notalink\n@@N\n";
         let links = parse_links(out);
@@ -618,7 +640,7 @@ mod tests {
         let source = Source::local(&root);
         assert_eq!(source.read("d/one.txt").as_deref(), Some(&b"hello"[..]));
         assert_eq!(source.kind("d/one.txt"), EntryKind::File);
-        assert_eq!(source.kind("d/inner"), EntryKind::Other, "目录不是普通文件");
+        assert_eq!(source.kind("d/inner"), EntryKind::Directory, "保留目录类型");
         assert_eq!(source.kind("d/nope"), EntryKind::Missing);
         assert_eq!(source.read("d/nope"), None);
 
@@ -748,8 +770,9 @@ mod tests {
         let mut contents = BTreeMap::new();
         let mut kinds = BTreeMap::new();
         let mut failures = Vec::new();
+        let inner = dir.join("inner").display().to_string();
         parse_batch(
-            &run(&remote_fetch_script(), &format!("c {one}\nc {missing}\n")),
+            &run(&remote_fetch_script(), &format!("c {one}\nc {missing}\ne {inner}\n")),
             &mut contents,
             &mut kinds,
             &mut failures,
@@ -758,6 +781,7 @@ mod tests {
         assert_eq!(contents[&one], b"hello\n");
         assert_eq!(kinds[&one], EntryKind::File);
         assert_eq!(kinds[&missing], EntryKind::Missing);
+        assert_eq!(kinds[&inner], EntryKind::Directory);
 
         std::fs::remove_dir_all(&root).ok();
     }
