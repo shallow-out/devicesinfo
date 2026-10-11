@@ -724,12 +724,14 @@ fn capture_from_root(
         source.associations(&[])?,
         false,
     )?;
-    // Expected output describes the frozen tree, whose volatile counters are scrubbed.
-    let mut report = inspect_hardware(out, arch);
-    report
-        .data
-        .warnings
-        .splice(0..0, extra_warnings.iter().cloned());
+    // **expected 是来源的事实**：夹具要能证明“捕获没丢东西”，就不能拿捕获树自己的
+    // 探测结果当答案 —— 那样漏掉一个输入会被写成“正确答案”，采集少了一整个目录、
+    // 报告跟着变，而夹具测试照样绿。信封（context）描述**冻结后的树**，载荷来自来源，
+    // 两者刻意分开。
+    //
+    // 远端采集的“来源”是本地镜像（远端的一切都按镜像处理），所以这条保证的是
+    // “镜像不被自己的探测行为骗过”；镜像与真机是否等价仍只能靠 `--ssh` 复核。
+    report.context = deviceinfo::SampleContext::read(out);
     let meta = serde_json::json!({
         "schema_version": deviceinfo::SCHEMA_VERSION,
         "arch": arch,
@@ -756,10 +758,13 @@ fn capture_from_root(
         )?
         .as_bytes(),
     )?;
+    // 环境报告同理：期望值取自来源，信封换成冻结后的树。
+    let mut environment = deviceinfo::inspect_environment(root);
+    environment.context = deviceinfo::SampleContext::read(out);
     write_file(
         &out.join("expected-environment.json"),
         to_json(
-            &serde_json::to_value(deviceinfo::inspect_environment(out))
+            &serde_json::to_value(&environment)
                 .map_err(|error| io::Error::other(format!("环境报告序列化失败: {error}")))?,
         )?
         .as_bytes(),
@@ -966,6 +971,10 @@ fn capture_plan_with_telemetry(source: &Source, telemetry: bool) -> io::Result<C
         for entry in lists.entries(&drm_subdir) {
             files.push(format!("{drm_subdir}/{}", entry.name));
         }
+        // **目录本身也要留下**：一个空的 `device/drm` 和"压根没这个目录"是两件事——
+        // 前者是只会显示输出的 card，后者是判不出来。只把条目记进 `files`，空目录就
+        // 会在夹具里消失，于是分类从显示变成了 GPU（而 expected 又来自捕获树，测试不红）。
+        directories.push(drm_subdir);
         // xe 的 tile*/gt*/freq0/{max,cur}_freq
         for tile in lists.numeric(&device, "tile") {
             tile_dirs.push(format!("{device}/{tile}"));
@@ -1540,6 +1549,83 @@ mod tests {
                 preserved
             );
         }
+    }
+
+    /// 空的 `device/drm` 必须在夹具里活下来；expected 必须来自**来源**，
+    /// 否则"采集丢了一个目录"会被写进答案里，测试反而测不出来。
+    #[test]
+    fn an_empty_drm_directory_survives_capture_and_expected_keeps_the_source_truth() {
+        let source = minimal_machine();
+        for (path, content) in [
+            ("sys/class/drm/card0/device/vendor", "0x8086\n"),
+            ("sys/class/drm/card0/device/device", "0x1234\n"),
+        ] {
+            write_file(&source.path.join(path), content.as_bytes()).unwrap();
+        }
+        // 空目录：它的**存在**就说明这个 card 会做显示输出
+        fs::create_dir_all(source.path.join("sys/class/drm/card0/device/drm")).unwrap();
+
+        let oracle = inspect_hardware(&source.path, "x86_64");
+        assert_eq!(
+            oracle.data.accelerators[0].kind,
+            deviceinfo::AcceleratorKind::Display,
+            "{:#?}",
+            oracle.data.accelerators
+        );
+
+        let out = TempTree::new().unwrap();
+        capture(&Source::local(&source.path), "x86_64", &[], &out.path).unwrap();
+
+        // 夹具能重复出同样的分类（丢了空目录就会变成 GPU）
+        assert_hardware_snapshot_matches(&out.path);
+        // 而且期望值等于**来源**的事实
+        let expected: deviceinfo::Snapshot<deviceinfo::HardwareReport> =
+            serde_json::from_slice(&fs::read(out.path.join("expected.json")).unwrap()).unwrap();
+        assert_eq!(expected.data, oracle.data);
+    }
+
+    /// 列目录必须在**根内**解析软链：跟着绝对目标跑到采集机的 `/sys`，采到的东西就成了
+    /// "采集机恰好有什么"，而探测看的又是树里的东西——两边不一致就是静默失真。
+    #[test]
+    fn listing_resolves_symlinks_inside_the_root_instead_of_the_collecting_machine() {
+        let tree = minimal_machine();
+        fs::create_dir_all(tree.path.join("sys/class/block")).unwrap();
+        // 这个目标在**采集机上**真的存在：跟过去就会把本机的 /sys/kernel 当目标机的
+        std::os::unix::fs::symlink("/sys/kernel", tree.path.join("sys/class/block/dm-0"))
+            .unwrap();
+        let listing = Source::local(&tree.path)
+            .list_many(&["sys/class/block/dm-0".into()])
+            .unwrap();
+        assert!(
+            listing["sys/class/block/dm-0"].is_empty(),
+            "根外的绝对软链要按根内不存在处理：{:?}",
+            listing["sys/class/block/dm-0"]
+        );
+
+        // 根内的绝对软链照旧要跟——设备关联走的正是这条路
+        fs::create_dir_all(tree.path.join("sys/devices/thing/block/dm-9/slaves/sda1")).unwrap();
+        std::os::unix::fs::symlink(
+            "/sys/devices/thing/block/dm-9",
+            tree.path.join("sys/class/block/dm-9"),
+        )
+        .unwrap();
+        let listing = Source::local(&tree.path)
+            .list_many(&["sys/class/block/dm-9".into()])
+            .unwrap();
+        let entries: Vec<(String, bool)> = listing["sys/class/block/dm-9"]
+            .iter()
+            .map(|entry| (entry.name.clone(), entry.is_dir))
+            .collect();
+        assert_eq!(entries, vec![("slaves".to_string(), true)]);
+        // 软链目标也要在根内读：`/sys/devices/...` 不该在采集机上被跟出去
+        let links = Source::local(&tree.path)
+            .link_many(&["sys/class/block/dm-9".into(), "sys/class/block/missing".into()])
+            .unwrap();
+        assert_eq!(
+            links["sys/class/block/dm-9"].as_deref(),
+            Some("/sys/devices/thing/block/dm-9")
+        );
+        assert_eq!(links["sys/class/block/missing"], None);
     }
 
     fn assert_hardware_snapshot_matches(out: &Path) {

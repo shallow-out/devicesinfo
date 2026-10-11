@@ -170,7 +170,7 @@ impl Source {
             Self::Local(root) => Ok(paths
                 .iter()
                 .map(|path| {
-                    let target = std::fs::read_link(root.join(path))
+                    let target = local_link_target(root, path)
                         .ok()
                         .and_then(|target| target.to_str().map(str::to_string));
                     (path.clone(), target)
@@ -510,16 +510,48 @@ pub(crate) fn quoted(path: &str) -> String {
 }
 
 fn list_local(root: &Path, dir: &str) -> Vec<Entry> {
-    let Ok(entries) = std::fs::read_dir(root.join(dir)) else {
+    // **软链必须在根内解析**：`fs::read_dir(root.join(dir))` 会让内核跟着绝对软链跑到
+    // 采集机的真 `/sys`，于是“这条目录里有什么”取决于采集机上恰好连着什么东西。
+    // 而探测走 `resolve_path_in_root`、看的是树里的东西：两边不一致时，夹具会静默地
+    // 少掉整条依赖关系（例如存储的 backing 链）——而 expected 又是从同一棵暂存树算出来的。
+    let Ok(path) = deviceinfo::resolve_path_in_root(root, dir) else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&path) else {
         return Vec::new();
     };
     entries
         .flatten()
-        .map(|entry| Entry {
-            is_dir: entry.path().is_dir(),
-            name: entry.file_name().to_string_lossy().into_owned(),
+        .map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let is_dir = deviceinfo::resolve_path_in_root(root, &join_relative(dir, &name))
+                .map(|resolved| resolved.is_dir())
+                .unwrap_or(false);
+            Entry { is_dir, name }
         })
         .collect()
+}
+
+fn join_relative(dir: &str, name: &str) -> String {
+    if dir.is_empty() {
+        name.to_string()
+    } else {
+        format!("{dir}/{name}")
+    }
+}
+
+/// 读一个路径的软链目标，**但要先把它所在的目录在根内解析**。
+///
+/// `read_link(root.join("sys/class/block/dm-987/slaves/x"))` 里中间那几段软链会被内核
+/// 直接跟到采集机的 `/sys`。和列目录是同一个病：采到什么取决于采集机自己。
+fn local_link_target(root: &Path, path: &str) -> io::Result<PathBuf> {
+    let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+    let base = if parent.is_empty() {
+        root.to_path_buf()
+    } else {
+        deviceinfo::resolve_path_in_root(root, parent)?
+    };
+    std::fs::read_link(base.join(name))
 }
 
 fn lines_of(bytes: &[u8]) -> Vec<String> {
