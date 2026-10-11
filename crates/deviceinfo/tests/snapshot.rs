@@ -120,6 +120,25 @@ fn overlapping_windows_duplicate_captures_and_clock_precision_are_rejected() {
         snapshot(2_000_000_000, BOOT).elapsed_since(&unknown_resolution),
         Err(Error::InvalidContext)
     );
+
+    // **当前这次**更粗的时钟同样要拦：原生 1 ns 之后接一次 10 ms 粒度的 SSH 采样，
+    // 那 5 ms 的间隔在后者分辨率之下，不能拿它算速率。
+    let mut coarse_current = snapshot(1_010_000_000, BOOT);
+    coarse_current.context.started.boot_clock_resolution_ns = Some(10_000_000);
+    assert_eq!(
+        coarse_current.elapsed_since(&snapshot(1_005_000_000, BOOT)),
+        Err(Error::NonIncreasingTime)
+    );
+
+    // 任一边界缺精度、或精度为 0，都是“未知”，不是“精细”
+    for broken in [None, Some(0)] {
+        let mut unknown = snapshot(2_000_000_000, BOOT);
+        unknown.context.finished.boot_clock_resolution_ns = broken;
+        assert_eq!(
+            unknown.elapsed_since(&snapshot(1_000_000_000, BOOT)),
+            Err(Error::InvalidContext)
+        );
+    }
 }
 
 #[test]

@@ -166,18 +166,22 @@ impl SampleContext {
             return Err(DifferenceError::DifferentNamespace);
         }
         // Windows must not overlap; replaying the same capture cannot create a rate.
-        let resolution = previous
-            .finished
-            .boot_clock_resolution_ns
-            .filter(|value| *value > 0)
-            .ok_or(DifferenceError::InvalidContext)?;
-        if self
-            .started
-            .boot_clock_resolution_ns
-            .filter(|value| *value > 0)
-            .is_none()
-        {
-            return Err(DifferenceError::InvalidContext);
+        //
+        // **两个窗口的四个边界都要有有效精度**，并按最粗的那个守窗口：间隔两端各自
+        // 由自己的时钟决定能分辨到什么程度（原生 1 ns、SSH 是 10 ms 粒度的
+        // `/proc/uptime`）。只看上一采样的精度，就会在“当前这次其实分辨不出这么短的
+        // 间隔”时照旧给出速率 —— 那是一个看起来很合理的错数。
+        let mut resolution = 0u64;
+        for value in [
+            previous.started.boot_clock_resolution_ns,
+            previous.finished.boot_clock_resolution_ns,
+            self.started.boot_clock_resolution_ns,
+            self.finished.boot_clock_resolution_ns,
+        ] {
+            match value.filter(|value| *value > 0) {
+                Some(value) => resolution = resolution.max(value),
+                None => return Err(DifferenceError::InvalidContext),
+            }
         }
         if self.started.boot_time_ns.unwrap_or(0)
             <= previous
