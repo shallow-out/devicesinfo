@@ -76,6 +76,8 @@ mod cpu;
 pub mod diagnostics;
 pub mod environment;
 mod features;
+/// 夹具的“检出后修复”：Git 不跟踪空目录，而有些空目录的存在本身就是事实。
+pub mod fixture;
 pub mod live;
 mod memory;
 pub mod mmc_health;

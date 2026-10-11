@@ -47,6 +47,8 @@ fn captured_machines_still_probe_the_same() {
 
         let meta_text = std::fs::read_to_string(fixture.join("meta.json"))
             .unwrap_or_else(|error| panic!("{} 缺 meta.json: {error}", fixture.display()));
+        // Git 不跟踪空目录：检出来的夹具要先把缺的空目录补回来，否则探测看到的是另一棵树。
+        deviceinfo::fixture::materialize(&fixture).expect("补回夹具里的空目录");
         let meta: serde_json::Value = serde_json::from_str(&meta_text).expect("meta.json 应可解析");
         let arch = meta["arch"]
             .as_str()

@@ -19,6 +19,9 @@
 | `observe_mmc_health(root, path)` | `MmcHealthObservation` | 显式读取原生 MMC EXT_CSD；注入目录禁止打开设备 |
 | `check_environment(environment, options, runner, read_stamp)` | `LiveReport` | 显式运行命令/网络检查，命令与时间回调必须属于同一目标 |
 
+`fixture::materialize(root)` 按 `meta.json` 的 `empty_directories` 把空目录补回来：
+Git 不跟踪空目录，而 `<card>/device/drm` 这类目录的**存在**本身就是事实。
+
 输入清单、数据类型、纯字节解码器和文本渲染函数仍可复用。底层裸 IO 探测函数不是公开 API。
 读取载荷要使用 `.data`；保存、传输和缓存必须保留**完整** `Snapshot`。
 不添加 `Deref` 或隐式提取兼容层，避免消费方丢掉来源信息后继续差分。

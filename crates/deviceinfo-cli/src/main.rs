@@ -715,6 +715,21 @@ fn capture_from_root(
         }
     }
 
+    // 3.5) **回放必须等于来源**：不等就说明捕获丢了输入，或者探测穿过了夹具里的绝对软链
+    //      读到了采集机的 /sys。**一份自相矛盾的夹具比没有更坏**（它的回归测试一跑就红，
+    //      而红的样子像“探测行为变了”），所以这里拒绝并把自己擦干净——半个夹具会挡住下一次。
+    let mut environment = deviceinfo::inspect_environment(root);
+    if inspect_hardware(out, arch).data != report.data
+        || deviceinfo::inspect_environment(out).data != environment.data
+    {
+        let _ = fs::remove_dir_all(out);
+        return Err(io::Error::other(format!(
+            "这份夹具会和它自己的回放矛盾（捕获丢了输入，或探测穿过了锅链）：{}——\
+             已清掉输出目录；若反复如此，说明采集清单漏了输入",
+            out.display()
+        )));
+    }
+
     // 4) 元信息与期望输出
     persist_context(
         out,
@@ -732,12 +747,31 @@ fn capture_from_root(
     // 远端采集的“来源”是本地镜像（远端的一切都按镜像处理），所以这条保证的是
     // “镜像不被自己的探测行为骗过”；镜像与真机是否等价仍只能靠 `--ssh` 复核。
     report.context = deviceinfo::SampleContext::read(out);
+    // **空目录进不了 Git**：夹具是要提交的，而 Git 不跟踪空目录——
+    // `sys/class/drm/card0/device/drm` 恰好就是这样一条：它的**存在**决定这张卡是
+    // “只会显示输出”还是“判不出来”。把观测到的空目录写进 meta，
+    // 检出后由 `deviceinfo::fixture::materialize` 补回来。
+    let mut empty_directories: Vec<String> = plan
+        .directories
+        .iter()
+        .filter(|relative| {
+            out.join(relative).is_dir()
+                && fs::read_dir(out.join(relative))
+                    .map(|mut entries| entries.next().is_none())
+                    .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
+    empty_directories.sort();
     let meta = serde_json::json!({
         "schema_version": deviceinfo::SCHEMA_VERSION,
         "arch": arch,
         "includes_thermal_telemetry": telemetry,
+        "empty_directories": empty_directories,
         "note": "由 `deviceinfo capture` 生成。expected.json 是采集当时的探测结果快照——\
-                 探测行为变化时它会失败，人工看 diff 决定是改了行为还是修了 bug。",
+                 探测行为变化时它会失败，人工看 diff 决定是改了行为还是修了 bug。\
+                 empty_directories 是 Git 存不下来的空目录，检出后调 \
+                 deviceinfo::fixture::materialize 补回来。",
     });
     write_file(
         &out.join("meta.json"),
@@ -759,7 +793,6 @@ fn capture_from_root(
         .as_bytes(),
     )?;
     // 环境报告同理：期望值取自来源，信封换成冻结后的树。
-    let mut environment = deviceinfo::inspect_environment(root);
     environment.context = deviceinfo::SampleContext::read(out);
     write_file(
         &out.join("expected-environment.json"),
@@ -1577,6 +1610,26 @@ mod tests {
         capture(&Source::local(&source.path), "x86_64", &[], &out.path).unwrap();
 
         // 夹具能重复出同样的分类（丢了空目录就会变成 GPU）
+        assert_hardware_snapshot_matches(&out.path);
+        // **Git 不跟踪空目录**：meta 里要记下它，检出来后补得回来
+        let meta: serde_json::Value =
+            serde_json::from_slice(&fs::read(out.path.join("meta.json")).unwrap()).unwrap();
+        assert_eq!(
+            meta["empty_directories"],
+            serde_json::json!(["sys/class/drm/card0/device/drm"]),
+            "{meta}"
+        );
+        // 模拟一次 Git 检出：删掉空目录 → 补回来 → 分类必须还是“显示设备”
+        fs::remove_dir(out.path.join("sys/class/drm/card0/device/drm")).unwrap();
+        assert_eq!(
+            inspect_hardware(&out.path, "x86_64").data.accelerators[0].kind,
+            deviceinfo::AcceleratorKind::Gpu,
+            "目录没了就会退化成判不出来"
+        );
+        assert_eq!(
+            deviceinfo::fixture::materialize(&out.path).unwrap(),
+            vec!["sys/class/drm/card0/device/drm".to_string()]
+        );
         assert_hardware_snapshot_matches(&out.path);
         // 而且期望值等于**来源**的事实
         let expected: deviceinfo::Snapshot<deviceinfo::HardwareReport> =
